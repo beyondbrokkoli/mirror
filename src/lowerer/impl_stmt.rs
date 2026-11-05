@@ -205,30 +205,25 @@ impl<'a> IrLowerer<'a> {
                 let t_reg = ptr_of(t_any)?;
                 let key = self.lower_index_key(key)?;
 
-                let base_name = get_base_identifier(obj);
+                let elig = self.shape.fast_stores.get(&stmt.id());
 
-                let mut fast_guard: Option<Reg<Int>> = None;
-                let mut row_reserve: Option<(Reg<Ptr>, Reg<Int>)> = None;
-                if let TableKey::Int(g) = key {
-                    for ctx in self.fills.loop_ctxs.iter_mut().rev() {
-                        if ctx.guard_reg == g.id {
-                            if ctx.reserved.contains(&t_reg.id) {
-                                fast_guard = Some(g);
-                                break;
-                            } else if let Some(name) = base_name
-                                && let Some((_, bound)) =
-                                    ctx.nested_fills.iter().find(|(n, _)| n == name)
-                            {
-                                ctx.reserved.push(t_reg.id);
-                                row_reserve = Some((t_reg, *bound));
-                                fast_guard = Some(g);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if let Some((table, bound)) = row_reserve {
-                    self.emit(Instruction::TableReserve { table, bound });
+                if let Some(elig) = elig
+                    && elig.row_reserve
+                {
+                    let bound = self
+                        .reserves
+                        .iter()
+                        .rev()
+                        .find(|r| r.loop_id == elig.loop_id)
+                        .map(|r| r.bound)
+                        .expect(
+                            "a nested-row store's loop is active — the walk \
+                             mints eligibility only inside its loop's body",
+                        );
+                    self.emit(Instruction::TableReserve {
+                        table: t_reg,
+                        bound,
+                    });
                 }
 
                 let store_elem = self.elem_face_of(obj)?;
@@ -246,27 +241,32 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
 
-                if let Some(g) = fast_guard {
+                if elig.is_some() {
+                    let TableKey::Int(k) = key else {
+                        panic!(
+                            "a fast-store fact rides a non-integer key — \
+                             the walk mints the fact only for guard-shaped \
+                             keys, which lower to the integer lane"
+                        );
+                    };
                     let layout = self.lookup_layout_for(obj)?;
-                    self.table_set_fast(t_reg, g, v_reg, &store_elem, layout)?;
+                    self.table_set_fast(t_reg, k, v_reg, &store_elem, layout)?;
                 } else {
                     self.table_set(t_reg, key, v_reg, &store_elem)?;
                 }
 
-                if matches!(value, Expr::TableCtor { .. })
-                    && let Some(name) = base_name
-                {
-                    let bound_reg = self.fills.loop_ctxs.iter().rev().find_map(|ctx| {
-                        ctx.nested_fills
-                            .iter()
-                            .find(|(n, _)| n == name)
-                            .map(|(_, b_reg)| *b_reg)
+                if matches!(value, Expr::TableCtor { .. }) {
+                    let bound = self.reserves.iter().rev().find_map(|r| {
+                        self.shape
+                            .reserve_plans
+                            .get(&r.loop_id)
+                            .is_some_and(|p| p.ctor_reserves.contains(&stmt.id()))
+                            .then_some(r.bound)
                     });
-
-                    if let Some(b_reg) = bound_reg {
+                    if let Some(bound) = bound {
                         self.emit(Instruction::TableReserve {
                             table: ptr_of(v_reg)?,
-                            bound: b_reg,
+                            bound,
                         });
                     }
                 }
@@ -298,7 +298,7 @@ impl<'a> IrLowerer<'a> {
                     (a.reg.id(), name_a).cmp(&(b.reg.id(), name_b))
                 });
 
-                let conv: Option<(String, Vec<String>, BTreeSet<String>)> = match condition {
+                let plan: Option<(String, &ReservePlan)> = match condition {
                     Expr::BinaryOp {
                         op: BinOp::LessThan,
                         left,
@@ -306,41 +306,29 @@ impl<'a> IrLowerer<'a> {
                     } if as_ident(left).is_some() => {
                         let guard = as_ident(left).expect("guarded by as_ident");
                         self.shape
-                            .fill_loops
+                            .reserve_plans
                             .get(&stmt.id())
-                            .map(|plan| {
-                                let depth = self.scopes.len();
-                                let mut names = Vec::new();
-                                for name in &plan.fills {
-                                    if !self.has_var(name) {
-                                        continue;
-                                    }
-                                    if self.shape.is_dense_at_depth(name, depth) {
-                                        names.push(name.clone());
-                                    }
-                                }
-                                (guard.to_string(), names, plan.nested_fills.clone())
-                            })
-                            .filter(|(_, names, nested)| !names.is_empty() || !nested.is_empty())
+                            .map(|plan| (guard.to_string(), plan))
                     }
                     _ => None,
                 };
+
                 let conv_bound: Option<&Expr> = match condition {
                     Expr::BinaryOp {
                         op: BinOp::LessThan,
                         right: bound_expr,
                         ..
-                    } if conv.is_some() => Some(bound_expr),
+                    } if plan.is_some() => Some(bound_expr),
                     _ => None,
                 };
                 let mut conv_bound_reg: Option<Reg<Int>> = None;
-                if let (Some((_, names, _)), Some(bound_expr)) = (&conv, conv_bound) {
+                if let (Some((_, plan)), Some(bound_expr)) = (&plan, conv_bound) {
                     let saved_scopes = self.scopes.clone();
                     let TypedReg { reg: b_any, .. } = self.lower_expr(bound_expr, None)?;
                     self.scopes = saved_scopes;
                     let b_reg = int_of(b_any)?;
                     conv_bound_reg = Some(b_reg);
-                    for name in names {
+                    for name in &plan.pre_header {
                         let t_reg = ptr_of(self.read_var(name)?.reg)?;
                         self.emit(Instruction::TableReserve {
                             table: t_reg,
@@ -372,7 +360,7 @@ impl<'a> IrLowerer<'a> {
                     phis.push((var, phi_reg, pre_loop_local.layout));
                 }
 
-                let cond_reg = if let (Some((guard, _, _)), Some(b_reg)) = (&conv, conv_bound_reg) {
+                let cond_reg = if let (Some((guard, _)), Some(b_reg)) = (&plan, conv_bound_reg) {
                     let g_reg = int_of(self.read_var(guard)?.reg)?;
                     let c_reg = self.next_reg();
                     self.cmp3(Instruction::Less, c_reg, g_reg, b_reg);
@@ -388,45 +376,22 @@ impl<'a> IrLowerer<'a> {
                     false_block: exit_block,
                 });
 
-                if let Some((guard, names, nested_fills)) = &conv {
-                    let guard_reg = self.read_var(guard)?.reg.id();
-                    let reserved = names
-                        .iter()
-                        .map(|name| Ok(self.read_var(name)?.reg.id()))
-                        .collect::<Result<Vec<_>, LowerError>>()?;
-
-                    let mut nested_fill_regs: Vec<(String, Reg<Int>)> = Vec::new();
-                    for name in names {
+                if let Some((_, plan)) = &plan {
+                    let bound = conv_bound_reg.expect(
+                        "a planned loop lowered its bound in the pre-header — \
+                         the plan's presence implies the condition's right \
+                         operand was lowered",
+                    );
+                    for name in &plan.nested {
                         let local = self.read_var(name)?;
-                        if let Ty::Tbl(inner_ty) = &local.ty
-                            && matches!(**inner_ty, Ty::Tbl(_))
-                        {
-                            self.emit(Instruction::TableReserve {
-                                table: ptr_of(local.reg)?,
-                                bound: conv_bound_reg.unwrap(),
-                            });
-                            nested_fill_regs.push((name.clone(), conv_bound_reg.unwrap()));
-                        }
+                        self.emit(Instruction::TableReserve {
+                            table: ptr_of(local.reg)?,
+                            bound,
+                        });
                     }
-                    for name in nested_fills {
-                        if self.has_var(name) {
-                            let local = self.read_var(name)?;
-                            if let Ty::Tbl(inner_ty) = &local.ty
-                                && matches!(**inner_ty, Ty::Tbl(_))
-                            {
-                                self.emit(Instruction::TableReserve {
-                                    table: ptr_of(local.reg)?,
-                                    bound: conv_bound_reg.unwrap(),
-                                });
-                                nested_fill_regs.push((name.clone(), conv_bound_reg.unwrap()));
-                            }
-                        }
-                    }
-
-                    self.fills.loop_ctxs.push(LoopCtx {
-                        guard_reg,
-                        reserved,
-                        nested_fills: nested_fill_regs,
+                    self.reserves.push(ActiveReserve {
+                        loop_id: stmt.id(),
+                        bound,
                     });
                 }
 
@@ -442,8 +407,8 @@ impl<'a> IrLowerer<'a> {
                     }
                     an.emit_scope_frees((stmt.id(), 0))
                 })?;
-                if conv.is_some() {
-                    self.fills.loop_ctxs.pop();
+                if plan.is_some() {
+                    self.reserves.pop();
                 }
                 let break_ctx = self
                     .break_ctxs

@@ -7,8 +7,8 @@ use crate::ir::{
     RegId, RegKind, SourceLoc, TableKey, Terminator, repr_of,
 };
 use crate::shape::{
-    ArmFreeEntry, DoExitFree, FfiVerb, InstanceId, Keep, KeyLane, LayoutVerdict, ShapeFacts,
-    TagSrc, Ty,
+    ArmFreeEntry, DoExitFree, FfiVerb, InstanceId, Keep, KeyLane, LayoutVerdict, ReservePlan,
+    ShapeFacts, TagSrc, Ty,
 };
 use alm_rt::{signal, trace};
 use bridges::{
@@ -65,12 +65,6 @@ struct TypedReg {
     ty: Ty,
 }
 
-struct LoopCtx {
-    guard_reg: RegId,
-    reserved: Vec<RegId>,
-    nested_fills: Vec<(String, Reg<Int>)>,
-}
-
 struct BreakCtx {
     exit_block: BlockId,
     phi_vars: Vec<String>,
@@ -81,8 +75,13 @@ struct FreeHandles {
     site_regs: BTreeMap<usize, (Reg<Ptr>, u32)>,
 }
 
-struct FillCtxs {
-    loop_ctxs: Vec<LoopCtx>,
+/// One active conversion loop's bound register, pushed at the loop's
+/// header and popped at its body's end. The eligibility and reserve
+/// decisions live in the walk facts, read by NodeId; only the lowered
+/// bound register is emission state.
+struct ActiveReserve {
+    loop_id: NodeId,
+    bound: Reg<Int>,
 }
 
 pub struct IrLowerer<'a> {
@@ -91,7 +90,7 @@ pub struct IrLowerer<'a> {
     current_block: BlockId,
     free_reg: RegId,
     scopes: Vec<BTreeMap<String, Local>>,
-    fills: FillCtxs,
+    reserves: Vec<ActiveReserve>,
     handles: FreeHandles,
     shape: &'a ShapeFacts,
     cur_loc: Option<SourceLoc>,

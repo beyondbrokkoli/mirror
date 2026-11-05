@@ -41,3 +41,4 @@ include!("corpus_mutations_never_desync_the_walks.rs");
 include!("token_soup_never_panics_or_desyncs.rs");
 include!("str_key_derives_agree_across_the_abi.rs");
 include!("walk_pins_are_a_pure_subset_over_the_corpus.rs");
+include!("fast_lane_facts_hold_over_the_corpus.rs");

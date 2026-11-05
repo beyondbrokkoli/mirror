@@ -95,10 +95,44 @@ pub struct InstanceInfo {
     pub access_elems: BTreeMap<NodeId, Ty>,
 }
 
-#[derive(Clone)]
-pub struct FillPlan {
-    pub fills: BTreeSet<String>,
-    pub nested_fills: BTreeSet<String>,
+/// How a fast-store key relates to its loop's guard. `Guard` is the
+/// key the guard name currently names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyShape {
+    Guard,
+}
+
+/// One store the walk proved eligible for the fast lane. Presence in
+/// `fast_stores` is the whole decision; the lowerer reads it by the
+/// statement's `NodeId` and re-derives nothing.
+#[derive(Clone, Debug)]
+pub struct FastStoreElig {
+    pub loop_id: NodeId,
+    /// The base name the claim rode; read by the lane pins. A table
+    /// can sit in a plan's pre-header and nested lists at once, so
+    /// this name alone does not say which claim fired.
+    #[allow(dead_code)]
+    pub table: String,
+    /// Phase 1 admits exactly the guard key; the shape travels with
+    /// the fact so later key shapes extend the gate in the walk alone.
+    #[allow(dead_code)]
+    pub key: KeyShape,
+    /// The claim is the nested-row kind: the store's table register is
+    /// a fresh row, so the row's own reserve rides this store instead
+    /// of the pre-header.
+    pub row_reserve: bool,
+}
+
+/// The reserve shape of one conversion loop: which names get a
+/// pre-header reserve, which names are nested rows reserved under the
+/// header, and which constructor-value stores borrow the loop's bound.
+/// The bound itself stays a reference to the loop condition's right
+/// operand; the lowerer lowers it and keeps the register.
+#[derive(Clone, Debug)]
+pub struct ReservePlan {
+    pub pre_header: Vec<String>,
+    pub nested: Vec<String>,
+    pub ctor_reserves: BTreeSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -129,8 +163,8 @@ pub struct ShapeFacts {
     pub arm_do_exit_frees: BTreeMap<(NodeId, u8), Vec<ArmFreeEntry>>,
     pub arm_root_exit_frees: Vec<ArmFreeEntry>,
     pub move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
-    pub name_dense: BTreeMap<(String, usize), bool>,
-    pub fill_loops: BTreeMap<NodeId, FillPlan>,
+    pub fast_stores: BTreeMap<NodeId, FastStoreElig>,
+    pub reserve_plans: BTreeMap<NodeId, ReservePlan>,
     pub stored_ctor_parents: BTreeSet<usize>,
     pub substitutions: BTreeMap<usize, Ty>,
     pub local_types: BTreeMap<(NodeId, InstanceId, String), Ty>,
@@ -169,13 +203,6 @@ impl ShapeFacts {
             }
             _ => ty,
         }
-    }
-
-    pub fn is_dense_at_depth(&self, name: &str, depth: usize) -> bool {
-        self.name_dense
-            .get(&(name.to_string(), depth))
-            .copied()
-            .unwrap_or(false)
     }
 
     pub fn check_row_reads(&mut self) {

@@ -946,13 +946,6 @@ impl Analyzer {
             return;
         }
         let dense_bases: Vec<String> = fills.iter().chain(nested_fills.iter()).cloned().collect();
-        self.layout.fill_loops.insert(
-            while_stmt,
-            FillPlan {
-                fills,
-                nested_fills,
-            },
-        );
 
         let depth = self.walk.scopes.len();
         for table_name in dense_bases {
@@ -975,6 +968,56 @@ impl Analyzer {
             }
 
             self.layout.name_dense.insert((table_name, depth), true);
+        }
+
+        // The reserve plan carries the lowerer's old emission-time
+        // decisions as walk facts: the fills visible here and dense at
+        // this depth take a pre-header reserve; the table-of-table
+        // names among them plus the nested fills take a reserve under
+        // the header. Plan presence is the conversion verdict (at
+        // least one visible dense fill, or any nested fill at all).
+        let depth = self.walk.scopes.len();
+        let visible = |name: &str| self.walk.scopes.iter().any(|s| s.contains_key(name));
+        let dense_here = |name: &str| {
+            self.layout
+                .name_dense
+                .get(&(name.to_string(), depth))
+                .copied()
+                .unwrap_or(false)
+        };
+        let tbl_of_tbl = |name: &str| {
+            self.walk
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|s| s.get(name))
+                .is_some_and(|bind| matches!(bind.ty, Tbl(ref inner) if matches!(**inner, Tbl(_))))
+        };
+        let pre_header: Vec<String> = fills
+            .iter()
+            .filter(|n| visible(n) && dense_here(n))
+            .cloned()
+            .collect();
+        let mut nested: Vec<String> = pre_header
+            .iter()
+            .filter(|n| tbl_of_tbl(n))
+            .cloned()
+            .collect();
+        nested.extend(
+            nested_fills
+                .iter()
+                .filter(|n| visible(n) && tbl_of_tbl(n))
+                .cloned(),
+        );
+        if !pre_header.is_empty() || !nested_fills.is_empty() {
+            self.layout.reserve_plans.insert(
+                while_stmt,
+                ReservePlan {
+                    pre_header,
+                    nested,
+                    ctor_reserves: BTreeSet::new(),
+                },
+            );
         }
     }
 

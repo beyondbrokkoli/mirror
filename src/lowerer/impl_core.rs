@@ -6,9 +6,7 @@ impl<'a> IrLowerer<'a> {
             current_block: 0,
             free_reg: 0,
             scopes: vec![BTreeMap::new()],
-            fills: FillCtxs {
-                loop_ctxs: Vec::new(),
-            },
+            reserves: Vec::new(),
             shape,
             cur_loc: None,
             handles: FreeHandles {

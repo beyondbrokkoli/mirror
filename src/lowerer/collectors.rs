@@ -187,10 +187,3 @@ fn as_ident(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn get_base_identifier(expr: &Expr) -> Option<&String> {
-    match expr {
-        Expr::Identifier { name, .. } => Some(name),
-        Expr::Index { obj, .. } => get_base_identifier(obj),
-        _ => None,
-    }
-}

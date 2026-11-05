@@ -8,7 +8,7 @@ use super::core::{
     SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
 };
 use super::facts;
-use super::facts::{FillPlan, ShapeFacts};
+use super::facts::{FastStoreElig, KeyShape, ReservePlan, ShapeFacts};
 use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 pub(super) use crate::diag::Diagnostic;
@@ -18,6 +18,7 @@ mod checker;
 mod checks;
 mod constraints;
 mod exits;
+mod fast_lane;
 mod functions;
 mod infer;
 mod lattice;
@@ -148,7 +149,8 @@ struct ReadSideState {
 
 struct LayoutFactsState {
     name_dense: BTreeMap<(String, usize), bool>,
-    fill_loops: BTreeMap<NodeId, super::facts::FillPlan>,
+    fast_stores: BTreeMap<NodeId, super::facts::FastStoreElig>,
+    reserve_plans: BTreeMap<NodeId, super::facts::ReservePlan>,
     verdicts: Vec<LayoutVerdict>,
 }
 
@@ -419,7 +421,8 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         },
         layout: LayoutFactsState {
             name_dense: BTreeMap::new(),
-            fill_loops: BTreeMap::new(),
+            fast_stores: BTreeMap::new(),
+            reserve_plans: BTreeMap::new(),
             verdicts: vec![LayoutVerdict::Growing; n],
         },
         ctor_lines: ctx.ctor_lines.clone(),
@@ -562,6 +565,7 @@ pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
         a.ledger.diagnostics.push(err.0);
     }
     a.plan_stmt_temp_frees(ctx.ast);
+    a.mint_fast_lane(ctx.ast);
 
     let mut facts = a
         .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)
@@ -775,8 +779,8 @@ impl Recorded {
             ret_path_keep_temps: self.own.ret_path_keep_temps,
             rebind_frees: self.own.rebind_grants,
             move_poisons: self.own.move_poisons,
-            name_dense: self.layout.name_dense,
-            fill_loops: self.layout.fill_loops,
+            fast_stores: self.layout.fast_stores,
+            reserve_plans: self.layout.reserve_plans,
             stored_ctor_parents: self.own.stored_ctor_parents,
             substitutions,
             local_types: self.chk.local_types,
