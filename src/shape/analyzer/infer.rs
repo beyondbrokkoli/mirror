@@ -1,0 +1,1100 @@
+use super::*;
+use crate::ast::has_break;
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum NumExpr {
+    Lit(i64),
+    Var(String),
+    Add(Box<NumExpr>, Box<NumExpr>),
+    Mul(Box<NumExpr>, Box<NumExpr>),
+    Other,
+}
+
+pub(super) fn num_of(expr: &Expr) -> NumExpr {
+    match expr {
+        Expr::Integer { value: v, .. } => NumExpr::Lit(*v),
+        Expr::Identifier { name: n, .. } => NumExpr::Var(n.clone()),
+        Expr::BinaryOp {
+            op: BinOp::Add,
+            left,
+            right,
+            ..
+        } => NumExpr::Add(Box::new(num_of(left)), Box::new(num_of(right))),
+        Expr::BinaryOp {
+            op: BinOp::Mul,
+            left,
+            right,
+            ..
+        } => NumExpr::Mul(Box::new(num_of(left)), Box::new(num_of(right))),
+        _ => NumExpr::Other,
+    }
+}
+
+pub(super) fn provably_nonneg(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &NumExpr,
+    self_name: &str,
+    path: &mut BTreeSet<String>,
+) -> bool {
+    match expr {
+        NumExpr::Lit(v) => *v >= 0,
+        NumExpr::Var(n) => {
+            if n == self_name {
+                true
+            } else if path.contains(n) {
+                false
+            } else {
+                let Some(shapes) = num_assigns.get(n) else {
+                    return false;
+                };
+                path.insert(n.clone());
+                let ok = shapes
+                    .iter()
+                    .all(|sh| provably_nonneg(num_assigns, sh, n, path));
+                path.remove(n);
+                ok
+            }
+        }
+        NumExpr::Add(a, b) | NumExpr::Mul(a, b) => {
+            provably_nonneg(num_assigns, a, self_name, path)
+                && provably_nonneg(num_assigns, b, self_name, path)
+        }
+        NumExpr::Other => false,
+    }
+}
+
+pub(super) fn guard_provably_nonneg_expr(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &Expr,
+) -> bool {
+    let mut path = BTreeSet::new();
+    provably_nonneg(num_assigns, &num_of(expr), "", &mut path)
+}
+
+pub(super) fn guard_provably_nonneg(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    guard: &str,
+) -> bool {
+    num_assigns.get(guard).is_some_and(|shapes| {
+        let mut path = BTreeSet::new();
+        shapes
+            .iter()
+            .all(|sh| provably_nonneg(num_assigns, sh, guard, &mut path))
+    })
+}
+
+pub(super) fn guard_only_ascends(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    stmts: &[Stmt],
+    guard: &str,
+) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Assignment { name, expr, .. } if name == guard => {
+                let Expr::BinaryOp {
+                    op: BinOp::Add,
+                    left,
+                    right,
+                    ..
+                } = expr
+                else {
+                    return false;
+                };
+                if !matches!(left.as_ref(), Expr::Identifier { name: n, .. } if n == guard) {
+                    return false;
+                }
+                if !guard_provably_nonneg_expr(num_assigns, right) {
+                    return false;
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                if !guard_only_ascends(num_assigns, body, guard) {
+                    return false;
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } if !guard_only_ascends(num_assigns, then_body, guard)
+                || !guard_only_ascends(num_assigns, else_body, guard) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+impl Analyzer {
+    pub(super) fn infer_bind(&mut self, rec: Gate, expr: &Expr) -> Result<TableShape, ShapeError> {
+        let (ty, aliases, lineage) = self.infer_expr(rec, expr)?;
+        Ok(TableShape {
+            ty,
+            layout: LayoutVerdict::default(),
+            aliases,
+            lineage,
+        })
+    }
+
+    pub(super) fn collect_entry_moves(
+        &mut self,
+        rec: Gate,
+        expr: &Expr,
+        out: &mut Vec<(usize, String)>,
+    ) -> Result<(), ShapeError> {
+        if let Expr::TableCtor { entries, .. } = expr {
+            for (_, e) in entries {
+                if let Expr::Identifier { name: n, .. } = e {
+                    let (d, bind) = self.resolve(rec, n)?;
+                    self.record_moved_param(n);
+                    self.check_boundary_pin(&bind, n)?;
+                    if matches!(bind.ty, Tbl(_)) && !out.iter().any(|(_, m)| m == n) {
+                        out.push((d, n.clone()));
+                    }
+                } else {
+                    self.collect_entry_moves(rec, e, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn infer_module_call(
+        &mut self,
+        rec: Gate,
+        obj: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
+        let base = match obj {
+            Expr::Identifier { name: n, .. } => n.as_str(),
+            _ => {
+                return Err(ShapeError(Diagnostic::scope(
+                    "the ffi surface's '.' base must be a name",
+                )));
+            }
+        };
+        let (_, bind) = self.resolve(rec, base)?;
+        let module = bind.ty == Ffi;
+        if module || bind.ty == FfiLib {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok(if module && name == "load" {
+                (FfiLib, BTreeSet::new(), BTreeMap::new())
+            } else if module && name == "arg_kind" {
+                (Int, BTreeSet::new(), BTreeMap::new())
+            } else {
+                (Pending, BTreeSet::new(), BTreeMap::new())
+            });
+        }
+        if bind.ty == Coro {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok(if name == "status" {
+                (Str, BTreeSet::new(), BTreeMap::new())
+            } else {
+                (Int, BTreeSet::new(), BTreeMap::new())
+            });
+        }
+        if matches!(bind.ty, Tbl(_)) {
+            for a in args {
+                self.infer_expr(rec, a)?;
+            }
+            return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
+        }
+        Err(ShapeError(Diagnostic::scope(format!(
+            "'{base}' is not the ffi module, a loaded library, or the coroutine \
+             module — '.' is the module surfaces', tables use '[]'"
+        ))))
+    }
+
+    pub(super) fn infer_expr(
+        &mut self,
+        rec: Gate,
+        expr: &Expr,
+    ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
+        match expr {
+            Expr::Integer { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_INT);
+                Ok((Int, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::Float { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_FLT);
+                Ok((Flt, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::Boolean { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_BOOL);
+                Ok((Bool, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::String { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_STR);
+                Ok((Str, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::Nil { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_NIL);
+                Ok((Conflict, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::TableCtor { entries, .. } => {
+                let id = self.lattice.sites[&expr.id()];
+                let mut first_elem_ty: Option<Ty> = None;
+                let mut row_sites: Vec<usize> = Vec::new();
+                for (ei, (k, e)) in entries.iter().enumerate() {
+                    if let CtorKey::Const(c) = k
+                        && let Some(&child) = self.lattice.sites.get(&e.id())
+                        && matches!(e, Expr::TableCtor { .. })
+                    {
+                        self.lattice
+                            .site_slots
+                            .entry(id)
+                            .or_default()
+                            .insert(*c, child);
+                    }
+                    if let CtorKey::Expr(ke) = k {
+                        let (kt, _, _) = self.infer_expr(rec, ke)?;
+                        if matches!(kt, Flt | Bool) {
+                            signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_KEY);
+                            continue;
+                        }
+                        self.pin_int_use(rec, ke, &kt);
+                        if rec.on() {
+                            self.check_key_threshold(rec, ke, &BTreeSet::from([id]))?;
+                        }
+                    } else if let CtorKey::Const(c) = k
+                        && rec.on()
+                    {
+                        self.check_key_threshold(
+                            rec,
+                            &Expr::Integer {
+                                value: *c,
+                                id: NodeId::mint(),
+                            },
+                            &BTreeSet::from([id]),
+                        )?;
+                    }
+                    let (t, esites, elineage) = self.infer_expr(rec, e)?;
+                    if matches!(t, Pending)
+                        && esites.iter().all(|s| is_root(s) || is_ghost(s))
+                        && self.walk.scopes.len() == 1
+                    {
+                        self.reads.boundary_fed.insert(id);
+                    }
+                    if matches!(t, Tbl(_)) {
+                        self.reads.tbl_value_stores.insert(id);
+                        for s in esites
+                            .iter()
+                            .copied()
+                            .filter(|s| !is_root(s) && !is_ghost(s))
+                        {
+                            row_sites.push(s);
+                        }
+                        if let Some(&child_site) = self.lattice.sites.get(&e.id()) {
+                            signal!(rec.on(), trace::TRACE_INFER_TBL_CHILD);
+                            self.lattice
+                                .child_sites
+                                .entry(id)
+                                .or_default()
+                                .insert(child_site);
+                        }
+                        if !matches!(e, Expr::TableCtor { .. }) {
+                            let entry_ghosts: Vec<usize> =
+                                esites.iter().copied().filter(is_ghost).collect();
+                            if !entry_ghosts.is_empty() {
+                                signal!(rec.on(), trace::TRACE_ROW_HOUSING);
+                                for &g in &entry_ghosts {
+                                    let Some(&birth) = self.lattice.ghost_site.get(&g) else {
+                                        signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
+                                        return Err(ShapeError(Diagnostic::lifetime(
+                                            "a row read with a dynamic or \
+                                             unproven key cannot be stored — its birth \
+                                             site is not visible to the lattice; store a \
+                                             row read through a literal key instead",
+                                        )));
+                                    };
+                                    if id == birth || self.birth_closure(id).contains(&birth) {
+                                        signal!(rec.on(), trace::TRACE_FAIL_ROW_STORE);
+                                        return Err(ShapeError(Diagnostic::lifetime(
+                                            "cyclic row store — the row \
+                                             read would be stored into a table that \
+                                             already contains it (alm's element types \
+                                             are finite)",
+                                        )));
+                                    }
+                                    self.check_row_housing(g, e)?;
+                                }
+                                for &g in &entry_ghosts {
+                                    let birth = self.lattice.ghost_site[&g];
+                                    self.reads.row_links.entry(id).or_default().insert(birth);
+                                    self.lattice.housed_ghosts.insert(g);
+                                    if let CtorKey::Const(c) = k {
+                                        self.lattice
+                                            .site_slots
+                                            .entry(id)
+                                            .or_default()
+                                            .insert(*c, g);
+                                    }
+                                    if rec.on() {
+                                        self.own
+                                            .ctor_ghost_keeps
+                                            .entry(expr.id())
+                                            .or_default()
+                                            .push((ei, g));
+                                        signal!(rec.on(), trace::TRACE_ROW_HOUSED);
+                                    }
+                                }
+                            } else if esites.iter().all(is_root) && !elineage.is_empty() {
+                                signal!(rec.on(), trace::TRACE_FAIL_BORROW_ESCAPE);
+                                return Err(ShapeError(Diagnostic::lifetime(
+                                    "a row read cannot be stored — borrows \
+                                     hold no ownership, and cells own exactly the headers \
+                                     they are given",
+                                )));
+                            }
+                            self.own.stored_ctor_parents.insert(id);
+                            let proj_values: Vec<usize> = esites
+                                .iter()
+                                .copied()
+                                .filter_map(|c| self.proj_node(c))
+                                .collect();
+                            for c in proj_values {
+                                self.reads.row_links.entry(id).or_default().insert(c);
+                            }
+                        }
+                    }
+                    match first_elem_ty {
+                        None => {
+                            signal!(rec.on(), trace::TRACE_INFER_TBL_FIRST);
+                            first_elem_ty = Some(t.clone());
+                        }
+                        Some(ref expected) => {
+                            let joined = join_ty(expected, &t);
+                            if joined == Conflict {
+                                signal!(rec.on(), trace::TRACE_INFER_TBL_MISMATCH);
+                                if self.lattice.site_elem[id] != Conflict {
+                                    self.probe(rec, trace::TRACE_INFER_TBL_CONFLICT);
+                                    self.lattice.site_elem[id] = Conflict;
+                                    self.walk.changed = true;
+                                }
+                            } else {
+                                signal!(rec.on(), trace::TRACE_INFER_TBL_MATCH);
+                                if matches!(joined, Any) && !matches!(expected, Any) {
+                                    self.probe(rec, trace::TRACE_CHK_ANY_MIXED_CTOR);
+                                    self.note_adopt(id, self.ctor_lines[id]);
+                                }
+                                if joined != *expected {
+                                    first_elem_ty = Some(joined);
+                                }
+                            }
+                        }
+                    }
+                    if matches!(t, Conflict) {
+                        crate::alm_dbgln!(
+                            "[ctor] site {id} line {:?}: cell value is Conflict",
+                            self.ctor_lines[id]
+                        );
+                    }
+                    self.decide(rec, id, &t);
+                }
+                let resolved = if self.lattice.site_elem[id] != Pending {
+                    signal!(rec.on(), trace::TRACE_INFER_TBL_RESOLVED);
+                    self.lattice.site_elem[id].clone()
+                } else {
+                    signal!(rec.on(), trace::TRACE_INFER_TBL_PENDING);
+                    first_elem_ty.unwrap_or(Pending)
+                };
+                if let Tbl(inner) = &resolved
+                    && contains_any(inner)
+                {
+                    for s in std::mem::take(&mut row_sites) {
+                        if self.lattice.site_elem[s] != **inner
+                            && !self.fn_body_sites.contains(&s)
+                            && !self.fn_param_sites.contains(&s)
+                        {
+                            self.probe(rec, trace::TRACE_CHK_ANY_MIXED_ROWS);
+                            self.note_adopt(s, self.ctor_lines[id]);
+                            self.decide(rec, s, inner);
+                        }
+                    }
+                }
+                Ok((
+                    Tbl(Box::new(resolved)),
+                    BTreeSet::from([id]),
+                    BTreeMap::new(),
+                ))
+            }
+            Expr::Index { obj, key, .. } => {
+                let (kt, _, _) = self.infer_expr(rec, key)?;
+                if matches!(kt, Flt | Bool) {
+                    crate::alm_dbgln!("[idx] bad key ty={:?}", kt);
+                    signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_KEY);
+                    self.infer_expr(rec, obj)?;
+                    return Ok((Conflict, BTreeSet::new(), BTreeMap::new()));
+                }
+                let (t, sites, mut lineage) = self.infer_expr(rec, obj)?;
+                if !matches!(t, Tbl(_)) {
+                    signal!(rec.on(), trace::TRACE_INFER_IDX_BAD_OBJ);
+                    let r = if matches!(t, Pending) {
+                        Pending
+                    } else {
+                        Conflict
+                    };
+                    for (&origin, (name, d)) in &lineage {
+                        if is_ghost(&origin) {
+                            continue;
+                        }
+                        let depth = d + 1;
+                        let e = self
+                            .reads
+                            .row_reads
+                            .entry(origin)
+                            .or_insert((name.clone(), depth));
+                        if depth > e.1 {
+                            e.1 = depth;
+                        }
+                    }
+                    return Ok((r, BTreeSet::new(), BTreeMap::new()));
+                }
+                self.pin_int_use(rec, key, &kt);
+                let claimed_rows: BTreeSet<usize> = self
+                    .lattice
+                    .claimed_ghosts
+                    .iter()
+                    .filter_map(|g| self.lattice.ghost_site.get(g).copied())
+                    .collect();
+                if !claimed_rows.is_empty() {
+                    let err = || {
+                        ShapeError(Diagnostic::lifetime(
+                            "this row was already released with its \
+                             housing — read it through the housing's cell before it \
+                             drops",
+                        ))
+                    };
+                    for &s in &sites {
+                        let row = if is_ghost(&s) {
+                            self.lattice.ghost_site.get(&s).copied()
+                        } else {
+                            Some(s)
+                        };
+                        if row.is_some_and(|r| claimed_rows.contains(&r)) {
+                            return Err(err());
+                        }
+                    }
+                    let slot_claimed = |base: usize, k: Option<i64>| -> bool {
+                        self.lattice.site_slots.get(&base).is_some_and(|m| {
+                            m.iter().any(|(kk, node)| {
+                                k.is_none_or(|x| *kk == x)
+                                    && self
+                                        .proj_node(*node)
+                                        .is_some_and(|p| claimed_rows.contains(&p))
+                            })
+                        })
+                    };
+                    let k = const_key_value(key);
+                    for &s in &sites {
+                        if !is_root(&s) && slot_claimed(s, k) {
+                            return Err(err());
+                        }
+                    }
+                }
+                let mut r = Pending;
+                for s in &sites {
+                    if !is_root(s) && !is_ghost(s) {
+                        signal!(rec.on(), trace::TRACE_INFER_IDX_VALID);
+                        self.lattice.needed[*s] = true;
+                        r = join_ty(&r, &self.lattice.site_elem[*s]);
+                    } else if is_ghost(s) {
+                        r = join_ty(&r, &self.ghost_row_elem(*s));
+                    }
+                }
+                for (&origin, (name, d)) in &lineage {
+                    if is_ghost(&origin) {
+                        continue;
+                    }
+                    let depth = d + 1;
+                    let e = self
+                        .reads
+                        .row_reads
+                        .entry(origin)
+                        .or_insert((name.clone(), depth));
+                    if depth > e.1 {
+                        e.1 = depth;
+                    }
+                }
+                for (_, d) in lineage.values_mut() {
+                    *d += 1;
+                }
+                if let Expr::Identifier { name, .. } = obj.as_ref() {
+                    for &s in &sites {
+                        if !is_root(&s) {
+                            lineage.entry(s).or_insert((name.clone(), 1));
+                        }
+                    }
+                }
+                let aliases = if lineage.is_empty() || value_kind(&r) || matches!(r, Conflict) {
+                    BTreeSet::new()
+                } else {
+                    signal!(rec.on(), trace::TRACE_ROW_GHOST_MINT);
+                    let node = expr.id();
+                    let ghost = match self.lattice.row_ghosts.get(&node) {
+                        Some(&g) => g,
+                        None => {
+                            let g = self.lattice.row_ghost_next;
+                            self.lattice.row_ghost_next += 1;
+                            self.lattice.row_ghosts.insert(node, g);
+                            g
+                        }
+                    };
+                    let bases: BTreeSet<usize> =
+                        sites.iter().copied().filter(|s| !is_root(s)).collect();
+                    self.lattice.ghost_mints.insert(
+                        ghost,
+                        GhostMint {
+                            bases,
+                            key: const_key_value(key),
+                        },
+                    );
+                    if let Some(k) = const_key_value(key) {
+                        let real: Vec<usize> = sites
+                            .iter()
+                            .copied()
+                            .filter(|s| !is_root(s) && !is_ghost(s))
+                            .collect();
+                        if real.len() == 1
+                            && let Some(&slot) = self
+                                .lattice
+                                .site_slots
+                                .get(&real[0])
+                                .and_then(|m| m.get(&k))
+                        {
+                            let birth = if is_ghost(&slot) {
+                                self.lattice.ghost_site.get(&slot).copied()
+                            } else {
+                                Some(slot)
+                            };
+                            if let Some(b) = birth {
+                                self.lattice.ghost_site.insert(ghost, b);
+                            }
+                        }
+                    }
+                    BTreeSet::from([ghost])
+                };
+                Ok((r, aliases, lineage))
+            }
+            Expr::Identifier { name, .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_IDENT);
+                let (depth, bind) = self.resolve(rec, name)?;
+                let _ = depth;
+                if matches!(bind.ty, Conflict) {
+                    crate::alm_dbgln!(
+                        "[ident] '{name}' resolves to Conflict aliases={:?}",
+                        bind.aliases
+                    );
+                }
+                Ok((bind.ty, bind.aliases.clone(), bind.lineage.clone()))
+            }
+            Expr::BinaryOp {
+                op, left, right, ..
+            } => {
+                let (lt, _, _) = self.infer_expr(rec, left)?;
+                let (rt, _, _) = self.infer_expr(rec, right)?;
+                match op {
+                    BinOp::And | BinOp::Or => {
+                        self.pin_bool_use(rec, left, &lt);
+                        self.pin_bool_use(rec, right, &rt);
+                    }
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::IntDiv
+                    | BinOp::Mod
+                    | BinOp::Div
+                    | BinOp::LessThan
+                    | BinOp::GreaterThan
+                    | BinOp::LessEq
+                    | BinOp::GreaterEq => {
+                        self.pin_numeric_pair(rec, left, &lt, right, &rt);
+                    }
+                    BinOp::Equal | BinOp::NotEqual => {
+                        self.pin_scalar_pair(rec, left, &lt, right, &rt);
+                    }
+                }
+                match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
+                        if let Some(t) = self.computed_arith_scalar(rec, left, &lt, right, &rt) {
+                            return Ok((t, BTreeSet::new(), BTreeMap::new()));
+                        }
+                    }
+                    BinOp::Div => {
+                        if let Some(t) = self.computed_div_scalar(rec, left, &lt, right, &rt) {
+                            return Ok((t, BTreeSet::new(), BTreeMap::new()));
+                        }
+                    }
+                    _ => {}
+                }
+                match op {
+                    BinOp::Div if matches!(lt, Int | Flt) && matches!(rt, Int | Flt) => {
+                        signal!(rec.on(), trace::TRACE_INFER_BINOP_ARITH);
+                        Ok((Flt, BTreeSet::new(), BTreeMap::new()))
+                    }
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
+                        signal!(rec.on(), trace::TRACE_INFER_BINOP_ARITH);
+                        if matches!(arith_ty(lt.clone(), rt.clone()), Conflict) {
+                            crate::alm_dbgln!("[arith] {:?} {op:?} {:?} = Conflict", lt, rt);
+                        }
+                        Ok((arith_ty(lt, rt), BTreeSet::new(), BTreeMap::new()))
+                    }
+                    _ => {
+                        signal!(rec.on(), trace::TRACE_INFER_BINOP_OTHER);
+                        Ok((Bool, BTreeSet::new(), BTreeMap::new()))
+                    }
+                }
+            }
+            Expr::UnaryOp { op, expr, .. } => {
+                let (t, _, _) = self.infer_expr(rec, expr)?;
+                match op {
+                    UnOp::Neg => {
+                        signal!(rec.on(), trace::TRACE_INFER_UNOP_NEG);
+                        self.pin_int_use(rec, expr, &t);
+                        if let Some(k) = self.computed_neg_scalar(rec, expr, &t) {
+                            return Ok((k, BTreeSet::new(), BTreeMap::new()));
+                        }
+                        Ok((t, BTreeSet::new(), BTreeMap::new()))
+                    }
+                    UnOp::Not => {
+                        signal!(rec.on(), trace::TRACE_INFER_UNOP_NOT);
+                        self.pin_bool_use(rec, expr, &t);
+                        Ok((Bool, BTreeSet::new(), BTreeMap::new()))
+                    }
+                    UnOp::Len => {
+                        signal!(rec.on(), trace::TRACE_INFER_UNOP_LEN);
+                        Ok((Int, BTreeSet::new(), BTreeMap::new()))
+                    }
+                }
+            }
+            Expr::SysAllocCount { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_SYSALLOC);
+                Ok((Int, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::SysExecCount { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_SYS_EXEC);
+                Ok((Int, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::FfiModule { .. } => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
+            Expr::CoroModule { .. } => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
+            Expr::Field { obj, .. } => {
+                let (ty, sites, lineage) = self.infer_expr(rec, obj)?;
+                match ty {
+                    Tbl(inner) if matches!(*inner, Conflict) => {
+                        crate::alm_dbgln!("[field] dot read on Tbl(Conflict) sites={:?}", sites);
+                        Ok((*inner, sites, lineage))
+                    }
+                    Tbl(inner) => Ok((*inner, sites, lineage)),
+                    _ => {
+                        crate::alm_dbgln!(
+                            "[field] dot access on non-table ty={:?} sites={:?}",
+                            ty,
+                            sites
+                        );
+                        Err(ShapeError(Diagnostic::scope(
+                            "dot access needs a record or the ffi surface",
+                        )))
+                    }
+                }
+            }
+            Expr::Function { .. } => {
+                signal!(rec.on(), trace::TRACE_INFER_IDENT);
+                Ok((Pending, BTreeSet::new(), BTreeMap::new()))
+            }
+            Expr::Call { callee, args, .. } => {
+                let name: String = match callee.as_ref() {
+                    Expr::Field { obj, name, .. } => {
+                        if let Some(dotted) = dotted_callee(callee.as_ref())
+                            && self.resolve_fn(&dotted).is_some()
+                        {
+                            dotted
+                        } else {
+                            return self.infer_module_call(rec, obj, name, args);
+                        }
+                    }
+                    Expr::Identifier { name: n, .. } => n.clone(),
+                    _ => {
+                        return Err(ShapeError(calls_through_fn_var_msg()));
+                    }
+                };
+                let name = name.as_str();
+                let Some(fn_ptr) = self.resolve_fn(name) else {
+                    for a in args {
+                        self.infer_expr(rec, a)?;
+                        self.check_uses(rec, a)?;
+                    }
+                    signal!(rec.on(), trace::TRACE_INFER_IDENT);
+                    return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
+                };
+                let params = self.fn_params.get(&fn_ptr).cloned().unwrap_or_default();
+                let stored_params = self.fn_store_params.get(&fn_ptr).cloned();
+                let moved_params = self.fn_moved_params.get(&fn_ptr).cloned();
+                let ret_params = self.fn_ret_params.get(&fn_ptr).cloned();
+                let mut ret_pinned = false;
+                let mut ret_arg_sites: BTreeSet<usize> = BTreeSet::new();
+                let mut ret_lineage: RowLineage = BTreeMap::new();
+                for (i, a) in args.iter().enumerate() {
+                    if let Expr::Identifier { name: n, .. } = a {
+                        let moves_it = moved_params
+                            .as_ref()
+                            .is_some_and(|m| params.get(i).is_some_and(|p| m.contains(p)));
+                        if moves_it {
+                            let cur = self
+                                .fn_walk
+                                .last()
+                                .map(|(fp, ps)| (*fp, ps.iter().any(|p| p == n)));
+                            if let Some((cur_fn, is_param)) = cur
+                                && is_param
+                            {
+                                self.fn_moved_params
+                                    .entry(cur_fn)
+                                    .or_default()
+                                    .insert(n.clone());
+                            }
+                            if let Ok((_, bind)) = self.resolve(rec, n)
+                                && bind.aliases.contains(&BOUNDARY_ROOT)
+                            {
+                                let p = params.get(i).cloned().unwrap_or_default();
+                                return Err(ShapeError(Diagnostic::lifetime(format!(
+                                    "'{name}' moves its parameter '{p}' \
+                                     into another table or binding — the pinned table \
+                                     '{n}' may not be passed to it (the host owns the \
+                                     boundary header)"
+                                ))));
+                            }
+                        }
+                        if ret_params.as_ref().is_some_and(|r| r.contains(&i))
+                            && let Ok((_, bind)) = self.resolve(rec, n)
+                            && bind.aliases.contains(&BOUNDARY_ROOT)
+                        {
+                            ret_pinned = true;
+                        }
+                    }
+                    let (_, sites, arg_lineage) = self.infer_expr(rec, a)?;
+                    if let Some(p) = params.get(i)
+                        && let Some(stored) = &stored_params
+                        && stored.contains(p)
+                    {
+                        self.fn_param_sites.extend(
+                            sites
+                                .iter()
+                                .copied()
+                                .filter(|s| !is_root(s) && !is_ghost(s)),
+                        );
+                    }
+                    if ret_params.as_ref().is_some_and(|r| r.contains(&i))
+                        && !matches!(a, Expr::Identifier { .. })
+                    {
+                        ret_arg_sites.extend(sites.iter().copied().filter(|s| !is_root(s)));
+                        for (origin, val) in &arg_lineage {
+                            match ret_lineage.entry(*origin) {
+                                std::collections::btree_map::Entry::Vacant(v) => {
+                                    v.insert(val.clone());
+                                }
+                                std::collections::btree_map::Entry::Occupied(mut o) => {
+                                    if val.1 > o.get().1 {
+                                        o.get_mut().1 = val.1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(shape) = self.fn_ret_shapes.get(&fn_ptr) {
+                    let mut aliases = shape.aliases.clone();
+                    aliases.extend(ret_arg_sites);
+                    if ret_pinned {
+                        aliases.insert(BOUNDARY_ROOT);
+                    }
+                    let mut lineage = shape.lineage.clone();
+                    for (origin, (name, d)) in ret_lineage {
+                        match lineage.entry(origin) {
+                            std::collections::btree_map::Entry::Vacant(v) => {
+                                v.insert((name, d));
+                            }
+                            std::collections::btree_map::Entry::Occupied(mut o) => {
+                                if d > o.get().1 {
+                                    o.get_mut().1 = d;
+                                }
+                            }
+                        }
+                    }
+                    Ok((shape.ty.clone(), aliases, lineage))
+                } else {
+                    signal!(rec.on(), trace::TRACE_INFER_IDENT);
+                    Ok((Pending, BTreeSet::new(), BTreeMap::new()))
+                }
+            }
+        }
+    }
+
+    pub(super) fn check_key_threshold(
+        &mut self,
+        rec: Gate,
+        key: &Expr,
+        sites: &BTreeSet<usize>,
+    ) -> Result<(), ShapeError> {
+        if let Some(i) = const_key_value(key) {
+            signal!(rec.on(), trace::TRACE_THRESH_INT);
+            if i >= BOUNDS_FAIL_THRESHOLD {
+                signal!(rec.on(), trace::TRACE_THRESH_BOUNDS);
+                return Err(ShapeError(Diagnostic::bounds("table index overflow")));
+            }
+            if i > SPARSE_THRESHOLD {
+                signal!(rec.on(), trace::TRACE_THRESH_SPARSE);
+                for &site in sites {
+                    if !is_root(&site) && !is_ghost(&site) {
+                        signal!(rec.on(), trace::TRACE_THRESH_SPARSE_ALIAS);
+                        self.layout.verdicts[site] =
+                            self.layout.verdicts[site].join(LayoutVerdict::Sparse);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn detect_fill_loop(
+        &mut self,
+        rec: Gate,
+        while_stmt: NodeId,
+        guard: &str,
+        bound: &Expr,
+        body: &[Stmt],
+    ) {
+        if has_break(body) {
+            return;
+        }
+        if body_has_call(body) {
+            return;
+        }
+        if !guard_provably_nonneg(&self.holds.num_assigns, guard) {
+            return;
+        }
+        if !guard_only_ascends(&self.holds.num_assigns, body, guard) {
+            return;
+        }
+
+        let mutated = self.collect_mutated_names(rec, body);
+        let stored = collect_stored_bases(body);
+        if idents_of(bound)
+            .iter()
+            .any(|v| mutated.contains(v) || stored.contains(v))
+        {
+            return;
+        }
+
+        let mut fills = BTreeSet::new();
+        let mut nested_fills = BTreeSet::new();
+
+        fn collect_fills(
+            stmts: &[Stmt],
+            guard: &str,
+            mutated: &BTreeSet<String>,
+            fills: &mut BTreeSet<String>,
+            nested_fills: &mut BTreeSet<String>,
+        ) {
+            for stmt in stmts {
+                if let Stmt::IndexAssign {
+                    obj,
+                    key:
+                        Expr::Identifier {
+                            name: key_ident, ..
+                        },
+                    ..
+                } = stmt
+                    && key_ident == guard
+                    && let Some(table_name) = get_base_identifier(obj)
+                    && !mutated.contains(table_name)
+                {
+                    match obj {
+                        Expr::Identifier { .. } => {
+                            fills.insert(table_name.clone());
+                        }
+                        Expr::Index { .. } => {
+                            nested_fills.insert(table_name.clone());
+                        }
+                        _ => {}
+                    }
+                }
+                match stmt {
+                    Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                        collect_fills(body, guard, mutated, fills, nested_fills)
+                    }
+                    Stmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        collect_fills(then_body, guard, mutated, fills, nested_fills);
+                        collect_fills(else_body, guard, mutated, fills, nested_fills);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        collect_fills(body, guard, &mutated, &mut fills, &mut nested_fills);
+
+        if fills.is_empty() && nested_fills.is_empty() {
+            return;
+        }
+        let dense_bases: Vec<String> = fills.iter().chain(nested_fills.iter()).cloned().collect();
+        self.layout.fill_loops.insert(
+            while_stmt,
+            FillPlan {
+                fills,
+                nested_fills,
+            },
+        );
+
+        let depth = self.walk.scopes.len();
+        for table_name in dense_bases {
+            let site_ids: BTreeSet<usize> = self
+                .walk
+                .scopes
+                .iter()
+                .rev()
+                .filter_map(|s| s.get(&table_name))
+                .flat_map(|ts| ts.aliases.iter().copied())
+                .collect();
+
+            for &site in &site_ids {
+                if !is_root(&site) && !is_ghost(&site) {
+                    signal!(rec.on(), trace::TRACE_FILL_LOOP_DENSE);
+                    if self.layout.verdicts[site] == LayoutVerdict::Growing {
+                        self.layout.verdicts[site] = LayoutVerdict::Dense;
+                    }
+                }
+            }
+
+            self.layout.name_dense.insert((table_name, depth), true);
+        }
+    }
+
+    pub(super) fn collect_mutated_names(&self, rec: Gate, stmts: &[Stmt]) -> BTreeSet<String> {
+        let mut mutated = BTreeSet::new();
+        for s in stmts {
+            match s {
+                Stmt::Assignment { name, .. } => {
+                    signal!(rec.on(), trace::TRACE_MUT_ASSIGN);
+                    mutated.insert(name.clone());
+                }
+                Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                    mutated.extend(self.collect_mutated_names(rec, body));
+                }
+                Stmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    signal!(rec.on(), trace::TRACE_MUT_IF);
+                    mutated.extend(self.collect_mutated_names(rec, then_body));
+                    mutated.extend(self.collect_mutated_names(rec, else_body));
+                }
+                _ => {}
+            }
+        }
+        mutated
+    }
+}
+
+fn idents_of(expr: &Expr) -> BTreeSet<String> {
+    fn go(expr: &Expr, out: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Identifier { name, .. } => {
+                out.insert(name.clone());
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                go(left, out);
+                go(right, out);
+            }
+            Expr::UnaryOp { expr, .. } => go(expr, out),
+            Expr::Index { obj, key, .. } => {
+                go(obj, out);
+                go(key, out);
+            }
+            Expr::Call { callee, args, .. } => {
+                go(callee, out);
+                for a in args {
+                    go(a, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BTreeSet::new();
+    go(expr, &mut out);
+    out
+}
+
+fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
+    let mut stored = BTreeSet::new();
+    for stmt in stmts {
+        match stmt {
+            Stmt::IndexAssign { obj, .. } => {
+                if let Some(base) = get_base_identifier(obj) {
+                    stored.insert(base.clone());
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
+                stored.extend(collect_stored_bases(body));
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                stored.extend(collect_stored_bases(then_body));
+                stored.extend(collect_stored_bases(else_body));
+            }
+            _ => {}
+        }
+    }
+    stored
+}
+
+fn expr_has_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_call(left) || expr_has_call(right),
+        Expr::UnaryOp { expr, .. } => expr_has_call(expr),
+        Expr::Index { obj, key, .. } => expr_has_call(obj) || expr_has_call(key),
+        Expr::Field { obj, .. } => expr_has_call(obj),
+        Expr::TableCtor { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| matches!(k, CtorKey::Expr(ke) if expr_has_call(ke)) || expr_has_call(v)),
+        _ => false,
+    }
+}
+
+fn body_has_call(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
+            exprs.iter().any(expr_has_call)
+        }
+        Stmt::Assignment { expr, .. } => expr_has_call(expr),
+        Stmt::IndexAssign {
+            obj, key, value, ..
+        } => expr_has_call(obj) || expr_has_call(key) || expr_has_call(value),
+        Stmt::While {
+            condition, body, ..
+        } => expr_has_call(condition) || body_has_call(body),
+        Stmt::Do { body, .. } => body_has_call(body),
+        Stmt::If {
+            condition,
+            then_body,
+            else_body,
+            ..
+        } => expr_has_call(condition) || body_has_call(then_body) || body_has_call(else_body),
+        Stmt::Expr { expr, .. } => expr_has_call(expr),
+        Stmt::Return { value: Some(e), .. } => expr_has_call(e),
+        _ => false,
+    })
+}
