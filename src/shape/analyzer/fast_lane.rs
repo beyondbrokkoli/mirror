@@ -20,6 +20,10 @@ struct LaneFrame {
     /// Names whose current binding differs from the binding this loop's
     /// header saw; block-scoped, like `guard_shadow`.
     shadowed: BTreeSet<String>,
+    /// The guard's compile-time entry value at this loop's header, from
+    /// the constant environment; offset keys need it to prove their
+    /// first key lands at or after zero.
+    entry_const: Option<i64>,
 }
 
 impl LaneFrame {
@@ -46,16 +50,57 @@ fn restore(frames: &mut [LaneFrame], saved: &LaneSnapshot) {
     }
 }
 
+/// Compile-time integer knowledge of names, mirroring the binding
+/// semantics the lowerer's registers carry: a declaration writes the
+/// current block's overlay (and lifts at the block's end), an
+/// assignment kills the persistent entry outright.
+#[derive(Clone)]
+struct ConstEnv {
+    base: BTreeMap<String, i64>,
+    overlay: BTreeMap<String, Option<i64>>,
+}
+
+impl ConstEnv {
+    fn new() -> Self {
+        ConstEnv {
+            base: BTreeMap::new(),
+            overlay: BTreeMap::new(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<i64> {
+        match self.overlay.get(name) {
+            Some(Some(v)) => Some(*v),
+            Some(None) => None,
+            None => self.base.get(name).copied(),
+        }
+    }
+
+    fn declare(&mut self, name: &str, init: Option<i64>) {
+        self.overlay.insert(name.to_string(), init);
+    }
+
+    fn assign(&mut self, name: &str) {
+        self.base.remove(name);
+        if self.overlay.contains_key(name) {
+            self.overlay.insert(name.to_string(), None);
+        }
+    }
+}
+
 struct LaneSink<'a> {
     plans: &'a BTreeMap<NodeId, (BTreeSet<String>, BTreeSet<String>)>,
     fast: BTreeMap<NodeId, FastStoreElig>,
     ctor: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    /// The widest `max(K, 0)` admitted per loop, sizing its reserves.
+    offsets: BTreeMap<NodeId, i64>,
 }
 
 impl Analyzer {
     /// Mint the fast-store facts over the whole program now that every
     /// conversion loop's reserve plan is final: store eligibility
-    /// depends on inner loops' plans too, so it cannot ride the walk.
+    /// depends on inner loops' plans too, so it cannot ride the walk
+    /// itself.
     pub(super) fn mint_fast_lane(&mut self, stmts: &[Stmt]) {
         let sets: BTreeMap<NodeId, (BTreeSet<String>, BTreeSet<String>)> = self
             .layout
@@ -75,30 +120,46 @@ impl Analyzer {
             plans: &sets,
             fast: BTreeMap::new(),
             ctor: BTreeMap::new(),
+            offsets: BTreeMap::new(),
         };
-        scan_stmts(stmts, &mut Vec::new(), &mut sink);
+        scan_stmts(stmts, &mut Vec::new(), &mut ConstEnv::new(), &mut sink);
         for (loop_id, hits) in sink.ctor {
             if let Some(plan) = self.layout.reserve_plans.get_mut(&loop_id) {
                 plan.ctor_reserves = hits;
+            }
+        }
+        for (loop_id, max_k) in sink.offsets {
+            if let Some(plan) = self.layout.reserve_plans.get_mut(&loop_id) {
+                plan.max_offset = max_k;
             }
         }
         self.layout.fast_stores = sink.fast;
     }
 }
 
-fn scan_stmts(stmts: &[Stmt], frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
+fn scan_stmts(
+    stmts: &[Stmt],
+    frames: &mut Vec<LaneFrame>,
+    env: &mut ConstEnv,
+    sink: &mut LaneSink,
+) {
     for stmt in stmts {
-        scan_stmt(stmt, frames, sink);
+        scan_stmt(stmt, frames, env, sink);
     }
 }
 
-fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
+fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink: &mut LaneSink) {
     match stmt {
         Stmt::LocalDecl { names, exprs, .. } => {
             for expr in exprs {
                 scan_expr(expr, sink);
             }
-            for name in names {
+            for (idx, name) in names.iter().enumerate() {
+                let init = match exprs.get(idx) {
+                    Some(Expr::Integer { value, .. }) => Some(*value),
+                    _ => None,
+                };
+                env.declare(name, init);
                 for frame in frames.iter_mut() {
                     if frame.guard == *name {
                         frame.guard_shadow = true;
@@ -109,6 +170,7 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
         }
         Stmt::Assignment { name, expr, .. } => {
             scan_expr(expr, sink);
+            env.assign(name);
             for frame in frames.iter_mut() {
                 if frame.guard == *name {
                     frame.guard_assigned = true;
@@ -152,16 +214,17 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
                     guard_assigned: false,
                     guard_shadow: false,
                     shadowed: BTreeSet::new(),
+                    entry_const: env.get(guard),
                 });
                 pushed = true;
             }
-            scan_block(body, frames, sink);
+            scan_block(body, frames, env, sink);
             if pushed {
                 frames.pop();
             }
         }
         Stmt::Do { body, .. } => {
-            scan_block(body, frames, sink);
+            scan_block(body, frames, env, sink);
         }
         Stmt::If {
             condition,
@@ -171,15 +234,33 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
         } => {
             scan_expr(condition, sink);
             let saved = snapshot(frames);
+            let saved_env = env.clone();
             let mut then_frames = frames.clone();
-            scan_stmts(then_body, &mut then_frames, sink);
+            let mut then_env = env.clone();
+            scan_stmts(then_body, &mut then_frames, &mut then_env, sink);
             let mut else_frames = frames.clone();
-            scan_stmts(else_body, &mut else_frames, sink);
+            let mut else_env = env.clone();
+            scan_stmts(else_body, &mut else_frames, &mut else_env, sink);
             for (i, frame) in frames.iter_mut().enumerate() {
                 frame.guard_assigned =
                     saved[i].0 || then_frames[i].guard_assigned || else_frames[i].guard_assigned;
             }
             restore(frames, &saved);
+            // A name whose constant either arm lost is not constant at
+            // the join; declarations lift with the arms' overlays.
+            let lost: Vec<String> = saved_env
+                .base
+                .keys()
+                .filter(|n| {
+                    then_env.base.get(*n) != saved_env.base.get(*n)
+                        || else_env.base.get(*n) != saved_env.base.get(*n)
+                })
+                .cloned()
+                .collect();
+            *env = saved_env;
+            for name in lost {
+                env.assign(&name);
+            }
         }
         Stmt::Print { exprs, .. } => {
             for e in exprs {
@@ -199,13 +280,20 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
 /// A nested block's statements run in sequence, and whatever they
 /// assigned leaks out past the block's end (the lowerer updates the
 /// visible binding in place), while shadows lift at the end.
-fn scan_block(stmts: &[Stmt], frames: &mut Vec<LaneFrame>, sink: &mut LaneSink) {
+fn scan_block(
+    stmts: &[Stmt],
+    frames: &mut Vec<LaneFrame>,
+    env: &mut ConstEnv,
+    sink: &mut LaneSink,
+) {
     let saved = snapshot(frames);
-    scan_stmts(stmts, frames, sink);
+    let saved_overlay = env.overlay.clone();
+    scan_stmts(stmts, frames, env, sink);
     for (frame, s) in frames.iter_mut().zip(&saved) {
         frame.guard_assigned = frame.guard_assigned || s.0;
     }
     restore(frames, &saved);
+    env.overlay = saved_overlay;
 }
 
 fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], sink: &mut LaneSink) {
@@ -216,12 +304,20 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
         if !frame.guard_live() {
             continue;
         }
-        if !matches!(
-            key,
-            Expr::Identifier { name, .. } if name == &frame.guard
-        ) {
+        let Some(shape) = guard_key_shape(key, &frame.guard) else {
             continue;
-        }
+        };
+        // An offset key must land at or after zero on its first trip:
+        // a negative key on the fast path is a negative getelementptr,
+        // and the runtime's negative-index no-op law lives only in the
+        // checked arm.
+        let shape = match shape {
+            KeyShape::Guard => shape,
+            KeyShape::GuardOffset(k) => match frame.entry_const {
+                Some(c) if c.checked_add(k).is_some_and(|v| v >= 0) => shape,
+                _ => continue,
+            },
+        };
         // A plain-name store on a pre-header-reserved table rides the
         // existing reserve when the name still names the binding the
         // loop's header saw; anything the plan holds as a nested row
@@ -235,10 +331,11 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                 FastStoreElig {
                     loop_id: frame.loop_id,
                     table: base.clone(),
-                    key: KeyShape::Guard,
+                    key: shape,
                     row_reserve: false,
                 },
             );
+            widen(sink, frame.loop_id, shape);
             return;
         }
         if frame.nested.contains(base) {
@@ -247,23 +344,37 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                 FastStoreElig {
                     loop_id: frame.loop_id,
                     table: base.clone(),
-                    key: KeyShape::Guard,
+                    key: shape,
                     row_reserve: true,
                 },
             );
+            widen(sink, frame.loop_id, shape);
             return;
         }
     }
 }
 
+/// The loop's reserves must cover `bound + max(K, 0)` cells for every
+/// admitted offset key `K`.
+fn widen(sink: &mut LaneSink, loop_id: NodeId, shape: KeyShape) {
+    let k = match shape {
+        KeyShape::Guard => 0,
+        KeyShape::GuardOffset(k) => k.max(0),
+    };
+    let entry = sink.offsets.entry(loop_id).or_insert(0);
+    if k > *entry {
+        *entry = k;
+    }
+}
+
 /// Function bodies ride their own emission contexts, never the lanes
-/// around their literals (a conversion loop's body admits no calls), so
-/// the frame stack starts empty inside them.
+/// or the constants around their literals (a conversion loop's body
+/// admits no calls), so both stacks start empty inside them.
 fn scan_expr(expr: &Expr, sink: &mut LaneSink) {
     match expr {
         Expr::Function { body, .. } => {
             let mut fresh = Vec::new();
-            scan_stmts(body, &mut fresh, sink);
+            scan_stmts(body, &mut fresh, &mut ConstEnv::new(), sink);
         }
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {

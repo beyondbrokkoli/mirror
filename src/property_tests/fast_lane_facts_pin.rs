@@ -1,4 +1,6 @@
 
+use crate::shape::KeyShape;
+
 fn lane_facts(source: &str) -> Result<(Vec<Stmt>, crate::shape::ShapeFacts), String> {
     let mut tokens = Vec::new();
     let mut offsets = Vec::new();
@@ -84,16 +86,16 @@ fn store_sites(stmts: &[Stmt], out: &mut Vec<(NodeId, String)>) {
 
 fn expect_lane(
     source: &str,
-    want_stores: &[(&str, bool)],
-    want_plans: &[(&[&str], &[&str])],
+    want_stores: &[(&str, bool, crate::shape::KeyShape)],
+    want_plans: &[(&[&str], &[&str], i64)],
 ) {
     let (ast, facts) = lane_facts(source).unwrap_or_else(|e| panic!("lane pin source rejected: {e}"));
     let mut sites = Vec::new();
     store_sites(&ast, &mut sites);
-    let mut got: Vec<(String, bool)> = Vec::new();
+    let mut got: Vec<(String, bool, crate::shape::KeyShape)> = Vec::new();
     for (id, base) in &sites {
         if let Some(elig) = facts.fast_stores.get(id) {
-            got.push((elig.table.clone(), elig.row_reserve));
+            got.push((elig.table.clone(), elig.row_reserve, elig.key));
             assert_eq!(
                 elig.table, *base,
                 "the fact's table name must be the store's base name"
@@ -104,26 +106,27 @@ fn expect_lane(
             );
         }
     }
-    let want: Vec<(String, bool)> = want_stores
+    let want: Vec<(String, bool, crate::shape::KeyShape)> = want_stores
         .iter()
-        .map(|(t, r)| (t.to_string(), *r))
+        .map(|(t, r, k)| (t.to_string(), *r, *k))
         .collect();
     assert_eq!(
         got, want,
         "fast-store facts diverged from the pinned lane shape"
     );
-    let mut plans: Vec<(Vec<String>, Vec<String>)> = facts
+    let mut plans: Vec<(Vec<String>, Vec<String>, i64)> = facts
         .reserve_plans
         .values()
-        .map(|p| (p.pre_header.clone(), p.nested.clone()))
+        .map(|p| (p.pre_header.clone(), p.nested.clone(), p.max_offset))
         .collect();
     plans.sort();
-    let want_plans: Vec<(Vec<String>, Vec<String>)> = want_plans
+    let want_plans: Vec<(Vec<String>, Vec<String>, i64)> = want_plans
         .iter()
-        .map(|(pre, nested)| {
+        .map(|(pre, nested, max_k)| {
             (
                 pre.iter().map(|s| s.to_string()).collect(),
                 nested.iter().map(|s| s.to_string()).collect(),
+                *max_k,
             )
         })
         .collect();
@@ -139,8 +142,8 @@ fn fast_lane_facts_pin_guard_fill_rides_the_lane() {
          \x20 t[i] = i\n\
          \x20 i = i + 1\n\
          end\n",
-        &[("t", false)],
-        &[(&["t"], &[])],
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &[], 0)],
     );
 }
 
@@ -153,8 +156,8 @@ fn fast_lane_facts_pin_nested_row_reserves_at_the_store() {
          \x20 t[0][i] = i\n\
          \x20 i = i + 1\n\
          end\n",
-        &[("t", true)],
-        &[(&[], &["t"])],
+        &[("t", true, KeyShape::Guard)],
+        &[(&[], &["t"], 0)],
     );
 }
 
@@ -206,8 +209,8 @@ fn fast_lane_facts_pin_guard_rebind_declines_later_stores() {
          \x20 t[i] = i\n\
          \x20 i = i + 1\n\
          end\n",
-        &[("t", false)],
-        &[(&["t"], &[])],
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &[], 0)],
     );
 }
 
@@ -221,7 +224,7 @@ fn fast_lane_facts_pin_store_after_the_increment_declines() {
          \x20 t[i] = i\n\
          end\n",
         &[],
-        &[(&["t"], &[])],
+        &[(&["t"], &[], 0)],
     );
 }
 
@@ -238,13 +241,13 @@ fn fast_lane_facts_pin_guard_shadow_scopes_to_its_block() {
          \x20 t[i] = i\n\
          \x20 i = i + 1\n\
          end\n",
-        &[("t", false)],
-        &[(&["t"], &[])],
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &[], 0)],
     );
 }
 
 #[test]
-fn fast_lane_facts_pin_offset_key_declines_in_phase_one() {
+fn fast_lane_facts_pin_offset_key_rides_with_a_constant_entry() {
     expect_lane(
         "local t = {}\n\
          local j = 1\n\
@@ -252,7 +255,51 @@ fn fast_lane_facts_pin_offset_key_declines_in_phase_one() {
          \x20 t[j-1] = j - 1\n\
          \x20 j = j + 1\n\
          end\n",
+        &[("t", false, KeyShape::GuardOffset(-1))],
+        &[(&["t"], &[], 0)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_zero_start_offset_declines() {
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i-1] = i + 4\n\
+         \x20 i = i + 1\n\
+         end\n",
         &[],
+        &[(&["t"], &[], 0)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_positive_offset_widens_the_reserve() {
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i+1] = i * 3\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[("t", false, KeyShape::GuardOffset(1))],
+        &[(&["t"], &[], 1)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_offset_without_a_constant_entry_declines() {
+    // `2 * 2` is provably nonnegative (the loop converts) but is not a
+    // literal, so no first-key bound can be proven for `i + 1`.
+    expect_lane(
+        "local t = {}\n\
+         local i = 2 * 2\n\
+         while i < 6 do\n\
+         \x20 t[i+1] = i * 3\n\
+         \x20 i = i + 1\n\
+         end\n",
         &[],
+        &[(&["t"], &[], 0)],
     );
 }

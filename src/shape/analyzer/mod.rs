@@ -9,7 +9,7 @@ use super::core::{
 };
 use super::facts;
 use super::facts::{FastStoreElig, KeyShape, ReservePlan, ShapeFacts};
-use super::helpers::{const_key_value, extract_guard, merge_table_scopes};
+use super::helpers::{const_key_value, extract_guard, guard_key_shape, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 pub(super) use crate::diag::Diagnostic;
 use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};

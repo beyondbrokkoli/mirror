@@ -43,6 +43,49 @@ pub fn extract_guard(condition: &Expr) -> Option<(&str, &Expr)> {
     }
 }
 
+/// The key's relation to a loop guard: the guard name itself, or the
+/// name plus or minus a constant literal (both operand orders for the
+/// sum; a constant minus the guard is not invertible and declines).
+/// `None` is every other shape.
+pub fn guard_key_shape(key: &Expr, guard: &str) -> Option<crate::shape::KeyShape> {
+    use crate::shape::KeyShape;
+    let literal = |e: &Expr| match e {
+        Expr::Integer { value, .. } => Some(*value),
+        _ => None,
+    };
+    let is_guard = |e: &Expr| matches!(e, Expr::Identifier { name, .. } if name == guard);
+    match key {
+        Expr::Identifier { name, .. } if name == guard => Some(KeyShape::Guard),
+        Expr::BinaryOp {
+            op: BinOp::Add,
+            left,
+            right,
+            ..
+        } => {
+            if is_guard(left) {
+                literal(right).map(KeyShape::GuardOffset)
+            } else {
+                literal(left)
+                    .filter(|_| is_guard(right))
+                    .map(KeyShape::GuardOffset)
+            }
+        }
+        Expr::BinaryOp {
+            op: BinOp::Sub,
+            left,
+            right,
+            ..
+        } => {
+            if is_guard(left) {
+                literal(right).and_then(|k| k.checked_neg().map(KeyShape::GuardOffset))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 pub fn merge_table_scopes(
     into: &mut [BTreeMap<String, TableShape>],
     a: &[BTreeMap<String, TableShape>],

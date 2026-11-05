@@ -901,15 +901,8 @@ impl Analyzer {
             nested_fills: &mut BTreeSet<String>,
         ) {
             for stmt in stmts {
-                if let Stmt::IndexAssign {
-                    obj,
-                    key:
-                        Expr::Identifier {
-                            name: key_ident, ..
-                        },
-                    ..
-                } = stmt
-                    && key_ident == guard
+                if let Stmt::IndexAssign { obj, key, .. } = stmt
+                    && guard_key_shape(key, guard).is_some()
                     && let Some(table_name) = get_base_identifier(obj)
                     && !mutated.contains(table_name)
                 {
@@ -1016,6 +1009,7 @@ impl Analyzer {
                     pre_header,
                     nested,
                     ctor_reserves: BTreeSet::new(),
+                    max_offset: 0,
                 },
             );
         }

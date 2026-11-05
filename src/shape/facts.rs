@@ -96,10 +96,12 @@ pub struct InstanceInfo {
 }
 
 /// How a fast-store key relates to its loop's guard. `Guard` is the
-/// key the guard name currently names.
+/// key the guard name currently names; `GuardOffset(k)` is that name
+/// plus the constant `k` (`j - 1` is `GuardOffset(-1)`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyShape {
     Guard,
+    GuardOffset(i64),
 }
 
 /// One store the walk proved eligible for the fast lane. Presence in
@@ -113,8 +115,10 @@ pub struct FastStoreElig {
     /// this name alone does not say which claim fired.
     #[allow(dead_code)]
     pub table: String,
-    /// Phase 1 admits exactly the guard key; the shape travels with
-    /// the fact so later key shapes extend the gate in the walk alone.
+    /// The key's relation to the guard. The lowerer lowers the key
+    /// expression and never branches on the shape; it travels with the
+    /// fact so key-shape extensions stay walk-side, where the proof
+    /// obligations live.
     #[allow(dead_code)]
     pub key: KeyShape,
     /// The claim is the nested-row kind: the store's table register is
@@ -133,6 +137,10 @@ pub struct ReservePlan {
     pub pre_header: Vec<String>,
     pub nested: Vec<String>,
     pub ctor_reserves: BTreeSet<NodeId>,
+    /// The largest `max(K, 0)` over the loop's admitted offset keys;
+    /// the reserves cover `bound + max_offset` cells. The loop's
+    /// condition still tests the raw bound.
+    pub max_offset: i64,
 }
 
 #[derive(Clone)]

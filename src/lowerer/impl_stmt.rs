@@ -322,17 +322,34 @@ impl<'a> IrLowerer<'a> {
                     _ => None,
                 };
                 let mut conv_bound_reg: Option<Reg<Int>> = None;
+                let mut reserve_bound_reg: Option<Reg<Int>> = None;
                 if let (Some((_, plan)), Some(bound_expr)) = (&plan, conv_bound) {
                     let saved_scopes = self.scopes.clone();
                     let TypedReg { reg: b_any, .. } = self.lower_expr(bound_expr, None)?;
                     self.scopes = saved_scopes;
                     let b_reg = int_of(b_any)?;
                     conv_bound_reg = Some(b_reg);
+                    // Offset keys reach `bound + K`; the reserves cover
+                    // them with one widened register while the loop's
+                    // condition keeps testing the raw bound.
+                    let reserve_reg = if plan.max_offset > 0 {
+                        let k_reg = self.next_reg();
+                        self.emit(Instruction::LoadInt {
+                            target: Reg::new(k_reg),
+                            val: plan.max_offset,
+                        });
+                        let sum = self.next_reg();
+                        self.num3(Instruction::Add, sum, b_reg, Reg::new(k_reg));
+                        Reg::new(sum)
+                    } else {
+                        b_reg
+                    };
+                    reserve_bound_reg = Some(reserve_reg);
                     for name in &plan.pre_header {
                         let t_reg = ptr_of(self.read_var(name)?.reg)?;
                         self.emit(Instruction::TableReserve {
                             table: t_reg,
-                            bound: b_reg,
+                            bound: reserve_reg,
                         });
                     }
                     self.emit_cond_temp_frees(stmt);
@@ -377,7 +394,7 @@ impl<'a> IrLowerer<'a> {
                 });
 
                 if let Some((_, plan)) = &plan {
-                    let bound = conv_bound_reg.expect(
+                    let bound = reserve_bound_reg.expect(
                         "a planned loop lowered its bound in the pre-header — \
                          the plan's presence implies the condition's right \
                          operand was lowered",
