@@ -82,6 +82,72 @@ pub(super) fn guard_provably_nonneg(
     })
 }
 
+/// The sound lower bound of the guard's value at loop entry, minted
+/// beside `guard_provably_nonneg` from the same shapes at the same
+/// instant: every rule under-approximates every runtime value, so the
+/// admission gate can spend it as an entry when the exact constant is
+/// unknown. `None` = no derivable bound (a cycle is a previous trip,
+/// not the entry).
+pub(super) fn guard_lower_bound(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    guard: &str,
+) -> Option<i64> {
+    let shapes = num_assigns.get(guard)?;
+    let mut best = i64::MAX;
+    for sh in shapes {
+        let mut path = BTreeSet::new();
+        let bound = shape_lower_bound(num_assigns, sh, guard, &mut path)?;
+        best = best.min(bound);
+    }
+    Some(best)
+}
+
+pub(super) fn shape_lower_bound(
+    num_assigns: &BTreeMap<String, Vec<NumExpr>>,
+    expr: &NumExpr,
+    self_name: &str,
+    path: &mut BTreeSet<String>,
+) -> Option<i64> {
+    match expr {
+        NumExpr::Lit(v) => Some(*v),
+        NumExpr::Var(n) => {
+            if n == self_name || path.contains(n) {
+                return None;
+            }
+            let shapes = num_assigns.get(n)?;
+            if shapes.is_empty() {
+                return None;
+            }
+            path.insert(n.clone());
+            let mut best = i64::MAX;
+            for sh in shapes {
+                let bound = shape_lower_bound(num_assigns, sh, n, path)?;
+                best = best.min(bound);
+            }
+            path.remove(n);
+            Some(best)
+        }
+        NumExpr::Add(a, b) => {
+            let la = shape_lower_bound(num_assigns, a, self_name, path)?;
+            let lb = shape_lower_bound(num_assigns, b, self_name, path)?;
+            la.checked_add(lb)
+        }
+        NumExpr::Mul(a, b) => {
+            let la = shape_lower_bound(num_assigns, a, self_name, path)?;
+            let lb = shape_lower_bound(num_assigns, b, self_name, path)?;
+            // Monotone only over nonnegative operands; a negative
+            // factor flips the inequality and the product stops being
+            // a bound.
+            if la >= 0 && lb >= 0 {
+                la.checked_mul(lb)
+            } else {
+                None
+            }
+        }
+        NumExpr::Other => None,
+    }
+}
+
 pub(super) fn guard_only_ascends(
     num_assigns: &BTreeMap<String, Vec<NumExpr>>,
     stmts: &[Stmt],
@@ -1021,7 +1087,8 @@ impl Analyzer {
                     pre_header,
                     nested,
                     ctor_reserves: BTreeSet::new(),
-                    key_offset: 0,
+                    entry_lb: guard_lower_bound(&self.holds.num_assigns, guard),
+                    key_offset: None,
                 },
             );
         }

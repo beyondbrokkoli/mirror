@@ -24,6 +24,10 @@ struct LaneFrame {
     /// the constant environment; offset keys need it to prove their
     /// first key lands at or after zero.
     entry_const: Option<i64>,
+    /// The plan's minted lower bound on the same entry (an
+    /// under-approximation through Var chains): the gate reads the
+    /// exact value when known, this bound when not.
+    entry_lb: Option<i64>,
 }
 
 impl LaneFrame {
@@ -88,15 +92,19 @@ impl ConstEnv {
     }
 }
 
+/// One plan's entry facts for the lane: the pre-header and nested
+/// name sets plus the minted lower bound on the loop entry.
+type PlanSets = (BTreeSet<String>, BTreeSet<String>, Option<i64>);
+
 struct LaneSink<'a> {
-    plans: &'a BTreeMap<NodeId, (BTreeSet<String>, BTreeSet<String>)>,
+    plans: &'a BTreeMap<NodeId, PlanSets>,
     fast: BTreeMap<NodeId, FastStoreElig>,
     ctor: BTreeMap<NodeId, BTreeSet<NodeId>>,
     /// The widest physical offset admitted per loop, sizing its
     /// reserves. Signed and unclamped: the tight form reserves
     /// `bound + K_eff` cells so the border equals the logical length
-    /// under every base.
-    offsets: BTreeMap<NodeId, i64>,
+    /// under every base. `None` = the loop minted no admitted store.
+    offsets: BTreeMap<NodeId, Option<i64>>,
     /// The surface index base the walk runs under; `GuardOffset` shapes
     /// arrive pre-folded from recognition, and a bare `Guard`'s physical
     /// offset `-index_base` is derived at its consumers here.
@@ -109,7 +117,7 @@ impl Analyzer {
     /// depends on inner loops' plans too, so it cannot ride the walk
     /// itself.
     pub(super) fn mint_fast_lane(&mut self, stmts: &[Stmt]) {
-        let sets: BTreeMap<NodeId, (BTreeSet<String>, BTreeSet<String>)> = self
+        let sets: BTreeMap<NodeId, PlanSets> = self
             .layout
             .reserve_plans
             .iter()
@@ -119,6 +127,7 @@ impl Analyzer {
                     (
                         p.pre_header.iter().cloned().collect(),
                         p.nested.iter().cloned().collect(),
+                        p.entry_lb,
                     ),
                 )
             })
@@ -212,7 +221,7 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
             scan_expr(condition, sink);
             let mut pushed = false;
             if let Some((guard, _)) = extract_guard(condition)
-                && let Some((pre_header, nested)) = sink.plans.get(&stmt.id())
+                && let Some((pre_header, nested, entry_lb)) = sink.plans.get(&stmt.id())
             {
                 frames.push(LaneFrame {
                     loop_id: stmt.id(),
@@ -223,6 +232,7 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                     guard_shadow: false,
                     shadowed: BTreeSet::new(),
                     entry_const: env.get(guard),
+                    entry_lb: *entry_lb,
                 });
                 pushed = true;
             }
@@ -321,18 +331,17 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
             KeyShape::Guard => -sink.index_base,
             KeyShape::GuardOffset(k) => k,
         };
-        // An offset key must land at or after zero on its first trip:
-        // a negative key on the fast path is a negative getelementptr,
-        // and the runtime's negative-index no-op law lives only in the
-        // checked arm. A bare guard at base 0 is the one unconditional
-        // historical case (its offset is zero in physical space); under
-        // base 1 the bare guard is an offset key like any other.
-        let admitted = match (&shape, k_phys) {
-            (KeyShape::Guard, 0) => true,
-            _ => {
-                matches!(frame.entry_const, Some(c) if c.checked_add(k_phys).is_some_and(|v| v >= 0))
-            }
-        };
+        // One admission law for every key shape: the entry's exact
+        // constant when known, the plan's minted lower bound when not,
+        // and `first + k_phys >= 0` on the checked sum. A minted plan
+        // passed `guard_provably_nonneg`, and a provably nonnegative
+        // entry under-approximates to a bound `>= 0` — so a base-0
+        // bare guard (offset 0) admits through the same formula
+        // without an unconditional arm. An entry with neither a
+        // constant nor a bound declines: the fast path must never
+        // turn a negative key into a negative getelementptr.
+        let first = frame.entry_const.or(frame.entry_lb);
+        let admitted = matches!(first, Some(c) if c.checked_add(k_phys).is_some_and(|v| v >= 0));
         if !admitted {
             continue;
         }
@@ -376,13 +385,12 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
 /// admitted key: the widest physical offset wins, negative offsets
 /// included (the tight form — the border must equal the logical
 /// length under every base, and a negative offset's highest write is
-/// `bound - 1 + K_eff`).
+/// `bound - 1 + K_eff`). Option-max over `None`: a loop with no
+/// admitted store keeps `None`, and the placeholder ambiguity is gone.
 fn widen(sink: &mut LaneSink, loop_id: NodeId, k_phys: i64) {
-    // Seeded at the floor, not zero: a zero seed would silently
-    // re-clamp every negative offset back to a `bound`-sized reserve.
-    let entry = sink.offsets.entry(loop_id).or_insert(i64::MIN);
-    if k_phys > *entry {
-        *entry = k_phys;
+    let entry = sink.offsets.entry(loop_id).or_insert(None);
+    if entry.is_none_or(|current| k_phys > current) {
+        *entry = Some(k_phys);
     }
 }
 

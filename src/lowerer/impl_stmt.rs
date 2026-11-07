@@ -333,17 +333,20 @@ impl<'a> IrLowerer<'a> {
                     // cover them with one widened register (signed — a
                     // negative offset tightens the reserve) while the
                     // loop's condition keeps testing the raw bound.
-                    let reserve_reg = if plan.key_offset != 0 {
-                        let k_reg = self.next_reg();
-                        self.emit(Instruction::LoadInt {
-                            target: Reg::new(k_reg),
-                            val: plan.key_offset,
-                        });
-                        let sum = self.next_reg();
-                        self.num3(Instruction::Add, sum, b_reg, Reg::new(k_reg));
-                        Reg::new(sum)
-                    } else {
-                        b_reg
+                    // `None` or a claimed 0 both emit the raw bound:
+                    // no admitted offset, no widening register.
+                    let reserve_reg = match plan.key_offset {
+                        Some(off) if off != 0 => {
+                            let k_reg = self.next_reg();
+                            self.emit(Instruction::LoadInt {
+                                target: Reg::new(k_reg),
+                                val: off,
+                            });
+                            let sum = self.next_reg();
+                            self.num3(Instruction::Add, sum, b_reg, Reg::new(k_reg));
+                            Reg::new(sum)
+                        }
+                        _ => b_reg,
                     };
                     reserve_bound_reg = Some(reserve_reg);
                     for name in &plan.pre_header {

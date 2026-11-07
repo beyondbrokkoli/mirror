@@ -121,7 +121,7 @@ fn store_sites(stmts: &[Stmt], out: &mut Vec<(NodeId, String)>) {
 fn expect_lane(
     source: &str,
     want_stores: &[(&str, bool, crate::shape::KeyShape)],
-    want_plans: &[(&[&str], &[&str], i64)],
+    want_plans: &[(&[&str], &[&str], Option<i64>)],
 ) {
     expect_lane_base(source, 0, want_stores, want_plans);
 }
@@ -130,7 +130,7 @@ fn expect_lane_base(
     source: &str,
     index_base: i64,
     want_stores: &[(&str, bool, crate::shape::KeyShape)],
-    want_plans: &[(&[&str], &[&str], i64)],
+    want_plans: &[(&[&str], &[&str], Option<i64>)],
 ) {
     let (ast, facts) =
         lane_facts_base(source, index_base).unwrap_or_else(|e| panic!("lane pin source rejected: {e}"));
@@ -158,13 +158,13 @@ fn expect_lane_base(
         got, want,
         "fast-store facts diverged from the pinned lane shape"
     );
-    let mut plans: Vec<(Vec<String>, Vec<String>, i64)> = facts
+    let mut plans: Vec<(Vec<String>, Vec<String>, Option<i64>)> = facts
         .reserve_plans
         .values()
         .map(|p| (p.pre_header.clone(), p.nested.clone(), p.key_offset))
         .collect();
     plans.sort();
-    let want_plans: Vec<(Vec<String>, Vec<String>, i64)> = want_plans
+    let want_plans: Vec<(Vec<String>, Vec<String>, Option<i64>)> = want_plans
         .iter()
         .map(|(pre, nested, max_k)| {
             (
@@ -187,7 +187,7 @@ fn fast_lane_facts_pin_guard_fill_rides_the_lane() {
          \x20 i = i + 1\n\
          end\n",
         &[("t", false, KeyShape::Guard)],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], Some(0))],
     );
 }
 
@@ -201,7 +201,7 @@ fn fast_lane_facts_pin_nested_row_reserves_at_the_store() {
          \x20 i = i + 1\n\
          end\n",
         &[("t", true, KeyShape::Guard)],
-        &[(&[], &["t"], 0)],
+        &[(&[], &["t"], Some(0))],
     );
 }
 
@@ -254,7 +254,7 @@ fn fast_lane_facts_pin_guard_rebind_declines_later_stores() {
          \x20 i = i + 1\n\
          end\n",
         &[("t", false, KeyShape::Guard)],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], Some(0))],
     );
 }
 
@@ -268,7 +268,7 @@ fn fast_lane_facts_pin_store_after_the_increment_declines() {
          \x20 t[i] = i\n\
          end\n",
         &[],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], None)],
     );
 }
 
@@ -286,7 +286,7 @@ fn fast_lane_facts_pin_guard_shadow_scopes_to_its_block() {
          \x20 i = i + 1\n\
          end\n",
         &[("t", false, KeyShape::Guard)],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], Some(0))],
     );
 }
 
@@ -303,7 +303,7 @@ fn fast_lane_facts_pin_offset_key_rides_with_a_constant_entry() {
          \x20 j = j + 1\n\
          end\n",
         &[("t", false, KeyShape::GuardOffset(-1))],
-        &[(&["t"], &[], -1)],
+        &[(&["t"], &[], Some(-1))],
     );
 }
 
@@ -317,7 +317,7 @@ fn fast_lane_facts_pin_zero_start_offset_declines() {
          \x20 i = i + 1\n\
          end\n",
         &[],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], None)],
     );
 }
 
@@ -331,14 +331,17 @@ fn fast_lane_facts_pin_positive_offset_widens_the_reserve() {
          \x20 i = i + 1\n\
          end\n",
         &[("t", false, KeyShape::GuardOffset(1))],
-        &[(&["t"], &[], 1)],
+        &[(&["t"], &[], Some(1))],
     );
 }
 
 #[test]
-fn fast_lane_facts_pin_offset_without_a_constant_entry_declines() {
-    // `2 * 2` is provably nonnegative (the loop converts) but is not a
-    // literal, so no first-key bound can be proven for `i + 1`.
+fn fast_lane_facts_pin_offset_without_a_constant_entry_admits_through_the_entry_bound() {
+    // `2 * 2` is provably nonnegative (the loop converts) and is not
+    // a literal, so the exact constant is unknown — but the plan's
+    // minted entry bound (the product's floor 4) re-proves the first
+    // key: 4 + 1 >= 0, so the store rides the lane and the plan
+    // carries the claimed offset.
     expect_lane(
         "local t = {}\n\
          local i = 2 * 2\n\
@@ -346,8 +349,8 @@ fn fast_lane_facts_pin_offset_without_a_constant_entry_declines() {
          \x20 t[i+1] = i * 3\n\
          \x20 i = i + 1\n\
          end\n",
-        &[],
-        &[(&["t"], &[], 0)],
+        &[("t", false, KeyShape::GuardOffset(1))],
+        &[(&["t"], &[], Some(1))],
     );
 }
 
@@ -365,7 +368,7 @@ fn fast_lane_facts_pin_base1_bare_guard_folds_and_tightens() {
          end\n",
         1,
         &[("t", false, KeyShape::Guard)],
-        &[(&["t"], &[], -1)],
+        &[(&["t"], &[], Some(-1))],
     );
 }
 
@@ -373,7 +376,8 @@ fn fast_lane_facts_pin_base1_bare_guard_folds_and_tightens() {
 fn fast_lane_facts_pin_base1_zero_start_declines_the_lane() {
     // A zero-start fill under base 1 has a negative first physical key
     // (0 - 1 = -1), so the admission gate declines the fast lane; the
-    // declined store contributes no offset and the plan keeps 0.
+    // declined store contributes no offset and the plan keeps None
+    // (the reserve stays at the raw bound).
     expect_lane_base(
         "local t = {}\n\
          local i = 0\n\
@@ -383,8 +387,75 @@ fn fast_lane_facts_pin_base1_zero_start_declines_the_lane() {
          end\n",
         1,
         &[],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], None)],
     );
+}
+
+#[test]
+fn fast_lane_facts_pin_var_chain_entry_admits_through_the_plan_bound() {
+    // The Var-chain spelling the placeholder era declined: `i`'s entry
+    // has no exact constant (ConstEnv records only Integer inits), but
+    // the plan mints the entry bound from the same num_assigns its
+    // nonneg gate read — start holds Lit 1, so lb(i) = 1 and the bare
+    // guard's first physical key 1 - 1 = 0 admits under base 1.
+    let source = "local start = 1\n\
+                  local t = {}\n\
+                  local i = start\n\
+                  while i < 9 do\n\
+                  \x20 t[i] = i\n\
+                  \x20 i = i + 1\n\
+                  end\n";
+    let (ast, facts) = lane_facts_base(source, 1).unwrap();
+    let mut sites = Vec::new();
+    store_sites(&ast, &mut sites);
+    assert_eq!(
+        facts.fast_stores.len(),
+        1,
+        "the bare-guard fill rides the lane through the plan bound"
+    );
+    let plan = facts
+        .reserve_plans
+        .values()
+        .next()
+        .expect("the loop carries a reserve plan");
+    assert_eq!(plan.entry_lb, Some(1), "the Var chain's floor is the entry bound");
+    assert_eq!(plan.key_offset, Some(-1), "the claimed physical offset is -1");
+}
+
+#[test]
+fn fast_lane_facts_pin_if_join_entry_admits_through_the_plan_bound() {
+    // An if-join entry: the walk appends both arms' assignment shapes
+    // to the declaration's, so the bound is the minimum over every
+    // recorded shape — the arms' lows (1 and 2) — and the base-1 bare
+    // guard admits exactly as the Var-chain spelling does. A stale
+    // high decl (3) does not loosen the floor.
+    let source = "local t = {}\n\
+                  local start = 3\n\
+                  if 0 < 1 then\n\
+                  \x20 start = 1\n\
+                  else\n\
+                  \x20 start = 2\n\
+                  end\n\
+                  local i = start\n\
+                  while i < 9 do\n\
+                  \x20 t[i] = i\n\
+                  \x20 i = i + 1\n\
+                  end\n";
+    let (ast, facts) = lane_facts_base(source, 1).unwrap();
+    let mut sites = Vec::new();
+    store_sites(&ast, &mut sites);
+    assert_eq!(
+        facts.fast_stores.len(),
+        1,
+        "the if-join entry re-proves the first key through the bound"
+    );
+    let plan = facts
+        .reserve_plans
+        .values()
+        .next()
+        .expect("the loop carries a reserve plan");
+    assert_eq!(plan.entry_lb, Some(1), "the arms' minimum is the entry bound");
+    assert_eq!(plan.key_offset, Some(-1), "the claimed physical offset is -1");
 }
 
 #[test]
@@ -401,7 +472,7 @@ fn fast_lane_facts_pin_base1_offset_folds_at_recognition() {
          end\n",
         1,
         &[("t", false, KeyShape::GuardOffset(1))],
-        &[(&["t"], &[], 1)],
+        &[(&["t"], &[], Some(1))],
     );
 }
 

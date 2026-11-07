@@ -137,12 +137,20 @@ pub struct ReservePlan {
     pub pre_header: Vec<String>,
     pub nested: Vec<String>,
     pub ctor_reserves: BTreeSet<NodeId>,
-    /// The widest physical key offset `K_eff` over the loop's admitted
-    /// keys (signed, unclamped — the tight form); the reserves cover
-    /// `bound + K_eff` cells so the border equals the logical length
-    /// under every base. The loop's condition still tests the raw
-    /// bound.
-    pub key_offset: i64,
+    /// The loop entry's sound lower bound, minted by `detect_fill_loop`
+    /// from the same `num_assigns` its nonneg gate reads at the same
+    /// instant (the body has not walked yet, so the shapes are the
+    /// entry facts). The admission gate reads it when the entry has no
+    /// exact constant; `None` = no derivable bound.
+    pub entry_lb: Option<i64>,
+    /// `None` = no admitted offset (a declined store contributes
+    /// nothing and the reserves keep the raw bound); `Some(k)` = the
+    /// widest physical key offset `K_eff` over the loop's admitted
+    /// keys (signed, unclamped — the tight form), so the reserves
+    /// cover `bound + K_eff` cells and the border equals the logical
+    /// length under every base. The loop's condition still tests the
+    /// raw bound.
+    pub key_offset: Option<i64>,
 }
 
 #[derive(Clone)]
