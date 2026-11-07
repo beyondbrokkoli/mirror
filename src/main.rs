@@ -263,6 +263,9 @@ FLAGS:
     --exe         Link a standalone executable (@main entry, no boundary table).
     --lib         Link a shared library (default; explicit for clarity).
     --debug       -O0, frame pointers, no inlining — dev loop tracing.
+    --index-base=N  Surface index base for table keys: 0 (default) or 1
+                    (Lua-style; constructor literals and bracket keys shift
+                    at their choke points, #t stays base-blind).
 
 The compiler performs a pure transform to native code. If --output is omitted,
 it defaults to libalm_out.so (or alm_out for --exe).";
@@ -271,6 +274,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
     let mut debug = false;
     let mut verbose = false;
     let mut output_file: Option<String> = None;
+    let mut index_base: i64 = 0;
     let mut idx = 1;
     while let Some(flag) = args.get(idx).map(String::as_str) {
         match flag {
@@ -314,6 +318,21 @@ it defaults to libalm_out.so (or alm_out for --exe).";
                 output_file = Some(flag["--output=".len()..].to_string());
                 idx += 1;
             }
+            _ if flag.starts_with("--index-base=") => {
+                let raw = &flag["--index-base=".len()..];
+                index_base = match raw.parse::<i64>() {
+                    Ok(0) => 0,
+                    Ok(1) => 1,
+                    _ => {
+                        eprintln!(
+                            "alm compiler error: --index-base must be 0 or 1, got '{raw}' \
+                             (the machinery is base-parametric; the surface is a toggle)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                idx += 1;
+            }
             _ if flag.starts_with('-') => {
                 eprintln!(
                     "alm compiler error: Unknown flag '{flag}'. Flags must come before the source file."
@@ -353,6 +372,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
             standalone,
             source_file: std::fs::canonicalize(source_path).unwrap_or_else(|_| source_path.into()),
             walk_pins: true,
+            index_base,
         },
     ) {
         Ok(ir) => ir,

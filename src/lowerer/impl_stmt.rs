@@ -329,14 +329,15 @@ impl<'a> IrLowerer<'a> {
                     self.scopes = saved_scopes;
                     let b_reg = int_of(b_any)?;
                     conv_bound_reg = Some(b_reg);
-                    // Offset keys reach `bound + K`; the reserves cover
-                    // them with one widened register while the loop's
-                    // condition keeps testing the raw bound.
-                    let reserve_reg = if plan.max_offset > 0 {
+                    // Offset keys reach `bound + K_eff`; the reserves
+                    // cover them with one widened register (signed — a
+                    // negative offset tightens the reserve) while the
+                    // loop's condition keeps testing the raw bound.
+                    let reserve_reg = if plan.key_offset != 0 {
                         let k_reg = self.next_reg();
                         self.emit(Instruction::LoadInt {
                             target: Reg::new(k_reg),
-                            val: plan.max_offset,
+                            val: plan.key_offset,
                         });
                         let sum = self.next_reg();
                         self.num3(Instruction::Add, sum, b_reg, Reg::new(k_reg));

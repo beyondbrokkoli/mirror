@@ -34,6 +34,11 @@ pub struct Parser<'a> {
     pub diagnostics: Vec<Diagnostic>,
     depth: usize,
     newlines: Vec<usize>,
+    /// The surface index base: a literal constructor key `[k] = v`
+    /// mints `Const(k - index_base)` at parse, so every `CtorKey::Const`
+    /// is physical from the moment it exists. Positional entries mint
+    /// physical `0..k-1` in every base and never shift.
+    index_base: i64,
 }
 
 impl<'a> Parser<'a> {
@@ -51,7 +56,13 @@ impl<'a> Parser<'a> {
                 .filter(|(_, b)| *b == b'\n')
                 .map(|(i, _)| i)
                 .collect(),
+            index_base: 0,
         }
+    }
+
+    pub fn with_index_base(mut self, index_base: i64) -> Self {
+        self.index_base = index_base;
+        self
     }
 
     fn line_of(&self, off: usize) -> usize {
@@ -953,9 +964,14 @@ impl<'a> Parser<'a> {
             match &key {
                 CtorKey::Const(slot) => {
                     if !slots.insert(*slot) {
+                        // The dedup set holds physical slots; the message
+                        // renders the user's key (`slot + index_base`),
+                        // which is what the writer spelled and where a
+                        // positional entry sits under the surface base.
                         return Err(ParseError(Diagnostic::syntax(format!(
-                            "duplicate index {slot} in constructor — each slot may \
-                             be written once (last-wins is not alm's rule)"
+                            "duplicate index {} in constructor — each slot may \
+                             be written once (last-wins is not alm's rule)",
+                            slot + self.index_base
                         ))));
                     }
                     if !names.is_empty() {
@@ -1010,10 +1026,20 @@ impl<'a> Parser<'a> {
             let value = self.parse_expr()?;
             match key {
                 Expr::Integer { value: k, .. } => {
-                    if k >= BOUNDS_FAIL_THRESHOLD {
+                    // The mint choke point: a literal key shifts to
+                    // physical space here and only here; a `Const` is
+                    // never seam-shifted later. The bounds check reads
+                    // the shifted value.
+                    let slot = match k.checked_sub(self.index_base) {
+                        Some(slot) => slot,
+                        None => {
+                            return Err(ParseError(Diagnostic::bounds("table index overflow")));
+                        }
+                    };
+                    if slot >= BOUNDS_FAIL_THRESHOLD {
                         return Err(ParseError(Diagnostic::bounds("table index overflow")));
                     }
-                    Ok((CtorKey::Const(k), value))
+                    Ok((CtorKey::Const(slot), value))
                 }
                 _ => {
                     alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_TBL_EXPR_KEY);

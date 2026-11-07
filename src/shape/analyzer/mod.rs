@@ -322,6 +322,7 @@ struct Analyzer {
     reads: ReadSideState,
     layout: LayoutFactsState,
     walk_pins: bool,
+    index_base: i64,
     pin_derived_exprs: BTreeSet<NodeId>,
     pin_justified_names: BTreeSet<String>,
     ctor_lines: Vec<usize>,
@@ -348,10 +349,22 @@ struct Analyzer {
     loop_scope_entries: Vec<usize>,
 }
 
+/// The base-0 entry the property pins and corpus sweeps drive; the
+/// pipeline calls `analyze_with_base` with the surface's index base.
+#[cfg(test)]
 pub fn analyze_with(ctx: &AnalysisContext<'_>, walk_pins: bool) -> ShapeFacts {
+    analyze_with_base(ctx, walk_pins, 0)
+}
+
+pub fn analyze_with_base(
+    ctx: &AnalysisContext<'_>,
+    walk_pins: bool,
+    index_base: i64,
+) -> ShapeFacts {
     let n = ctx.sites.len();
     let mut a = Analyzer {
         walk_pins,
+        index_base,
         pin_derived_exprs: BTreeSet::new(),
         pin_justified_names: BTreeSet::new(),
         walk: WalkState {
@@ -645,6 +658,7 @@ struct Recorded {
     own: OwnershipState,
     reads: ReadSideState,
     layout: LayoutFactsState,
+    index_base: i64,
     ctor_lines: Vec<usize>,
     fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
     join_tags: BTreeMap<NodeId, bool>,
@@ -669,6 +683,7 @@ impl Analyzer {
             own: self.own,
             reads: self.reads,
             layout: self.layout,
+            index_base: self.index_base,
             ctor_lines: self.ctor_lines,
             fn_scope_keys: self.fn_scope_keys,
             join_tags: self.join_tags,
@@ -762,6 +777,7 @@ impl Recorded {
         }
 
         ShapeFacts {
+            index_base: self.index_base,
             sites: self.lattice.sites,
             elems: self.static_elems,
             boundary_elem: self.chk.boundary_elem,

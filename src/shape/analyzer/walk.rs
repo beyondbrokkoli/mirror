@@ -405,7 +405,7 @@ impl Analyzer {
                             self.check_row_housing(g, value)?;
                             stored_ghosts.push(g);
                         }
-                        if let Some(k) = const_key_value(key) {
+                        if let Some(k) = const_key_value(key, self.index_base) {
                             for &s in &targets {
                                 if let Some(&existing) =
                                     self.lattice.site_slots.get(&s).and_then(|m| m.get(&k))
@@ -628,11 +628,19 @@ impl Analyzer {
                         .copied()
                         .filter_map(|s| self.proj_node(s))
                         .collect();
-                    self.check_key_threshold(rec, key, &real_base_sites)?;
+                    self.check_key_threshold(
+                        rec,
+                        const_key_value(key, self.index_base),
+                        &real_base_sites,
+                    )?;
                 }
 
                 if !stored_ghosts.is_empty() {
-                    let slot = const_key_value(key);
+                    // Physical like every site_slots writer: the ctor
+                    // writers arrive mint-shifted, so this store-side
+                    // writer translates through the same base-aware
+                    // reader or its slots would silently never match.
+                    let slot = const_key_value(key, self.index_base);
                     for &g in &stored_ghosts {
                         let birth = self.lattice.ghost_site[&g];
                         let tgt_sites: Vec<usize> = obj_sites

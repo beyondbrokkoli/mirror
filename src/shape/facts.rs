@@ -137,14 +137,21 @@ pub struct ReservePlan {
     pub pre_header: Vec<String>,
     pub nested: Vec<String>,
     pub ctor_reserves: BTreeSet<NodeId>,
-    /// The largest `max(K, 0)` over the loop's admitted offset keys;
-    /// the reserves cover `bound + max_offset` cells. The loop's
-    /// condition still tests the raw bound.
-    pub max_offset: i64,
+    /// The widest physical key offset `K_eff` over the loop's admitted
+    /// keys (signed, unclamped — the tight form); the reserves cover
+    /// `bound + K_eff` cells so the border equals the logical length
+    /// under every base. The loop's condition still tests the raw
+    /// bound.
+    pub key_offset: i64,
 }
 
 #[derive(Clone)]
 pub struct ShapeFacts {
+    /// The surface index base the compile ran under. Physical key =
+    /// user key − index_base; the lowerer's key seam is its only
+    /// emission-side reader, and every fact keyed by a slot value is
+    /// already physical (mint-shifted at recognition).
+    pub index_base: i64,
     pub sites: BTreeMap<NodeId, usize>,
     pub elems: Vec<Ty>,
     pub boundary_elem: Option<Ty>,

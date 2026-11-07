@@ -43,6 +43,7 @@ fn property_opts(walk_pins: bool) -> PipelineOpts {
         standalone: false,
         source_file: "property_case.lua".into(),
         walk_pins,
+        index_base: 0,
     }
 }
 
@@ -92,6 +93,7 @@ fn compile_exe(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
                 standalone: true,
                 source_file: "property_case.lua".into(),
                 walk_pins: true,
+                index_base: 0,
             },
         )
     })) {

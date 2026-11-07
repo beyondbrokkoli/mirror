@@ -13,6 +13,9 @@ pub struct PipelineOpts {
     pub standalone: bool,
     pub source_file: std::path::PathBuf,
     pub walk_pins: bool,
+    /// Surface index base (0 default, 1 for Lua-style). Physical key =
+    /// user key − index_base at every seam.
+    pub index_base: i64,
 }
 
 #[derive(Debug)]
@@ -67,7 +70,8 @@ pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<
         }
     }
 
-    let mut parser = Parser::new(tokens.into_iter().zip(offsets).collect(), source);
+    let mut parser = Parser::new(tokens.into_iter().zip(offsets).collect(), source)
+        .with_index_base(opts.index_base);
     let ast = parser.parse_program();
     front_diagnostics.extend(parser.diagnostics);
 
@@ -99,7 +103,7 @@ fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec
 
     let ctx = analysis::build_context(&ast);
 
-    let shape = shape::analyze_with(&ctx, opts.walk_pins);
+    let shape = shape::analyze_with_base(&ctx, opts.walk_pins, opts.index_base);
     if !shape.diagnostics.is_empty() {
         return Err((Stage::Analyze, shape.diagnostics));
     }

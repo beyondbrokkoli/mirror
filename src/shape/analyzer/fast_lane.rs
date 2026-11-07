@@ -92,8 +92,15 @@ struct LaneSink<'a> {
     plans: &'a BTreeMap<NodeId, (BTreeSet<String>, BTreeSet<String>)>,
     fast: BTreeMap<NodeId, FastStoreElig>,
     ctor: BTreeMap<NodeId, BTreeSet<NodeId>>,
-    /// The widest `max(K, 0)` admitted per loop, sizing its reserves.
+    /// The widest physical offset admitted per loop, sizing its
+    /// reserves. Signed and unclamped: the tight form reserves
+    /// `bound + K_eff` cells so the border equals the logical length
+    /// under every base.
     offsets: BTreeMap<NodeId, i64>,
+    /// The surface index base the walk runs under; `GuardOffset` shapes
+    /// arrive pre-folded from recognition, and a bare `Guard`'s physical
+    /// offset `-index_base` is derived at its consumers here.
+    index_base: i64,
 }
 
 impl Analyzer {
@@ -121,6 +128,7 @@ impl Analyzer {
             fast: BTreeMap::new(),
             ctor: BTreeMap::new(),
             offsets: BTreeMap::new(),
+            index_base: self.index_base,
         };
         scan_stmts(stmts, &mut Vec::new(), &mut ConstEnv::new(), &mut sink);
         for (loop_id, hits) in sink.ctor {
@@ -130,7 +138,7 @@ impl Analyzer {
         }
         for (loop_id, max_k) in sink.offsets {
             if let Some(plan) = self.layout.reserve_plans.get_mut(&loop_id) {
-                plan.max_offset = max_k;
+                plan.key_offset = max_k;
             }
         }
         self.layout.fast_stores = sink.fast;
@@ -304,20 +312,30 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
         if !frame.guard_live() {
             continue;
         }
-        let Some(shape) = guard_key_shape(key, &frame.guard) else {
+        let Some(shape) = guard_key_shape(key, &frame.guard, sink.index_base) else {
             continue;
+        };
+        // The key's physical offset: `GuardOffset` arrived pre-folded at
+        // recognition; a bare `Guard` sits at `-index_base`.
+        let k_phys = match shape {
+            KeyShape::Guard => -sink.index_base,
+            KeyShape::GuardOffset(k) => k,
         };
         // An offset key must land at or after zero on its first trip:
         // a negative key on the fast path is a negative getelementptr,
         // and the runtime's negative-index no-op law lives only in the
-        // checked arm.
-        let shape = match shape {
-            KeyShape::Guard => shape,
-            KeyShape::GuardOffset(k) => match frame.entry_const {
-                Some(c) if c.checked_add(k).is_some_and(|v| v >= 0) => shape,
-                _ => continue,
-            },
+        // checked arm. A bare guard at base 0 is the one unconditional
+        // historical case (its offset is zero in physical space); under
+        // base 1 the bare guard is an offset key like any other.
+        let admitted = match (&shape, k_phys) {
+            (KeyShape::Guard, 0) => true,
+            _ => {
+                matches!(frame.entry_const, Some(c) if c.checked_add(k_phys).is_some_and(|v| v >= 0))
+            }
         };
+        if !admitted {
+            continue;
+        }
         // A plain-name store on a pre-header-reserved table rides the
         // existing reserve when the name still names the binding the
         // loop's header saw; anything the plan holds as a nested row
@@ -335,7 +353,7 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: false,
                 },
             );
-            widen(sink, frame.loop_id, shape);
+            widen(sink, frame.loop_id, k_phys);
             return;
         }
         if frame.nested.contains(base) {
@@ -348,22 +366,23 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: true,
                 },
             );
-            widen(sink, frame.loop_id, shape);
+            widen(sink, frame.loop_id, k_phys);
             return;
         }
     }
 }
 
-/// The loop's reserves must cover `bound + max(K, 0)` cells for every
-/// admitted offset key `K`.
-fn widen(sink: &mut LaneSink, loop_id: NodeId, shape: KeyShape) {
-    let k = match shape {
-        KeyShape::Guard => 0,
-        KeyShape::GuardOffset(k) => k.max(0),
-    };
-    let entry = sink.offsets.entry(loop_id).or_insert(0);
-    if k > *entry {
-        *entry = k;
+/// The loop's reserves must cover `bound + K_eff` cells for every
+/// admitted key: the widest physical offset wins, negative offsets
+/// included (the tight form — the border must equal the logical
+/// length under every base, and a negative offset's highest write is
+/// `bound - 1 + K_eff`).
+fn widen(sink: &mut LaneSink, loop_id: NodeId, k_phys: i64) {
+    // Seeded at the floor, not zero: a zero seed would silently
+    // re-clamp every negative offset back to a `bound`-sized reserve.
+    let entry = sink.offsets.entry(loop_id).or_insert(i64::MIN);
+    if k_phys > *entry {
+        *entry = k_phys;
     }
 }
 

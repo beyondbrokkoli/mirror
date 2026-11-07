@@ -117,7 +117,7 @@ fn expect_lane(
     let mut plans: Vec<(Vec<String>, Vec<String>, i64)> = facts
         .reserve_plans
         .values()
-        .map(|p| (p.pre_header.clone(), p.nested.clone(), p.max_offset))
+        .map(|p| (p.pre_header.clone(), p.nested.clone(), p.key_offset))
         .collect();
     plans.sort();
     let want_plans: Vec<(Vec<String>, Vec<String>, i64)> = want_plans
@@ -248,6 +248,9 @@ fn fast_lane_facts_pin_guard_shadow_scopes_to_its_block() {
 
 #[test]
 fn fast_lane_facts_pin_offset_key_rides_with_a_constant_entry() {
+    // Tight reserves: the plan carries the signed offset (-1), not the
+    // old `max(K, 0)` clamp, so the reserve is `bound - 1` cells and
+    // the border equals the stored span.
     expect_lane(
         "local t = {}\n\
          local j = 1\n\
@@ -256,7 +259,7 @@ fn fast_lane_facts_pin_offset_key_rides_with_a_constant_entry() {
          \x20 j = j + 1\n\
          end\n",
         &[("t", false, KeyShape::GuardOffset(-1))],
-        &[(&["t"], &[], 0)],
+        &[(&["t"], &[], -1)],
     );
 }
 

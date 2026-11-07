@@ -260,19 +260,18 @@ impl Analyzer {
                         }
                         self.pin_int_use(rec, ke, &kt);
                         if rec.on() {
-                            self.check_key_threshold(rec, ke, &BTreeSet::from([id]))?;
+                            self.check_key_threshold(
+                                rec,
+                                const_key_value(ke, self.index_base),
+                                &BTreeSet::from([id]),
+                            )?;
                         }
                     } else if let CtorKey::Const(c) = k
                         && rec.on()
                     {
-                        self.check_key_threshold(
-                            rec,
-                            &Expr::Integer {
-                                value: *c,
-                                id: NodeId::mint(),
-                            },
-                            &BTreeSet::from([id]),
-                        )?;
+                        // A minted Const is already physical; it must never
+                        // ride the base-aware reader (the double-shift law).
+                        self.check_key_threshold(rec, Some(*c), &BTreeSet::from([id]))?;
                     }
                     let (t, esites, elineage) = self.infer_expr(rec, e)?;
                     if matches!(t, Pending)
@@ -491,7 +490,7 @@ impl Analyzer {
                             })
                         })
                     };
-                    let k = const_key_value(key);
+                    let k = const_key_value(key, self.index_base);
                     for &s in &sites {
                         if !is_root(&s) && slot_claimed(s, k) {
                             return Err(err());
@@ -552,10 +551,10 @@ impl Analyzer {
                         ghost,
                         GhostMint {
                             bases,
-                            key: const_key_value(key),
+                            key: const_key_value(key, self.index_base),
                         },
                     );
-                    if let Some(k) = const_key_value(key) {
+                    if let Some(k) = const_key_value(key, self.index_base) {
                         let real: Vec<usize> = sites
                             .iter()
                             .copied()
@@ -834,13 +833,18 @@ impl Analyzer {
         }
     }
 
+    /// `key` is the key's PHYSICAL compile-time value (callers translate
+    /// at their boundary: user-space expressions through
+    /// `const_key_value(key, index_base)`, minted `CtorKey::Const` slots
+    /// raw). The thresholds compare physical indices, matching the
+    /// runtime's `set_core`.
     pub(super) fn check_key_threshold(
         &mut self,
         rec: Gate,
-        key: &Expr,
+        key: Option<i64>,
         sites: &BTreeSet<usize>,
     ) -> Result<(), ShapeError> {
-        if let Some(i) = const_key_value(key) {
+        if let Some(i) = key {
             signal!(rec.on(), trace::TRACE_THRESH_INT);
             if i >= BOUNDS_FAIL_THRESHOLD {
                 signal!(rec.on(), trace::TRACE_THRESH_BOUNDS);
@@ -896,13 +900,14 @@ impl Analyzer {
         fn collect_fills(
             stmts: &[Stmt],
             guard: &str,
+            index_base: i64,
             mutated: &BTreeSet<String>,
             fills: &mut BTreeSet<String>,
             nested_fills: &mut BTreeSet<String>,
         ) {
             for stmt in stmts {
                 if let Stmt::IndexAssign { obj, key, .. } = stmt
-                    && guard_key_shape(key, guard).is_some()
+                    && guard_key_shape(key, guard, index_base).is_some()
                     && let Some(table_name) = get_base_identifier(obj)
                     && !mutated.contains(table_name)
                 {
@@ -918,22 +923,29 @@ impl Analyzer {
                 }
                 match stmt {
                     Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                        collect_fills(body, guard, mutated, fills, nested_fills)
+                        collect_fills(body, guard, index_base, mutated, fills, nested_fills)
                     }
                     Stmt::If {
                         then_body,
                         else_body,
                         ..
                     } => {
-                        collect_fills(then_body, guard, mutated, fills, nested_fills);
-                        collect_fills(else_body, guard, mutated, fills, nested_fills);
+                        collect_fills(then_body, guard, index_base, mutated, fills, nested_fills);
+                        collect_fills(else_body, guard, index_base, mutated, fills, nested_fills);
                     }
                     _ => {}
                 }
             }
         }
 
-        collect_fills(body, guard, &mutated, &mut fills, &mut nested_fills);
+        collect_fills(
+            body,
+            guard,
+            self.index_base,
+            &mutated,
+            &mut fills,
+            &mut nested_fills,
+        );
 
         if fills.is_empty() && nested_fills.is_empty() {
             return;
@@ -1009,7 +1021,7 @@ impl Analyzer {
                     pre_header,
                     nested,
                     ctor_reserves: BTreeSet::new(),
-                    max_offset: 0,
+                    key_offset: 0,
                 },
             );
         }

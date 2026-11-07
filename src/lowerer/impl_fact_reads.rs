@@ -24,9 +24,9 @@ impl<'a> IrLowerer<'a> {
                  records every dynamic key's lane on the OUTERMOST \
                  extent's record",
             );
-        let TypedReg { reg, .. } = self.lower_expr(key, None)?;
         match lane {
             KeyLane::Str => {
+                let TypedReg { reg, .. } = self.lower_expr(key, None)?;
                 let s = str_lane(reg)?;
                 let r = self.next_reg();
                 self.emit(Instruction::StrKey {
@@ -38,7 +38,37 @@ impl<'a> IrLowerer<'a> {
             }
             KeyLane::Int => {
                 signal!(trace::TRACE_LOWER_KEY_LANE);
-                Ok(TableKey::Int(int_of(reg)?))
+                // The seam: every non-Const int key translates to
+                // physical space exactly once, here. A bare integer
+                // key folds the shift into one LoadInt in every base
+                // (identical emission at base 0); a folded arithmetic
+                // constant folds only when a shift applies, so base-0
+                // emission stays byte-stable; everything else lowers
+                // as written and subtracts the base when it is not 0.
+                let base = self.shape.index_base;
+                if (matches!(key, Expr::Integer { .. }) || base != 0)
+                    && let Some(v) = crate::shape::const_key_value(key, base)
+                {
+                    let r = self.next_reg();
+                    self.emit(Instruction::LoadInt {
+                        target: Reg::new(r),
+                        val: v,
+                    });
+                    return Ok(TableKey::Int(Reg::new(r)));
+                }
+                let TypedReg { reg, .. } = self.lower_expr(key, None)?;
+                let reg = int_of(reg)?;
+                if base == 0 {
+                    return Ok(TableKey::Int(reg));
+                }
+                let c = self.next_reg();
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(c),
+                    val: base,
+                });
+                let r = self.next_reg();
+                self.num3(Instruction::Sub, r, reg, Reg::new(c));
+                Ok(TableKey::Int(Reg::new(r)))
             }
         }
     }
