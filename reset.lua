@@ -38,7 +38,7 @@ end
 
 local failed = {}
 for _, filename in ipairs(lockables) do
-    run_case(CASES_DIR .. "/" .. filename)
+    run_case(CASES_DIR .. "/" .. filename, nil, false, corpus.pins[filename].flags)
     if not compile_succeeded() then
         print(string.format("\27[31m✗\27[0m %s — compile failed: %s", filename, first_error(ERR)))
         table.insert(failed, filename)

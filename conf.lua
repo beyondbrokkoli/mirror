@@ -46,6 +46,7 @@ function parse_pins(content)
         end
     end
     pins.args = content:match("%-%-%s*ARGS:%s*([^\r\n]+)")
+    pins.flags = content:match("%-%-%s*FLAGS:%s*([^\r\n]+)")
     return pins
 end
 
@@ -82,11 +83,12 @@ function scan_corpus()
     return corpus
 end
 
-function run_case(src, args, with_backtrace)
+function run_case(src, args, with_backtrace, flags)
     local bt = with_backtrace and "RUST_BACKTRACE=1 " or ""
     local argstr = args and (" " .. args) or ""
+    local flagstr = flags and (flags .. " ") or ""
     local res = os.execute(string.format(
-        "%stimeout 120 %s '%s'%s > %s 2> %s", bt, BIN, src, argstr, OUT, ERR))
+        "%stimeout 120 %s %s'%s'%s > %s 2> %s", bt, BIN, flagstr, src, argstr, OUT, ERR))
     return res == true or res == 0
 end
 
@@ -98,9 +100,10 @@ function compile_succeeded_exe()
     return read_file(OUT):find("Success! executable written", 1, true) ~= nil
 end
 
-function run_case_exe(src)
+function run_case_exe(src, flags)
+    local flagstr = flags and (flags .. " ") or ""
     local res = os.execute(string.format(
-        "timeout 120 %s --exe '%s' > %s 2> %s", BIN, src, OUT, ERR))
+        "timeout 120 %s %s--exe '%s' > %s 2> %s", BIN, flagstr, src, OUT, ERR))
     return res == true or res == 0
 end
 

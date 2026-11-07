@@ -256,7 +256,7 @@ end
 local pos_passed = 0
 for _, name in ipairs(corpus.positive) do
     local pins = corpus.pins[name]
-    if not run_case(CASES_DIR .. "/" .. name, pins.args, false) then
+    if not run_case(CASES_DIR .. "/" .. name, pins.args, false, pins.flags) then
         local why = compile_succeeded() and "run failed" or "compile failed"
         report_fail("positive", name, why .. ": " .. first_error(ERR))
     else
@@ -276,7 +276,7 @@ end
 local neg_passed = 0
 for _, name in ipairs(corpus.negative) do
     local pins = corpus.pins[name]
-    run_case(CASES_DIR .. "/" .. name, pins.args, false)
+    run_case(CASES_DIR .. "/" .. name, pins.args, false, pins.flags)
     if compile_succeeded() then
         report_fail("negative", name, "expected compile failure, but it SUCCEEDED — the guard is gone")
     else
@@ -296,7 +296,7 @@ end
 local pan_passed = 0
 for _, name in ipairs(corpus.panic) do
     local pins = corpus.pins[name]
-    local died = not run_case(CASES_DIR .. "/" .. name, pins.args, true)
+    local died = not run_case(CASES_DIR .. "/" .. name, pins.args, true, pins.flags)
     if not compile_succeeded() then
         report_fail("panic", name, "expected compile to succeed: " .. first_error(ERR))
     else
@@ -338,7 +338,7 @@ end
 local exe_passed = 0
 if not NO_EXE then
     local function exe_twin(name, must_die)
-        if not run_case_exe(CASES_DIR .. "/" .. name) then
+        if not run_case_exe(CASES_DIR .. "/" .. name, corpus.pins[name].flags) then
             report_fail("exe", name, "standalone compile failed: " .. first_error(ERR))
             return
         end
