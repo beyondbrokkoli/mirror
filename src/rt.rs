@@ -462,6 +462,19 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C) {
     let tbl = unsafe { &mut *t };
 
     if index < 0 {
+        // A refused store of an owned row must reclaim it: the static
+        // pass already transferred the child into this table's
+        // housing, so dropping the write on the floor would leave the
+        // child with zero owners. The header's contains_tables bit is
+        // the same signal free_tbl trusts to walk children, so the
+        // refuse path and the free path agree on what a cell holds by
+        // construction. Closure-housing tables never set the bit, so a
+        // refused closure store keeps the old drop (documented with
+        // the ownership notes in docs/lane_single_brain.md).
+        if tbl.contains_tables != 0 && C::ESIZE == 8 {
+            let child = cell.to_lane() as usize as *mut AlmTable;
+            unsafe { free_tbl(child, &[]) };
+        }
         return;
     }
 
@@ -1538,6 +1551,33 @@ pub unsafe extern "C" fn alm_coro_close(co: i64) -> i64 {
 #[cfg(test)]
 mod strkey_tests {
     use super::*;
+
+    #[test]
+    fn refused_row_store_reclaims_the_child() {
+        // The ownership contract: a store the destination refuses (a
+        // negative physical key no-ops) must free the incoming row --
+        // static ownership already moved it into the destination's
+        // housing, so nobody else holds it. The free poisons the
+        // child's header, which is race-free proof against parallel
+        // tests (ALLOC_COUNT itself is process-wide).
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+
+        let slot: *const u8 = std::ptr::addr_of!(child).cast();
+        unsafe { alm_tbl_set(parent, -1, slot) };
+
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "the refused row is freed at the store"
+        );
+        assert_eq!(
+            unsafe { alm_tbl_len(parent) },
+            0,
+            "the refuse path must not grow #t"
+        );
+        unsafe { alm_tbl_free(parent) };
+    }
 
     #[test]
     fn negative_keys_never_pollute_border() {
