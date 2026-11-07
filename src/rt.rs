@@ -428,7 +428,7 @@ impl CellRepr for KeyedCell {
 
 #[allow(dead_code)]
 unsafe fn keyed_set(t: *mut AlmTable, index: i64, cell: KeyedCell) {
-    unsafe { set_core::<KeyedCell>(t, index, cell) };
+    unsafe { set_core::<KeyedCell>(t, index, cell, false) };
 }
 
 #[unsafe(no_mangle)]
@@ -442,15 +442,18 @@ pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_set(t: *mut AlmTable, index: i64, val: *const u8) {
+    // The pooled-handle face: interned strings and closure creation
+    // envs. The destination never owns the cell, so a refused store
+    // drops it (ownership notes in docs/lane_single_brain.md).
     if t.is_null() {
         unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
         eprintln!("alm runtime error: attempt to index a nil value (null table row)");
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
-        1 => unsafe { set_core::<u8>(t, index, u8::load_slot(val)) },
-        8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val)) },
-        16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val)) },
+        1 => unsafe { set_core::<u8>(t, index, u8::load_slot(val), false) },
+        8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val), false) },
+        16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val), false) },
         other => {
             eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
             std::process::abort();
@@ -458,20 +461,41 @@ pub unsafe extern "C" fn alm_tbl_set(t: *mut AlmTable, index: i64, val: *const u
     }
 }
 
-unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C) {
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_tbl_set_row(t: *mut AlmTable, index: i64, val: *const u8) {
+    // The owned-row face: the IR mints this symbol only for `Tbl`
+    // elem stores, and the static pass has already moved the child
+    // into this store's hands. A refused store reclaims the child —
+    // the symbol itself is the proof, so the refuse path never
+    // consults the destination's header bit (env tables set that bit
+    // for borrowed closure faces, so the bit cannot name ownership).
+    if t.is_null() {
+        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
+        std::process::abort();
+    }
+    match unsafe { (&*t).esize } {
+        1 => unsafe { set_core::<u8>(t, index, u8::load_slot(val), true) },
+        8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val), true) },
+        16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val), true) },
+        other => {
+            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
+            std::process::abort();
+        }
+    }
+}
+
+unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell: bool) {
     let tbl = unsafe { &mut *t };
 
     if index < 0 {
         // A refused store of an owned row must reclaim it: the static
-        // pass already transferred the child into this table's
-        // housing, so dropping the write on the floor would leave the
-        // child with zero owners. The header's contains_tables bit is
-        // the same signal free_tbl trusts to walk children, so the
-        // refuse path and the free path agree on what a cell holds by
-        // construction. Closure-housing tables never set the bit, so a
-        // refused closure store keeps the old drop (documented with
-        // the ownership notes in docs/lane_single_brain.md).
-        if tbl.contains_tables != 0 && C::ESIZE == 8 {
+        // pass already moved the child into this store's hands, so
+        // dropping the write on the floor would leave the child with
+        // zero owners. `owns_cell` arrives minted from the IR's
+        // Row/Handle split, so the refuse path and the free path agree
+        // on what the cell holds by construction.
+        if owns_cell && C::ESIZE == 8 {
             let child = cell.to_lane() as usize as *mut AlmTable;
             unsafe { free_tbl(child, &[]) };
         }
@@ -572,7 +596,7 @@ pub unsafe extern "C" fn alm_tbl_set_any(t: *mut AlmTable, index: i64, val: i128
         std::process::abort();
     }
     match unsafe { (&*t).esize } {
-        16 => unsafe { set_core::<u128>(t, index, val as u128) },
+        16 => unsafe { set_core::<u128>(t, index, val as u128, false) },
         other => {
             eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
             std::process::abort();
@@ -1556,15 +1580,16 @@ mod strkey_tests {
     fn refused_row_store_reclaims_the_child() {
         // The ownership contract: a store the destination refuses (a
         // negative physical key no-ops) must free the incoming row --
-        // static ownership already moved it into the destination's
-        // housing, so nobody else holds it. The free poisons the
-        // child's header, which is race-free proof against parallel
-        // tests (ALLOC_COUNT itself is process-wide).
+        // static ownership already moved it into the store's hands, so
+        // nobody else holds it. The row symbol itself is the proof;
+        // the free poisons the child's header, which is race-free
+        // proof against parallel tests (ALLOC_COUNT itself is
+        // process-wide).
         let parent = unsafe { alm_tbl_new(8, 0x80) };
         let child = unsafe { alm_tbl_new(8, 0) };
 
         let slot: *const u8 = std::ptr::addr_of!(child).cast();
-        unsafe { alm_tbl_set(parent, -1, slot) };
+        unsafe { alm_tbl_set_row(parent, -1, slot) };
 
         assert_eq!(
             unsafe { std::ptr::addr_of!((*child).esize).read() },
@@ -1577,6 +1602,52 @@ mod strkey_tests {
             "the refuse path must not grow #t"
         );
         unsafe { alm_tbl_free(parent) };
+    }
+
+    #[test]
+    fn refused_row_store_reclaims_without_the_header_bit() {
+        // The row symbol carries the ownership proof, not the
+        // destination's contains_tables bit: a row-housing parent the
+        // header never flagged still reclaims its refused child.
+        let parent = unsafe { alm_tbl_new(8, 0) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+
+        let slot: *const u8 = std::ptr::addr_of!(child).cast();
+        unsafe { alm_tbl_set_row(parent, -1, slot) };
+
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "the refused row is freed with no header bit to consult"
+        );
+        unsafe { alm_tbl_free(parent) };
+    }
+
+    #[test]
+    fn refused_handle_store_drops_even_when_the_bit_is_set() {
+        // The twin face law: a pooled handle (an interned string or a
+        // closure's creation env) is never owned by the destination,
+        // so the handle symbol drops a refused store even into a
+        // bit-set parent -- the old bit-consulted reclaim could have
+        // freed a borrowed env as a table.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+
+        let slot: *const u8 = std::ptr::addr_of!(child).cast();
+        unsafe { alm_tbl_set(parent, -1, slot) };
+
+        assert_ne!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "the refused handle is dropped, never freed as a table"
+        );
+        assert_eq!(
+            unsafe { alm_tbl_len(parent) },
+            0,
+            "the refuse path must not grow #t"
+        );
+        unsafe { alm_tbl_free(parent) };
+        unsafe { alm_tbl_free(child) };
     }
 
     #[test]

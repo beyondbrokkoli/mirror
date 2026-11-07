@@ -1,9 +1,9 @@
 use super::{IrLowerer, LowerError};
 
 use crate::ir::{
-    Any, AnyReg, BlockId, Bool, Byte, CellRepr, CellTy, CellVal, CmpRegs, CmpRepr, Float,
-    Instruction, Int, MoveRegs, NumRegs, NumRegsRhs, NumRepr, PackRegs, PhiRegs, PhiRepr, Ptr, Reg,
-    RegKind, TableKey, Terminator,
+    Any, AnyReg, BlockId, Bool, Byte, CellRepr, CellSet, CellSetFast, CellTy, CellVal, CmpRegs,
+    CmpRepr, Float, Instruction, Int, MoveRegs, NumRegs, NumRegsRhs, NumRepr, PackRegs, PhiRegs,
+    PhiRepr, Ptr, Reg, RegKind, TableKey, Terminator,
 };
 use crate::shape::Ty;
 pub(super) fn int_of(r: AnyReg) -> Result<Reg<Int>, LowerError> {
@@ -372,7 +372,31 @@ impl IrLowerer<'_> {
                  recorded elem by construction"
             );
         }
-        self.emit(Instruction::TableSet(E::set(table, index, value)));
+        let set = match E::TAG {
+            // The Ptr repr carries three faces: a row the destination
+            // owns, and pooled handles (interned strings, closure envs)
+            // it never owns. The mint names the face so the refuse path
+            // trusts the variant, never the destination's header bit
+            // (env tables set that bit for borrowed closure faces).
+            CellTy::Ptr => {
+                let value = Reg::new(value.id);
+                if matches!(elem, Ty::Tbl(_)) {
+                    CellSet::Row {
+                        table,
+                        index,
+                        value,
+                    }
+                } else {
+                    CellSet::Handle {
+                        table,
+                        index,
+                        value,
+                    }
+                }
+            }
+            _ => E::set(table, index, value),
+        };
+        self.emit(Instruction::TableSet(set));
         Ok(())
     }
 
@@ -392,9 +416,31 @@ impl IrLowerer<'_> {
             );
         }
         let cont = self.new_block();
-        self.emit(Instruction::TableSetFast(E::set_fast(
-            table, index, value, layout, cont,
-        )));
+        let set_fast = match E::TAG {
+            // The same face law as `set`, on the admitted-key lane.
+            CellTy::Ptr => {
+                let value = Reg::new(value.id);
+                if matches!(elem, Ty::Tbl(_)) {
+                    CellSetFast::Row {
+                        table,
+                        index,
+                        value,
+                        layout,
+                        cont,
+                    }
+                } else {
+                    CellSetFast::Handle {
+                        table,
+                        index,
+                        value,
+                        layout,
+                        cont,
+                    }
+                }
+            }
+            _ => E::set_fast(table, index, value, layout, cont),
+        };
+        self.emit(Instruction::TableSetFast(set_fast));
         self.terminate(Terminator::Jump(cont));
         self.current_block = cont;
         Ok(())

@@ -922,6 +922,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     if tbl_decls.set {
         head.push_str("declare void @alm_tbl_set(ptr, i64, ptr)\n");
     }
+    if tbl_decls.set_row {
+        head.push_str("declare void @alm_tbl_set_row(ptr, i64, ptr)\n");
+    }
     if tbl_decls.get_any {
         head.push_str("declare i128 @alm_tbl_get_any(ptr, i64)\n");
     }
@@ -1123,6 +1126,7 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1141,6 +1145,7 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1159,6 +1164,7 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1167,7 +1173,7 @@ fn emit_cell_set_fast(
             needs_hdr_md,
             tbl_decls,
         ),
-        CellSetFast::Ptr {
+        CellSetFast::Row {
             table,
             index,
             value,
@@ -1177,6 +1183,26 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            true,
+            layout,
+            *cont,
+            allocas,
+            code,
+            seam,
+            needs_hdr_md,
+            tbl_decls,
+        ),
+        CellSetFast::Handle {
+            table,
+            index,
+            value,
+            layout,
+            cont,
+        } => emit_table_set_fast(
+            table,
+            index,
+            value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1195,6 +1221,7 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1213,6 +1240,7 @@ fn emit_cell_set_fast(
             table,
             index,
             value,
+            false,
             layout,
             *cont,
             allocas,
@@ -1237,32 +1265,40 @@ fn emit_cell_set(
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
         CellSet::Float {
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
         CellSet::Bool {
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
-        CellSet::Ptr {
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
+        // The variant is the ownership proof: a row store's refused
+        // write reclaims its child through the row symbol; a handle
+        // store's refused write drops.
+        CellSet::Row {
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
+        } => emit_table_set(table, index, value, true, allocas, code, seam, tbl_decls),
+        CellSet::Handle {
+            table,
+            index,
+            value,
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
         CellSet::Byte {
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
         CellSet::Any {
             table,
             index,
             value,
-        } => emit_table_set(table, index, value, allocas, code, seam, tbl_decls),
+        } => emit_table_set(table, index, value, false, allocas, code, seam, tbl_decls),
     }
 }
 
@@ -1408,6 +1444,7 @@ fn emit_phi<R: Repr>(target: &Reg<R>, args: &[(BlockId, Reg<R>)], code: &mut Str
 struct TableDecls {
     get: bool,
     set: bool,
+    set_row: bool,
     get_any: bool,
     set_any: bool,
     get_skey: bool,
@@ -1479,6 +1516,7 @@ fn emit_table_set_fast<E: Repr>(
     table: &Reg<Ptr>,
     index: &Reg<Int>,
     value: &Reg<E>,
+    row_symbol: bool,
     layout: &LayoutVerdict,
     cont: BlockId,
     allocas: &mut String,
@@ -1535,7 +1573,7 @@ fn emit_table_set_fast<E: Repr>(
                    {checked}\
                    br label %b{cont}\n",
                 val_cast = val_cast,
-                checked = checked_store::<E>(f, table, index, &val_use, ety, tbl_decls),
+                checked = checked_store::<E>(f, table, index, &val_use, ety, row_symbol, tbl_decls),
                 cont = cont
             ));
         }
@@ -1555,7 +1593,7 @@ fn emit_table_set_fast<E: Repr>(
                    {checked}\
                    br label %b{cont}\n",
                 val_cast = val_cast,
-                checked = checked_store::<E>(f, table, index, &val_use, ety, tbl_decls),
+                checked = checked_store::<E>(f, table, index, &val_use, ety, row_symbol, tbl_decls),
                 f = f,
                 table = table.id,
                 index = index.id,
@@ -1574,6 +1612,7 @@ fn checked_store<E: Repr>(
     index: &Reg<Int>,
     val_use: &str,
     ety: &str,
+    row_symbol: bool,
     tbl_decls: &mut TableDecls,
 ) -> String {
     if E::REG_FACE {
@@ -1585,11 +1624,22 @@ fn checked_store<E: Repr>(
             v = val_use
         )
     } else {
-        tbl_decls.set = true;
+        // The admission gate proves this store's key lands at or after
+        // zero, so the refuse arm is unreachable from the fast lane —
+        // but the symbol still names the face, keeping the ownership
+        // contract whole if the gate ever drifts.
+        let sym = if row_symbol {
+            tbl_decls.set_row = true;
+            "alm_tbl_set_row"
+        } else {
+            tbl_decls.set = true;
+            "alm_tbl_set"
+        };
         format!(
             "  store {ety} {v}, ptr %ts{f}.valp\n\
-               call void @alm_tbl_set(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
+               call void @{sym}(ptr %v{table}, i64 %v{index}, ptr %ts{f}.valp)\n",
             ety = ety,
+            sym = sym,
             v = val_use,
             f = f,
             table = table.id,
@@ -1603,6 +1653,7 @@ fn emit_table_set<E: Repr>(
     table: &Reg<Ptr>,
     index: &TableKey,
     value: &Reg<E>,
+    row_symbol: bool,
     allocas: &mut String,
     code: &mut String,
     seam: usize,
@@ -1611,6 +1662,11 @@ fn emit_table_set<E: Repr>(
     let (sym, flag) = match (E::REG_FACE, index) {
         (true, TableKey::Int(_)) => ("alm_tbl_set_any", &mut tbl_decls.set_any),
         (true, TableKey::Str(_)) => ("alm_tbl_set_any_skey", &mut tbl_decls.set_any_skey),
+        // An integer key can be refused; the row symbol carries the
+        // ownership proof. String keys live in the reserved positive
+        // range, so the skey path has no refuse arm and one symbol
+        // serves both faces.
+        (false, TableKey::Int(_)) if row_symbol => ("alm_tbl_set_row", &mut tbl_decls.set_row),
         (false, TableKey::Int(_)) => ("alm_tbl_set", &mut tbl_decls.set),
         (false, TableKey::Str(_)) => ("alm_tbl_set_skey", &mut tbl_decls.set_skey),
     };
@@ -1956,6 +2012,7 @@ mod fast_store_tail_tests {
             &table,
             &index,
             &value,
+            false,
             &LayoutVerdict::Growing,
             5,
             &mut allocas,

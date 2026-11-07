@@ -398,7 +398,19 @@ pub enum CellSet {
         index: TableKey,
         value: Reg<Bool>,
     },
-    Ptr {
+    /// A store of an owned row: the elem face is `Tbl`, and the static
+    /// pass has already moved the child into this store's hands. The
+    /// runtime's row symbol reclaims the child when the store is
+    /// refused (a negative key).
+    Row {
+        table: Reg<Ptr>,
+        index: TableKey,
+        value: Reg<Ptr>,
+    },
+    /// A store of a pooled handle — an interned string or a closure's
+    /// creation env. The destination never owns the cell, so a refused
+    /// store drops it.
+    Handle {
         table: Reg<Ptr>,
         index: TableKey,
         value: Reg<Ptr>,
@@ -438,7 +450,18 @@ pub enum CellSetFast {
         layout: crate::shape::LayoutVerdict,
         cont: BlockId,
     },
-    Ptr {
+    /// The fast twin of `CellSet::Row`: an owned-row store whose key
+    /// the admission gate proved lands at or after zero.
+    Row {
+        table: Reg<Ptr>,
+        index: Reg<Int>,
+        value: Reg<Ptr>,
+        layout: crate::shape::LayoutVerdict,
+        cont: BlockId,
+    },
+    /// The fast twin of `CellSet::Handle`: a pooled handle the
+    /// destination never owns.
+    Handle {
         table: Reg<Ptr>,
         index: Reg<Int>,
         value: Reg<Ptr>,
@@ -467,7 +490,8 @@ impl CellSetFast {
             CellSetFast::Int { cont, .. }
             | CellSetFast::Float { cont, .. }
             | CellSetFast::Bool { cont, .. }
-            | CellSetFast::Ptr { cont, .. }
+            | CellSetFast::Row { cont, .. }
+            | CellSetFast::Handle { cont, .. }
             | CellSetFast::Byte { cont, .. }
             | CellSetFast::Any { cont, .. } => *cont,
         }
@@ -783,27 +807,25 @@ impl CellRepr for Ptr {
             index,
         }
     }
-    fn set(table: Reg<Ptr>, index: TableKey, value: Reg<Self>) -> CellSet {
-        CellSet::Ptr {
-            table,
-            index,
-            value,
-        }
+    fn set(_table: Reg<Ptr>, _index: TableKey, _value: Reg<Self>) -> CellSet {
+        unreachable!(
+            "a Ptr store's ownership face is named at the mint — \
+             bridges::set splits the repr into Row and Handle by the \
+             elem face"
+        )
     }
     fn set_fast(
-        table: Reg<Ptr>,
-        index: Reg<Int>,
-        value: Reg<Self>,
-        layout: crate::shape::LayoutVerdict,
-        cont: BlockId,
+        _table: Reg<Ptr>,
+        _index: Reg<Int>,
+        _value: Reg<Self>,
+        _layout: crate::shape::LayoutVerdict,
+        _cont: BlockId,
     ) -> CellSetFast {
-        CellSetFast::Ptr {
-            table,
-            index,
-            value,
-            layout,
-            cont,
-        }
+        unreachable!(
+            "a Ptr fast store's ownership face is named at the mint — \
+             bridges::set_fast splits the repr into Row and Handle by \
+             the elem face"
+        )
     }
 }
 
