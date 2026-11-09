@@ -59,6 +59,7 @@ static EXEC_ID: AtomicI32 = AtomicI32::new(EXEC_UNREGISTERED);
 static IS_EXE: AtomicBool = AtomicBool::new(false);
 static LOCAL_LEAK_HOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+#[cfg_attr(miri, allow(dead_code))]
 unsafe extern "C" {
     fn vx_trace_poke_exec(exec_id: i32, slot: u8);
     fn vx_str_intern(s: *const u8, len: usize) -> *const u8;
@@ -78,6 +79,7 @@ unsafe extern "C" {
 }
 
 #[repr(C)]
+#[cfg_attr(miri, allow(dead_code))]
 struct DlInfo {
     dli_fname: *const i8,
     dli_fbase: *mut c_void,
@@ -85,6 +87,7 @@ struct DlInfo {
     dli_saddr: *mut c_void,
 }
 
+#[cfg_attr(miri, allow(dead_code))]
 static MODULE_MARK: u8 = 0;
 
 fn exec_id() -> i32 {
@@ -371,11 +374,8 @@ impl CellRepr for u64 {
     const ESIZE: usize = 8;
     const ALIGN: usize = 8;
     unsafe fn load_slot(slot: *const u8) -> Self {
-        // The slot is a caller byte pointer (the IR's spill slot, a
-        // test's stack bytes) — the boundary law is unaligned, the same
-        // law the u128 impl reads by (Miri: alignment-1 word reads are
-        // UB through a strict *const u64).
-        unsafe { (slot as *const u64).read_unaligned() }
+        debug_assert!(slot.addr() & 7 == 0, "u64 slot cell not 8-aligned");
+        unsafe { (slot as *const u64).read() }
     }
     fn to_lane(self) -> u128 {
         u128::from(self)
@@ -390,8 +390,8 @@ impl CellRepr for u64 {
         unsafe { (slot as *const u64).read() }
     }
     unsafe fn store_dst(cell: Self, dst: *mut u8) {
-        // The dst is a caller byte pointer — the boundary law, as above.
-        unsafe { (dst as *mut u64).write_unaligned(cell) };
+        debug_assert!(dst.addr() & 7 == 0, "u64 dst cell not 8-aligned");
+        unsafe { (dst as *mut u64).write(cell) };
     }
 }
 
@@ -399,7 +399,8 @@ impl CellRepr for u128 {
     const ESIZE: usize = 16;
     const ALIGN: usize = 16;
     unsafe fn load_slot(slot: *const u8) -> Self {
-        unsafe { (slot as *const u128).read_unaligned() }
+        debug_assert!(slot.addr() & 15 == 0, "u128 slot cell not 16-aligned");
+        unsafe { (slot as *const u128).read() }
     }
     fn to_lane(self) -> u128 {
         self
@@ -416,7 +417,8 @@ impl CellRepr for u128 {
         unsafe { (slot as *const u128).read() }
     }
     unsafe fn store_dst(cell: Self, dst: *mut u8) {
-        unsafe { (dst as *mut u128).write_unaligned(cell) };
+        debug_assert!(dst.addr() & 15 == 0, "u128 dst cell not 16-aligned");
+        unsafe { (dst as *mut u128).write(cell) };
     }
 }
 
@@ -440,7 +442,8 @@ impl CellRepr for KeyedCell {
     const ESIZE: usize = 16;
     const ALIGN: usize = 16;
     unsafe fn load_slot(slot: *const u8) -> Self {
-        Self(unsafe { (slot as *const u128).read_unaligned() })
+        debug_assert!(slot.addr() & 15 == 0, "KeyedCell slot cell not 16-aligned");
+        Self(unsafe { (slot as *const u128).read() })
     }
     fn to_lane(self) -> u128 {
         self.0
@@ -457,7 +460,8 @@ impl CellRepr for KeyedCell {
         Self(unsafe { (slot as *const u128).read() })
     }
     unsafe fn store_dst(cell: Self, dst: *mut u8) {
-        unsafe { (dst as *mut u128).write_unaligned(cell.0) };
+        debug_assert!(dst.addr() & 15 == 0, "KeyedCell dst cell not 16-aligned");
+        unsafe { (dst as *mut u128).write(cell.0) };
     }
 }
 
@@ -543,22 +547,21 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     if tbl.mode == TableMode::Sparse {
         tbl.border = tbl.border.max(index.saturating_add(1));
         let map = unsafe { &mut *tbl.sparse_map };
-        if owns_cell {
-            let old = map.get(&index).copied().unwrap_or(0);
+        if let Some(old) = map.insert(index, cell.to_lane())
+            && owns_cell
+        {
             unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
         }
-        map.insert(index, cell.to_lane());
         return;
     }
 
     if index > tbl.len.saturating_add(SPARSE_THRESHOLD) {
         tbl.border = tbl.border.max(index.saturating_add(1));
-        if owns_cell && !tbl.sparse_map.is_null() {
-            let map = unsafe { &*tbl.sparse_map };
-            let old = map.get(&index).copied().unwrap_or(0);
+        if let Some(old) = unsafe { overflow_map(tbl).insert(index, cell.to_lane()) }
+            && owns_cell
+        {
             unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
         }
-        unsafe { overflow_map(tbl).insert(index, cell.to_lane()) };
         return;
     }
 
@@ -566,18 +569,7 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     unsafe { span_grow(tbl, index.wrapping_add(1)) };
     let ptr = unsafe { tbl.data.add(index as usize * C::ESIZE) };
     if owns_cell {
-        // A replace that displaces a table-typed slot word frees the old
-        // occupant before the write: its owner was the slot (the same
-        // ownership law the refuse arm reads, moved forward in life),
-        // and dropping the word would leave the child with zero owners
-        // forever — the sparse-overwrite displaced-row leak
-        // (probes/p21_sparse_overwrite_displaced_row_leak.lua). The
-        // row symbol is the proof table traffic runs through this
-        // call, the parent's contains_tables bit licenses the word as
-        // a table lane exactly the way free_tbl's child walk trusts
-        // it, and the non-owned faces keep the recorded no-op-store
-        // law — their replace drops the old cell without the free.
-        let old = unsafe { C::load_slot(ptr) };
+        let old = unsafe { C::load_span(ptr) };
         unsafe { reclaim_displaced_child::<C>(tbl, old, cell) };
     }
     unsafe { C::store_span(ptr, cell) };
@@ -637,7 +629,7 @@ fn valid_slot_addr(addr: usize) -> bool {
 
     #[cfg(miri)]
     {
-        addr != 0 && is_user_space && (addr & 7) == 0
+        addr >= 0x1000 && is_user_space && (addr & 7) == 0
     }
     #[cfg(not(miri))]
     {
@@ -1171,23 +1163,31 @@ pub unsafe extern "C" fn alm_str_register(ptrs: *const *const u8, n: usize) {
 #[cfg(miri)]
 unsafe fn miri_intern(s: *const u8, len: usize) -> *const u8 {
     use std::sync::Mutex;
-    static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    static POOL: Mutex<Vec<(usize, Vec<u64>)>> = Mutex::new(Vec::new());
     let bytes = unsafe { std::slice::from_raw_parts(s, len) }.to_vec();
     let mut pool = POOL.lock().unwrap();
-    let at = pool
-        .iter()
-        .position(|entry| entry.get(8..8 + len) == Some(bytes.as_slice()));
+    let at = pool.iter().position(|(elen, words)| {
+        *elen == len && {
+            let raw =
+                unsafe { std::slice::from_raw_parts(words.as_ptr().add(1).cast::<u8>(), len) };
+            raw == bytes.as_slice()
+        }
+    });
     let entry = if let Some(at) = at {
-        &pool[at]
+        &pool[at].1
     } else {
-        let mut entry: Vec<u8> = Vec::with_capacity(8 + len + 1);
-        entry.extend_from_slice(&str_key_of_bytes(&bytes).to_ne_bytes());
-        entry.extend_from_slice(&bytes);
-        entry.push(0);
-        pool.push(entry);
-        pool.last().unwrap()
+        let total_bytes = 8 + len + 1;
+        let mut words = vec![0u64; total_bytes.div_ceil(8)];
+        words[0] = str_key_of_bytes(&bytes) as u64;
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), words.as_mut_ptr().add(1).cast::<u8>(), len);
+        }
+        pool.push((len, words));
+        &pool.last().unwrap().1
     };
-    unsafe { entry.as_ptr().add(8) }
+    let ptr = unsafe { entry.as_ptr().add(1).cast::<u8>() };
+    ptr.expose_provenance();
+    ptr
 }
 
 #[unsafe(no_mangle)]
@@ -1207,7 +1207,9 @@ pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
     if s.is_null() {
         return -1;
     }
-    unsafe { (s as *const i64).sub(1).read_unaligned() }
+    let key_ptr = unsafe { (s as *const i64).sub(1) };
+    debug_assert!(key_ptr.addr() & 7 == 0, "alm_str_key prefix not 8-aligned");
+    unsafe { key_ptr.read() }
 }
 
 pub const STR_KEY_TAG: i64 = i64::MIN;
@@ -1667,9 +1669,9 @@ pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
     if unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
         let mut lanes = [0u64; 3];
         for (i, lane) in lanes.iter_mut().enumerate() {
-            let mut buf = [0u8; 16];
-            unsafe { alm_tbl_get(t, i as i64, buf.as_mut_ptr(), 16) };
-            *lane = u64::from_ne_bytes(buf[..8].try_into().unwrap());
+            let mut buf: u128 = 0;
+            unsafe { alm_tbl_get(t, i as i64, ptr::addr_of_mut!(buf).cast(), 16) };
+            *lane = buf as u64;
         }
         unsafe { vx_coro_send(id, lanes[0], lanes[1], lanes[2]) };
     }
@@ -1926,11 +1928,10 @@ mod strkey_tests {
             "the replacement's lane is the span slot's answer"
         );
         unsafe {
-            let mut buf = [0u8; 8];
-            alm_tbl_get(parent, 100_001, buf.as_mut_ptr(), 8);
+            let mut got: u64 = 0;
+            alm_tbl_get(parent, 100_001, ptr::addr_of_mut!(got).cast(), 8);
             assert_eq!(
-                u64::from_ne_bytes(buf) as usize,
-                replacement as usize,
+                got as usize, replacement as usize,
                 "the read face answers the replacement through the span"
             );
         };
@@ -1984,8 +1985,8 @@ mod strkey_tests {
 
         let row: *const u8 = std::ptr::addr_of!(child).cast();
         unsafe { alm_tbl_set_row(parent, 0, row) };
-        let word = 5u64.to_ne_bytes();
-        unsafe { alm_tbl_set(parent, 0, word.as_ptr().cast()) };
+        let word: u64 = 5;
+        unsafe { alm_tbl_set(parent, 0, ptr::addr_of!(word).cast()) };
 
         assert_ne!(
             unsafe { std::ptr::addr_of!((*child).esize).read() },

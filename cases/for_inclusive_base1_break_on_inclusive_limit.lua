@@ -2,7 +2,7 @@
 -- EXPECT: 1
 -- EXPECT: 10
 -- EXPECT: 3
--- Combines P17 (break-arm unhoused free) + P18 (base-1 negative-start
+-- Combines P17 (break-path unstored-row free) + P18 (base-1 negative-start
 -- refuse reclaim) + inclusive limit: trip 0 is reclaimed by set_core,
 -- trip 1 is housed in t[1], and trip 2 (the inclusive boundary trip)
 -- breaks before the store and reclaims its 2-level child at the break arm.

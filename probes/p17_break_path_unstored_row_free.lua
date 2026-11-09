@@ -1,12 +1,12 @@
--- P17 the break arm and the unhoused row (extends p15's scalar fill to
+-- P17 the break arm and the unstored row (extends p15's scalar fill to
 -- the break class): a loop allocates a row each trip, stores it into t on
 -- the fallthrough arm, and breaks BEFORE the store at the break point.
 -- Ownership is minted per syntax site in program order — never simulated
 -- — so the break's own mint (plan_break_exits at the break's NodeId,
 -- visited by the walk before the store site below it) sees the lattice
 -- state where the trip's row is allocated but not yet stored: the break
--- arm carries alm_tbl_free(child) for exactly that row.
--- Run: lua run.lua probe probes/p17_break_arm_unhoused_child_leak.lua
+-- arm carries alm_tbl_free(row) for exactly that row.
+-- Run: lua run.lua probe probes/p17_break_path_unstored_row_free.lua
 -- Quadrants:
 --   target/release/alm                        -o /tmp/b_q1.so ... && /tmp/b_q1.so   -> #t 1, sys 2
 --   target/release/alm --index-base=1         -o /tmp/b_q2.so ... && /tmp/b_q2.so   -> #t 0, sys 1
@@ -40,9 +40,9 @@
 local t = {}
 local bp = 1
 for i = 0, 3 do
-  local child = { i }
+  local row = { i }
   if i == bp then break end
-  t[i] = child
+  t[i] = row
 end
 print(#t)
 print(sys_alloc_count())
