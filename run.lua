@@ -18,7 +18,8 @@ Flags (any position):
                 must stand alone
   --no-fmt      skip the rustfmt gate (a default, quiet leg)
   --no-clippy   skip the clippy gate (a default, quiet leg)
-  --no-exe      skip the standalone-twin section
+  --no-test    skip the cargo test gate (a zero-arg leg)
+  --no-exe     skip the standalone-twin section
   --quick       corpus only (= --no-fmt --no-clippy --no-exe)
 
 Quiet when green: one summary line; failures and action-needed notices
@@ -38,7 +39,7 @@ if ARGS[1] == "probe" then
     end
 end
 
-local NO_LOCK, NO_FMT, NO_CLIPPY, NO_EXE, RELOCK = false, false, false, false, false
+local NO_LOCK, NO_FMT, NO_CLIPPY, NO_EXE, NO_TEST, RELOCK = false, false, false, false, false, false
 local CASES_OVERRIDE = nil
 local filters = {}
 do
@@ -51,10 +52,12 @@ do
             NO_FMT = true
         elseif a == "--no-clippy" then
             NO_CLIPPY = true
+        elseif a == "--no-test" then
+            NO_TEST = true
         elseif a == "--no-exe" then
             NO_EXE = true
         elseif a == "--quick" then
-            NO_FMT, NO_CLIPPY, NO_EXE = true, true, true
+            NO_FMT, NO_CLIPPY, NO_EXE, NO_TEST = true, true, true, true
         elseif a == "--relock" then
             RELOCK = true
         elseif a == "--cases" then
@@ -75,7 +78,7 @@ do
     end
 end
 
-if RELOCK and (CASES_OVERRIDE or NO_LOCK or NO_FMT or NO_CLIPPY or NO_EXE
+if RELOCK and (CASES_OVERRIDE or NO_LOCK or NO_FMT or NO_CLIPPY or NO_EXE or NO_TEST
                or #filters > 0 or mode == "probe") then
     io.stderr:write("\n--relock must stand alone (it rewrites every baseline; verify after with a zero-arg run)\n")
     os.exit(1)
@@ -219,6 +222,21 @@ if not NO_CLIPPY then
     local res = os.execute("cargo clippy --release --quiet -- -D warnings > /dev/null 2> " .. BERR)
     if not (res == 0 or res == true) then
         print(c(RED, "  ✗ cargo clippy failed (-D warnings):") .. "\n" .. read_file(BERR))
+        os.exit(1)
+    end
+end
+-- The unit/property pins in src/ (rt.rs strkey_tests, fast_lane_facts_pin,
+-- break_gate_tests, corpus_sweeps) ride the same battery as the .lua
+-- corpus: a zero-arg run that skips them lets the lock suite drift from
+-- the pins (the P20 lesson — the nested-row reserve pin was silently
+-- broken for a session). Failure output lands in target/test_out.txt
+-- (libtest's failure list prints on stdout, BERR only holds cargo's).
+if not NO_TEST and #filters == 0 then
+    local TEST_OUT = "target/test_out.txt"
+    local res = os.execute("cargo test --quiet > " .. TEST_OUT .. " 2> " .. BERR)
+    if not (res == 0 or res == true) then
+        print(c(RED, "  ✗ cargo test failed (full output: " .. TEST_OUT .. "):")
+            .. "\n" .. read_file(TEST_OUT) .. read_file(BERR))
         os.exit(1)
     end
 end
@@ -426,6 +444,7 @@ if not CASES_OVERRIDE and not NO_LOCK then
     table.insert(parts, lockpart)
 end
 local hygiene = {}
+if not NO_TEST and #filters == 0 then table.insert(hygiene, "test") end
 if not NO_FMT then table.insert(hygiene, "fmt") end
 if not NO_CLIPPY then table.insert(hygiene, "clippy") end
 if #hygiene > 0 then table.insert(parts, table.concat(hygiene, "+") .. " clean") end

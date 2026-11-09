@@ -112,6 +112,18 @@ fn exec_id() -> i32 {
     }
 }
 
+// Under Miri the vx sidecar and dladdr are foreign functions the
+// interpreter cannot execute (they are observability and name
+// introspection, not memory law), so the four touchpoints register as
+// a fixed exec id and drop the trace pokes. The memory laws the
+// interpreter is here to check — set_core, free_tbl, the strkey
+// reserved range — are pure Rust and run in full.
+#[cfg(miri)]
+unsafe fn register_now() -> i32 {
+    0
+}
+
+#[cfg(not(miri))]
 unsafe fn register_now() -> i32 {
     let mut info: DlInfo = std::mem::zeroed();
     let name: Vec<u8> = if unsafe { dladdr(ptr::addr_of!(MODULE_MARK).cast::<c_void>(), &mut info) }
@@ -138,10 +150,22 @@ unsafe fn register_now() -> i32 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_trace_set(slot: u8) {
-    unsafe { vx_trace_poke_exec(EXEC_ID.load(Ordering::Relaxed), slot) };
+    #[cfg(miri)]
+    {
+        let _ = slot;
+    }
+    #[cfg(not(miri))]
+    unsafe {
+        vx_trace_poke_exec(EXEC_ID.load(Ordering::Relaxed), slot)
+    };
 }
 
 unsafe fn mirror_census(id: i32) {
+    #[cfg(miri)]
+    {
+        let _ = id;
+    }
+    #[cfg(not(miri))]
     if id >= 0 {
         unsafe {
             vx_exec_census_set(
@@ -206,6 +230,12 @@ pub unsafe extern "C" fn alm_tbl_new(esize: usize, flags: u8) -> *mut AlmTable {
         },
         border: 0,
     }));
+    // The mint exposes the header's provenance: every lane word the
+    // runtime and the IR exchange carries this address as an integer,
+    // and the reconstitution seam (ptr::with_exposed_provenance in
+    // set_core's refuse arm, reclaim_displaced_child, free_tbl's child
+    // walk) can only recover provenance that was exposed here.
+    hdr.expose_provenance();
     ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
     TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
     let id = exec_id();
@@ -341,7 +371,11 @@ impl CellRepr for u64 {
     const ESIZE: usize = 8;
     const ALIGN: usize = 8;
     unsafe fn load_slot(slot: *const u8) -> Self {
-        unsafe { (slot as *const u64).read() }
+        // The slot is a caller byte pointer (the IR's spill slot, a
+        // test's stack bytes) — the boundary law is unaligned, the same
+        // law the u128 impl reads by (Miri: alignment-1 word reads are
+        // UB through a strict *const u64).
+        unsafe { (slot as *const u64).read_unaligned() }
     }
     fn to_lane(self) -> u128 {
         u128::from(self)
@@ -356,7 +390,8 @@ impl CellRepr for u64 {
         unsafe { (slot as *const u64).read() }
     }
     unsafe fn store_dst(cell: Self, dst: *mut u8) {
-        unsafe { (dst as *mut u64).write(cell) };
+        // The dst is a caller byte pointer — the boundary law, as above.
+        unsafe { (dst as *mut u64).write_unaligned(cell) };
     }
 }
 
@@ -496,7 +531,10 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
         // Row/Handle split, so the refuse path and the free path agree
         // on what the cell holds by construction.
         if owns_cell && C::ESIZE == 8 {
-            let child = cell.to_lane() as usize as *mut AlmTable;
+            // The lane word is an integer the IR and the span traffic
+            // as a value; the reconstitution seam recovers the
+            // exposed-provenance pointer the mint declared.
+            let child = ptr::with_exposed_provenance_mut::<AlmTable>(cell.to_lane() as usize);
             unsafe { free_tbl(child, &[]) };
         }
         return;
@@ -561,10 +599,10 @@ unsafe fn reclaim_displaced_child<C: CellRepr>(tbl: &AlmTable, old_slot: C, new_
     if old_lane == new_cell.to_lane() {
         return;
     }
-    let addr = old_lane as usize;
-    if valid_slot_addr(addr) {
+    let child = ptr::with_exposed_provenance_mut::<AlmTable>(old_lane as usize);
+    if valid_slot_addr(child as usize) {
         unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
-        unsafe { free_tbl(addr as *mut AlmTable, &[]) };
+        unsafe { free_tbl(child, &[]) };
     }
 }
 
@@ -572,13 +610,26 @@ unsafe fn reclaim_displaced_child<C: CellRepr>(tbl: &AlmTable, old_slot: C, new_
 /// it sits in user space and is 8-byte aligned; zero words (unwritten
 /// slots) and kernel islands fail it. free_tbl's child walk and the
 /// replace reclaim consult the one predicate.
+///
+/// The 1 MiB floor is an allocator-layout assumption (system heap bases
+/// sit far above it; zero words and small-integer lanes sit below).
+/// Miri's heap base sits BELOW the floor (~1 MB in the runs), so under
+/// the interpreter the floor yields and the zero-lane + kernel-island
+/// laws carry the rejection alone.
 fn valid_slot_addr(addr: usize) -> bool {
     #[cfg(target_pointer_width = "64")]
     let is_user_space = addr < 0x0000_7FFF_FFFF_FFFF;
     #[cfg(not(target_pointer_width = "64"))]
     let is_user_space = true;
 
-    addr > 0x0100_0000 && is_user_space && (addr & 7) == 0
+    #[cfg(miri)]
+    {
+        addr != 0 && is_user_space && (addr & 7) == 0
+    }
+    #[cfg(not(miri))]
+    {
+        addr > 0x0100_0000 && is_user_space && (addr & 7) == 0
+    }
 }
 
 unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
@@ -998,9 +1049,15 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
 
     if tbl.contains_tables != 0 {
         if tbl.mode == TableMode::Dense && !tbl.data.is_null() {
-            let ptrs =
-                std::slice::from_raw_parts(tbl.data.cast::<*mut AlmTable>(), tbl.len as usize);
-            for &child in ptrs {
+            // The span words are integer lanes (store_span writes the
+            // lane, never the pointer), so the child walk reads them as
+            // u64 words and reconstitutes each through the
+            // exposed-provenance seam — a pointer-typed read of an
+            // integer-written slot carries no provenance (Miri:
+            // dangling [noalloc]).
+            let lanes = std::slice::from_raw_parts(tbl.data.cast::<u64>(), tbl.len as usize);
+            for &lane in lanes {
+                let child = ptr::with_exposed_provenance_mut::<AlmTable>(lane as usize);
                 if valid_slot_addr(child as usize) {
                     unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
                     unsafe { free_tbl(child, keeps) };
@@ -1010,9 +1067,10 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
         if !tbl.sparse_map.is_null() {
             let map = unsafe { &*tbl.sparse_map };
             for &child_addr in map.values() {
-                if valid_slot_addr(child_addr as usize) {
+                let child = ptr::with_exposed_provenance_mut::<AlmTable>(child_addr as usize);
+                if valid_slot_addr(child as usize) {
                     unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
-                    unsafe { free_tbl(child_addr as *mut AlmTable, keeps) };
+                    unsafe { free_tbl(child, keeps) };
                 }
             }
         }
@@ -1089,9 +1147,46 @@ pub unsafe extern "C" fn alm_str_register(ptrs: *const *const u8, n: usize) {
     unsafe { vx_str_register(ptrs as *mut *const u8, n) };
 }
 
+/// The Miri stand-in for the C-side intern pool: the pool is a foreign
+/// function the interpreter cannot execute, so the law it must preserve
+/// is re-stated here — content dedup, an 8-byte str-key prefix before
+/// the returned bytes, a NUL terminator. `alm_str_key`'s unaligned
+/// prefix read is the ABI contract this layout answers to. The entries
+/// live in the static pool itself (a pushed Vec's buffer never moves),
+/// so the process exit drains them — no Box::leak to trip Miri's leak
+/// check, no immortality claim to justify.
+#[cfg(miri)]
+unsafe fn miri_intern(s: *const u8, len: usize) -> *const u8 {
+    use std::sync::Mutex;
+    static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    let bytes = unsafe { std::slice::from_raw_parts(s, len) }.to_vec();
+    let mut pool = POOL.lock().unwrap();
+    let at = pool
+        .iter()
+        .position(|entry| entry.get(8..8 + len) == Some(bytes.as_slice()));
+    let entry = if let Some(at) = at {
+        &pool[at]
+    } else {
+        let mut entry: Vec<u8> = Vec::with_capacity(8 + len + 1);
+        entry.extend_from_slice(&str_key_of_bytes(&bytes).to_ne_bytes());
+        entry.extend_from_slice(&bytes);
+        entry.push(0);
+        pool.push(entry);
+        pool.last().unwrap()
+    };
+    unsafe { entry.as_ptr().add(8) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_str_intern(s: *const u8, len: usize) -> *const u8 {
-    unsafe { vx_str_intern(s, len) }
+    #[cfg(miri)]
+    {
+        return unsafe { miri_intern(s, len) };
+    }
+    #[cfg(not(miri))]
+    unsafe {
+        vx_str_intern(s, len)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1140,7 +1235,7 @@ pub extern "C" fn alm_any_print(v: i128) {
         ALM_ARG_FLOAT => print!("{}", f64::from_bits(any_payload(v))),
         ALM_ARG_BOOL => print!("{}", any_payload(v) != 0),
         ALM_ARG_STRING => {
-            let p = any_payload(v) as *const u8;
+            let p = ptr::with_exposed_provenance::<u8>(any_payload(v) as usize);
             if !p.is_null() {
                 let bytes = unsafe { cstr_bytes(p) };
                 print!("{}", String::from_utf8_lossy(bytes));
@@ -1166,7 +1261,7 @@ pub extern "C" fn alm_any_len(v: i128) -> i64 {
     };
     match any_tag(v) {
         ALM_ARG_STRING => {
-            let p = any_payload(v) as *const u8;
+            let p = ptr::with_exposed_provenance::<u8>(any_payload(v) as usize);
             if p.is_null() {
                 return 0;
             }
@@ -1639,6 +1734,13 @@ mod strkey_tests {
         let slot: *const u8 = std::ptr::addr_of!(child).cast();
         unsafe { alm_tbl_set_row(parent, -1, slot) };
 
+        // The poison read is a real-allocator law: the header's memory
+        // is freed, and the detector reads it only because the system
+        // allocator recycles lazily. Under Miri a freed read is UB by
+        // definition, so the interpreter proves the reclaim through the
+        // laws around it (the refuse no-growth, the parent's exit free
+        // without a second free of the child).
+        #[cfg(not(miri))]
         assert_eq!(
             unsafe { std::ptr::addr_of!((*child).esize).read() },
             FREE_POISON_ESIZE,
@@ -1663,6 +1765,8 @@ mod strkey_tests {
         let slot: *const u8 = std::ptr::addr_of!(child).cast();
         unsafe { alm_tbl_set_row(parent, -1, slot) };
 
+        // The poison read: real-allocator law (see the twin above).
+        #[cfg(not(miri))]
         assert_eq!(
             unsafe { std::ptr::addr_of!((*child).esize).read() },
             FREE_POISON_ESIZE,
@@ -1713,6 +1817,9 @@ mod strkey_tests {
         let b: *const u8 = std::ptr::addr_of!(second).cast();
         unsafe { alm_tbl_set_row(parent, 0, b) };
 
+        // The poison read on the displaced (freed) header: real-allocator
+        // law (see refused_row_store_reclaims_the_child).
+        #[cfg(not(miri))]
         assert_eq!(
             unsafe { std::ptr::addr_of!((*first).esize).read() },
             FREE_POISON_ESIZE,
