@@ -582,7 +582,20 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     }
     unsafe { C::store_span(ptr, cell) };
     if !tbl.sparse_map.is_null() {
-        unsafe { (&mut *tbl.sparse_map).remove(&index) };
+        // The overflow-park seam (probes/p22_overflow_park_dense_grow_leak.lua):
+        // a prior write to this index may have parked in the overflow map
+        // before tbl.len grew past `index - SPARSE_THRESHOLD` and flipped the
+        // write into Branch 3's dense envelope. The parked lane is the slot's
+        // first occupant — an owned row the map still owns the last pointer
+        // to. Taking `remove`'s result through the same reclaim the span word
+        // obeys frees the (idempotent) victim: a parked index's span word is
+        // guaranteed 0 and vice versa, so one of the two lanes is always 0,
+        // and reclaim_displaced_child's validity gate passes over only the
+        // live one.
+        let parked = unsafe { (&mut *tbl.sparse_map).remove(&index) };
+        if owns_cell && let Some(parked) = parked {
+            unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(parked), cell) };
+        }
     }
 }
 
@@ -1837,6 +1850,98 @@ mod strkey_tests {
         );
         // The slot's owner is the replacement now; the parent's exit
         // free walks its valid slot words and collects it.
+        unsafe { alm_tbl_free(parent) };
+    }
+
+    #[test]
+    fn overflow_parked_row_is_reclaimed_when_dense_grows_into_it() {
+        // The park seam (probes/p22_overflow_park_dense_grow_leak.lua):
+        // a store above `len + SPARSE_THRESHOLD` rides Branch 2 and parks
+        // the row in the overflow map (which IS tbl.sparse_map --
+        // overflow_map lazily allocates it) while tbl.mode stays Dense.
+        // If tbl.len later grows so the SAME index flips into Branch 3's
+        // dense envelope, the span word reads 0 (a parked index has never
+        // had a span write) and the map entry drops. The bare remove used
+        // to orphan the parked row behind the write's back; set_core now
+        // feeds the removed lane through reclaim_displaced_child, the
+        // same law the span word already obeys.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let parked = unsafe { alm_tbl_new(8, 0) };
+        let filler = unsafe { alm_tbl_new(8, 0) };
+        let replacement = unsafe { alm_tbl_new(8, 0) };
+
+        // Park: 100001 > 0 + SPARSE_THRESHOLD. The map allocates, the
+        // border stretches to the parked index + 1, and the span stays
+        // empty -- the park must never be a span write.
+        let parked_lane: *const u8 = std::ptr::addr_of!(parked).cast();
+        unsafe { alm_tbl_set_row(parent, 100_001, parked_lane) };
+        assert_eq!(
+            unsafe { (*parent).len },
+            0,
+            "the overflow park must not grow the span"
+        );
+        assert_eq!(unsafe { alm_tbl_len(parent) }, 100_002);
+        assert!(!unsafe { (*parent).sparse_map }.is_null());
+        assert_eq!(
+            unsafe { (&*(*parent).sparse_map).get(&100_001).copied() },
+            Some(parked as usize as u128),
+            "the row's lane lives in the overflow map"
+        );
+
+        // Grow the dense span past the seam: index 9 (<= 10 +
+        // SPARSE_THRESHOLD) spands to len 10, so the next write to
+        // 100001 (<= 10 + SPARSE_THRESHOLD) takes Branch 3.
+        let filler_lane: *const u8 = std::ptr::addr_of!(filler).cast();
+        unsafe { alm_tbl_set_row(parent, 9, filler_lane) };
+        assert_eq!(unsafe { (*parent).len }, 10);
+        assert_eq!(
+            unsafe { (&*(*parent).sparse_map).get(&100_001).copied() },
+            Some(parked as usize as u128),
+            "the unrelated grow keeps the park parked"
+        );
+
+        // Branch 3 over the parked index: the span word was 0, the map
+        // entry drops, and -- the fix -- the parked row frees before the
+        // replacement takes the slot.
+        let replacement_lane: *const u8 = std::ptr::addr_of!(replacement).cast();
+        unsafe { alm_tbl_set_row(parent, 100_001, replacement_lane) };
+
+        // The reclaim's poison read: real-allocator law (see
+        // replaced_row_store_reclaims_the_displaced_child). Under Miri
+        // the freed header is exhausted, and the zero-leak exit (the
+        // interpreter's own detector) carries the proof: the parked row
+        // is nobody's child anymore, so only the reclaim could have
+        // collected it.
+        #[cfg(not(miri))]
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*parked).esize).read() },
+            FREE_POISON_ESIZE,
+            "the parked row frees at the dense flip, not at the drop"
+        );
+        assert!(unsafe { (&*(*parent).sparse_map).get(&100_001) }.is_none());
+        assert_eq!(unsafe { (*parent).len }, 100_002);
+        let lane = unsafe { ((*parent).data as *const u64).add(100_001).read() };
+        assert_eq!(
+            lane as usize, replacement as usize,
+            "the replacement's lane is the span slot's answer"
+        );
+        unsafe {
+            let mut buf = [0u8; 8];
+            alm_tbl_get(parent, 100_001, buf.as_mut_ptr(), 8);
+            assert_eq!(
+                u64::from_ne_bytes(buf) as usize,
+                replacement as usize,
+                "the read face answers the replacement through the span"
+            );
+        };
+        assert_ne!(
+            unsafe { std::ptr::addr_of!((*replacement).esize).read() },
+            FREE_POISON_ESIZE,
+            "the replacement rides the slot untouched"
+        );
+
+        // The span's rows collect at the exit: the filler and the
+        // replacement are the parent's valid slot words now.
         unsafe { alm_tbl_free(parent) };
     }
 

@@ -231,6 +231,177 @@ fn fast_lane_facts_pin_same_slot_repeat_stays_checked() {
 }
 
 #[test]
+fn fast_lane_facts_pin_two_shapes_one_group_collapse_forward() {
+    // The group law (post-P23 fix): distinct key shapes over one
+    // (loop, base) — `t[i]` and `t[i+1]` — overlap across trips (at
+    // trip i, slot i then slot i+1; at trip i+1, slot i+1 again), so
+    // the whole group falls to the checked face: the first sighting's
+    // mint revokes, nothing remains in `fast_stores`, and the plan
+    // widens nothing.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i] = i\n\
+         \x20 t[i+1] = i\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_two_shapes_one_group_collapse_backward() {
+    // The backward-order twin: `t[i+1]` sighted first (its mint
+    // admitted at 0 + 1) collapses when `t[i]` arrives — same group
+    // verdict, zero fast facts, the plan keeps None.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i+1] = i\n\
+         \x20 t[i] = i\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_unanalyzable_sibling_collapses_the_mint() {
+    // The poison service: a store whose key resolves under no key
+    // shape (`t[i * 2]`) writes unprovable slots at runtime, so the
+    // group that minted earlier in the walk is collapsed — its fact
+    // unclaims — and any sighting the walk reaches after that rides
+    // the checked face.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i] = i\n\
+         \x20 t[i * 2] = i\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_unanalyzable_store_poisons_sightings_that_come_later() {
+    // The poison service covers the mint-less first sighting too: the
+    // group is born dead when the shapeless store is seen, so the
+    // resolvable sighting after it never mints.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i * 2] = i\n\
+         \x20 t[i] = i\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_compound_host_sibling_poisons_nothing() {
+    // `t[i][0] = v` writes inside a row's cells, never `t`'s own
+    // slots: the poison service skips compound hosts, so the
+    // guard-keyed constructor store's mint stays claimed.
+    let source = "local t = {}\n\
+                  local i = 0\n\
+                  while i < 2 do\n\
+                  \x20 t[i] = {}\n\
+                  \x20 t[i][0] = i + 3\n\
+                  \x20 i = i + 1\n\
+                  end\n";
+    let (ast, facts) = lane_facts(source).unwrap();
+    let mut sites = Vec::new();
+    store_sites(&ast, &mut sites);
+    assert_eq!(sites.len(), 2, "the golden carries two stores");
+    assert!(
+        facts.fast_stores.contains_key(&sites[0].0),
+        "the guard-keyed constructor store rides the lane"
+    );
+    assert!(
+        !facts.fast_stores.contains_key(&sites[1].0),
+        "the compound-host row store stays checked"
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_sequential_scalar_fills_stay_claimed() {
+    // The cells-hold-one-kind law: replacing a scalar needs no
+    // reclaim, so two sequential integer fills on one binding keep
+    // riding the lane — the row-stored set never sees them.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i] = i\n\
+         \x20 i = i + 1\n\
+         end\n\
+         local j = 3\n\
+         while j < 6 do\n\
+         \x20 t[j] = j\n\
+         \x20 j = j + 1\n\
+         end\n",
+        &[("t", false, KeyShape::Guard), ("t", false, KeyShape::Guard)],
+        &[(&["t"], &[], Some(0)), (&["t"], &[], Some(0))],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_second_row_fill_widens_nothing() {
+    // The row-stored law: the first loop's constructor store leaves
+    // rows behind it, so the second loop's row store is not proven a
+    // fresh slot — it keeps the checked face and the plan widens
+    // nothing. The first mint stays (its slots were fresh).
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 t[i] = {}\n\
+         \x20 i = i + 1\n\
+         end\n\
+         local j = 2\n\
+         while j < 4 do\n\
+         \x20 t[j] = {}\n\
+         \x20 j = j + 1\n\
+         end\n",
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &["t"], None), (&["t"], &["t"], Some(0))],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_nested_store_never_claims() {
+    // The depth law: a store inside the inner loop re-runs once per
+    // enclosing trip, and the slots it touches are the enclosing
+    // trips' rows — the checked face. The depth counter rises for
+    // every entered while body, planned or not, so no frame claims
+    // through it: no fast fact and the outer plan widens nothing.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 local j = 0\n\
+         \x20 while j < 2 do\n\
+         \x20   t[i] = j\n\
+         \x20   j = j + 1\n\
+         \x20 end\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
 fn fast_lane_facts_pin_ctor_value_under_a_fill_borrows_the_bound() {
     let source = "local t = {}\n\
                   local i = 0\n\

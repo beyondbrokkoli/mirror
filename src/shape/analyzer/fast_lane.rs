@@ -100,21 +100,49 @@ struct LaneSink<'a> {
     plans: &'a BTreeMap<NodeId, PlanSets>,
     fast: BTreeMap<NodeId, FastStoreElig>,
     ctor: BTreeMap<NodeId, BTreeSet<NodeId>>,
-    /// The widest physical offset admitted per loop, sizing its
-    /// reserves. Signed and unclamped: the tight form reserves
-    /// `bound + K_eff` cells so the border equals the logical length
-    /// under every base. `None` = the loop minted no admitted store.
-    offsets: BTreeMap<NodeId, Option<i64>>,
     /// The surface index base the walk runs under; `GuardOffset` shapes
     /// arrive pre-folded from recognition, and a bare `Guard`'s physical
     /// offset `-index_base` is derived at its consumers here.
     index_base: i64,
-    /// Every (loop, base, key shape) that already minted a fast fact.
-    /// A same-slot repeat store is a replace, and the fast lane's
-    /// inline store cannot execute the reclaim the slot's displaced
-    /// occupant is owed — only a second sighting rides the checked
-    /// face, where set_core's replace arm frees it.
-    claimed: BTreeSet<(NodeId, String, KeyShape)>,
+    /// The claim groups: one per (loop, base). A group's first sighting
+    /// of a KeyShape rides the lane; a later sighting of the same shape
+    /// is a same-slot repeat (the P21 law) and declines, while a
+    /// distinct shape collapses the group. With more than one key shape
+    /// on the same (loop, base), the store windows overlap across trips:
+    /// at trip i the guard store writes slot i and the offset store
+    /// writes slot i + k, and the next trip's guard store clobbers the
+    /// offset row of trip i - 1 with no runtime face in between — not
+    /// even the first sighting is guaranteed a fresh slot then, so the
+    /// whole group falls to the checked face (its replace-reclaim speaks
+    /// the displacement law) and widens nothing.
+    claims: BTreeMap<(NodeId, String), LaneClaims>,
+    /// Every base that took a row kind store earlier in the walk. The
+    /// table the name binds holds rows at those slots: a later loop's
+    /// first sighting on the same base is not proven a fresh slot, so it
+    /// keeps the checked face too (the sequential-fill twin of the group
+    /// law). Scalar-only fills never enter the set — the cells-hold-one-
+    /// kind law forbids a row-and-scalar mix on one table binding —
+    /// so plain integer conversion loops stay claimed across fills.
+    row_stored: BTreeSet<String>,
+    /// Runtime loop nesting at the scan: incremented entering every
+    /// while body (planned or not), decremented leaving it. A claim
+    /// whose own loop is the only enclosing loop owns the whole trip
+    /// dimension over its body; deeper claims re-run their store
+    /// domain once per enclosing trip, and the slots the claim touches
+    /// are the enclosing trips' rows — nothing to prove fresh there.
+    loop_depth: u32,
+}
+
+/// One (loop, base) group. `shapes` carries every resolvable key shape
+/// the walk saw; `minted` pairs the facts' statement ids with their
+/// physical offsets (the plan's reserve widening reads only survivors);
+/// `poisoned` is the group-wide decline once a distinct shape or an
+/// unanalyzable store reached it.
+#[derive(Default)]
+struct LaneClaims {
+    shapes: BTreeSet<KeyShape>,
+    minted: Vec<(NodeId, i64)>,
+    poisoned: bool,
 }
 
 impl Analyzer {
@@ -142,9 +170,10 @@ impl Analyzer {
             plans: &sets,
             fast: BTreeMap::new(),
             ctor: BTreeMap::new(),
-            offsets: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            row_stored: BTreeSet::new(),
+            loop_depth: 0,
             index_base: self.index_base,
-            claimed: BTreeSet::new(),
         };
         scan_stmts(stmts, &mut Vec::new(), &mut ConstEnv::new(), &mut sink);
         for (loop_id, hits) in sink.ctor {
@@ -152,12 +181,87 @@ impl Analyzer {
                 plan.ctor_reserves = hits;
             }
         }
-        for (loop_id, max_k) in sink.offsets {
+        // The plan's widest offset comes from the surviving mints only:
+        // a collapsed group's facts were unclaimed (its stores ride the
+        // checked face), and a never-minted sighting contributes
+        // nothing, so the reserves keep the raw bound when nothing was
+        // proven.
+        let mut key_offsets: BTreeMap<NodeId, Option<i64>> = BTreeMap::new();
+        for ((loop_id, _), rec) in &sink.claims {
+            if rec.poisoned {
+                continue;
+            }
+            for (_, k) in &rec.minted {
+                let entry = key_offsets.entry(*loop_id).or_insert(None);
+                if entry.is_none_or(|current| *k > current) {
+                    *entry = Some(*k);
+                }
+            }
+        }
+        for (loop_id, max_k) in key_offsets {
             if let Some(plan) = self.layout.reserve_plans.get_mut(&loop_id) {
                 plan.key_offset = max_k;
             }
         }
         self.layout.fast_stores = sink.fast;
+    }
+}
+
+/// One resolvable sighting's group verdict: `FallThrough` continues
+/// the mint flow, `Decline` stops the frame walk, and `Collapse` has
+/// already unclaimed the group's minted facts in place.
+enum Sighting {
+    FallThrough,
+    Decline,
+    Collapse,
+}
+
+impl LaneSink<'_> {
+    /// The group decline for one (loop, base): every minted fact
+    /// unclaims (its store compiles to the checked face) and the group
+    /// declines every later sighting — same-shape repeats included,
+    /// whose checked stores keep set_core's replace-reclaim. A
+    /// poisoned group stays dead even when the poison arrived at a
+    /// sighting that minted nothing: a later same-shape sighting gets
+    /// no claim from it either.
+    fn poison(&mut self, loop_id: NodeId, base: &str) {
+        let rec = self.claims.entry((loop_id, base.to_string())).or_default();
+        if rec.poisoned {
+            return;
+        }
+        let dead = std::mem::take(&mut rec.minted);
+        rec.poisoned = true;
+        for (stmt_id, _) in dead {
+            self.fast.remove(&stmt_id);
+        }
+    }
+
+    /// Book one sighting into its (loop, base) group. The poisoned
+    /// group declines. A same-shape repeat is the P21 law: the first
+    /// sighting of a slot keeps the claim (its slot is fresh), the
+    /// repeats ride the checked face. A distinct new shape after a
+    /// mint collapses the group, because the two store windows overlap
+    /// across trips — at trip i the guard store writes slot i and the
+    /// offset store writes slot i + k, and the next trip's guard store
+    /// clobbers the offset row with no runtime face in between — so
+    /// nothing already minted can stay.
+    fn book_sighting(&mut self, loop_id: NodeId, base: &str, shape: KeyShape) -> Sighting {
+        let rec = self.claims.entry((loop_id, base.to_string())).or_default();
+        if rec.poisoned {
+            return Sighting::Decline;
+        }
+        if !rec.shapes.insert(shape) {
+            return Sighting::Decline;
+        }
+        if !rec.minted.is_empty() {
+            let dead = std::mem::take(&mut rec.minted);
+            rec.poisoned = true;
+            for (stmt_id, _) in dead {
+                self.fast.remove(&stmt_id);
+            }
+            return Sighting::Collapse;
+        }
+        Sighting::FallThrough
     }
 }
 
@@ -207,10 +311,9 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
             scan_expr(obj, sink);
             scan_expr(key, sink);
             scan_expr(value, sink);
-            claim_store(stmt.id(), obj, key, frames, sink);
-            if matches!(value, Expr::TableCtor { .. })
-                && let Some(base) = get_base_identifier(obj)
-            {
+            let row_kind = matches!(value, Expr::TableCtor { .. });
+            claim_store(stmt.id(), obj, key, row_kind, frames, sink);
+            if row_kind && let Some(base) = get_base_identifier(obj) {
                 for frame in frames.iter().rev() {
                     if frame.nested.contains(base) {
                         sink.ctor
@@ -243,7 +346,9 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                 });
                 pushed = true;
             }
+            sink.loop_depth += 1;
             scan_block(body, frames, env, sink);
+            sink.loop_depth -= 1;
             if pushed {
                 frames.pop();
             }
@@ -321,10 +426,36 @@ fn scan_block(
     env.overlay = saved_overlay;
 }
 
-fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], sink: &mut LaneSink) {
+/// One store site's lane laws. Pass one is the poison service (an
+/// unanalyzable writer collapses the groups it reaches); pass two
+/// books the sighting and, when every gate admits, mints the fast
+/// fact. A row-kind value marks the base afterwards.
+fn claim_store(
+    stmt_id: NodeId,
+    obj: &Expr,
+    key: &Expr,
+    row_kind: bool,
+    frames: &[LaneFrame],
+    sink: &mut LaneSink,
+) {
     let Some(base) = get_base_identifier(obj) else {
         return;
     };
+    // Pass one, the poison service: a plain-host store whose key
+    // resolves under no live frame ("t[expr] = v") is a runtime writer
+    // of unprovable slots, so every (loop, base) group it reaches
+    // collapses — including a group minted earlier in this walk, whose
+    // fresh-slot proof the unanalyzable writer undoes — and stays
+    // dead for sightings that come later in the walk. A compound host
+    // (`t[i][k] = v`) writes inside a row's cells, never `t`'s own
+    // slots, so it poisons nothing.
+    if matches!(obj, Expr::Identifier { .. }) {
+        for frame in frames.iter().rev() {
+            if guard_key_shape(key, &frame.guard, sink.index_base).is_none() {
+                sink.poison(frame.loop_id, base);
+            }
+        }
+    }
     for frame in frames.iter().rev() {
         if !frame.guard_live() {
             continue;
@@ -338,6 +469,10 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
             KeyShape::Guard => -sink.index_base,
             KeyShape::GuardOffset(k) => k,
         };
+        match sink.book_sighting(frame.loop_id, base, shape) {
+            Sighting::Decline | Sighting::Collapse => continue,
+            Sighting::FallThrough => {}
+        }
         // One admission law for every key shape: the entry's exact
         // constant when known, the plan's minted lower bound when not,
         // and `first + k_phys >= 0` on the checked sum. A minted plan
@@ -352,18 +487,23 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
         if !admitted {
             continue;
         }
-        // The claim law: one fast fact per (loop, base, key). A second
-        // sighting of the same slot is a replace — the fast lane's
-        // inline store would clobber the slot's first occupant's last
-        // pointer with no runtime face in between, so the displaced
-        // child leaks (the fast-lane displacement of
-        // probes/p21_sparse_overwrite_displaced_row_leak.lua' repeat
-        // probe). The repeat declines and rides the checked face, where
-        // set_core's replace-reclaim frees the displaced child; the
-        // claim itself stays with the first sighting, whose slot is
-        // fresh (span-grown or inserted) and displaces nothing.
-        let claim = (frame.loop_id, base.clone(), shape);
-        if sink.claimed.contains(&claim) {
+        // The row-stored law (the sequential twin of the group law): a
+        // row store into a base whose rows the walk already populated
+        // is not proven a fresh slot, so it keeps the checked face,
+        // whose replace-reclaim frees the displaced child. Scalar
+        // values stay eligible: replacing a scalar needs no reclaim,
+        // and the cells-hold-one-kind law forbids a row-and-scalar mix
+        // on one table binding — so plain integer fills keep riding
+        // the lane across fills.
+        if row_kind && sink.row_stored.contains(base) {
+            continue;
+        }
+        // The depth law: a claim whose own loop is the only enclosing
+        // loop owns the whole trip dimension over it; a deeper claim
+        // re-runs its store domain once per enclosing trip, and the
+        // slots it touches are the enclosing trips' rows. Deeper
+        // claims keep the checked face.
+        if sink.loop_depth != 1 {
             continue;
         }
         // A plain-name store on a pre-header-reserved table rides the
@@ -383,8 +523,12 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: false,
                 },
             );
-            sink.claimed.insert(claim);
-            widen(sink, frame.loop_id, k_phys);
+            if let Some(rec) = sink.claims.get_mut(&(frame.loop_id, base.clone())) {
+                rec.minted.push((stmt_id, k_phys));
+            }
+            if row_kind {
+                sink.row_stored.insert(base.clone());
+            }
             return;
         }
         if frame.nested.contains(base) && matches!(obj, Expr::Identifier { .. }) {
@@ -409,34 +553,40 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: true,
                 },
             );
-            sink.claimed.insert(claim);
-            widen(sink, frame.loop_id, k_phys);
+            if let Some(rec) = sink.claims.get_mut(&(frame.loop_id, base.clone())) {
+                rec.minted.push((stmt_id, k_phys));
+            }
+            if row_kind {
+                sink.row_stored.insert(base.clone());
+            }
             return;
         }
     }
-}
-
-/// The loop's reserves must cover `bound + K_eff` cells for every
-/// admitted key: the widest physical offset wins, negative offsets
-/// included (the tight form — the border must equal the logical
-/// length under every base, and a negative offset's highest write is
-/// `bound - 1 + K_eff`). Option-max over `None`: a loop with no
-/// admitted store keeps `None`, and the placeholder ambiguity is gone.
-fn widen(sink: &mut LaneSink, loop_id: NodeId, k_phys: i64) {
-    let entry = sink.offsets.entry(loop_id).or_insert(None);
-    if entry.is_none_or(|current| k_phys > current) {
-        *entry = Some(k_phys);
+    // The mint-less path (a declined sighting, a collapsed group, an
+    // unclaimable host, a shapeless base) still records a row store:
+    // the base the name binds holds rows from here on, fail-closed,
+    // name reuse included. A compound host writes inside a row's
+    // cells and marks nothing.
+    if row_kind && matches!(obj, Expr::Identifier { .. }) {
+        sink.row_stored.insert(base.clone());
     }
 }
 
 /// Function bodies ride their own emission contexts, never the lanes
 /// or the constants around their literals (a conversion loop's body
-/// admits no calls), so both stacks start empty inside them.
+/// admits no calls), so both stacks start empty inside them. The
+/// function's own stores face the function's trip counters only: the
+/// depth counter resets for the body's scan and restores after.
+/// `row_stored` stays walk-wide — name reuse across a call boundary
+/// keeps the fail-closed decline.
 fn scan_expr(expr: &Expr, sink: &mut LaneSink) {
     match expr {
         Expr::Function { body, .. } => {
+            let saved_depth = sink.loop_depth;
+            sink.loop_depth = 0;
             let mut fresh = Vec::new();
             scan_stmts(body, &mut fresh, &mut ConstEnv::new(), sink);
+            sink.loop_depth = saved_depth;
         }
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {
