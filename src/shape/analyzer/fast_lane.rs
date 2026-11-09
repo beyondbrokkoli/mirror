@@ -365,7 +365,19 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
             widen(sink, frame.loop_id, k_phys);
             return;
         }
-        if frame.nested.contains(base) {
+        if frame.nested.contains(base) && matches!(obj, Expr::Identifier { .. }) {
+            // A nested claim's host liveness is only a binding fact: a
+            // plain-name host names the binding the plan reserved, so
+            // the fast store's host register is the live table object
+            // every trip. A compound host reads a runtime slot at store
+            // time (`alm_tbl_get` of `t[k]`), and the slot's liveness is
+            // a claim the nested plan never minted: a refusable writer
+            // elsewhere in the body leaves that slot's zero word as the
+            // read's answer, and the fast lane's header deref would
+            // SIGSEGV on the null host with no runtime face in between.
+            // Those stores ride the checked face, whose null arm speaks
+            // the null-row-store guard — the faithful "attempt to index
+            // a nil value" — instead of a bare fault.
             sink.fast.insert(
                 stmt_id,
                 FastStoreElig {
