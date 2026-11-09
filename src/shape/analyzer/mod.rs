@@ -121,6 +121,12 @@ struct OwnershipState {
     ret_path_keep_temps: BTreeMap<NodeId, Vec<usize>>,
     rebind_grants: BTreeMap<NodeId, BTreeMap<String, Vec<super::facts::Keep>>>,
     stored_ctor_parents: BTreeSet<usize>,
+    /// Every IndexAssign whose value inferred table-typed — the same
+    /// predicate the lowerer's `contains_tables` ownership bit keys on.
+    /// The fast lane reads it so a store's row kind survives a
+    /// non-ctor spelling (`t[i] = r`), which the lane's syntactic
+    /// `TableCtor` check alone would miss and mark nothing.
+    row_value_stores: BTreeSet<NodeId>,
     move_poisons: BTreeMap<NodeId, BTreeSet<String>>,
     store_ghost_keeps: BTreeMap<NodeId, Vec<usize>>,
     ctor_ghost_keeps: BTreeMap<NodeId, Vec<(usize, usize)>>,
@@ -409,6 +415,7 @@ pub fn analyze_with_base(
             ret_path_keep_temps: BTreeMap::new(),
             rebind_grants: BTreeMap::new(),
             stored_ctor_parents: BTreeSet::new(),
+            row_value_stores: BTreeSet::new(),
             move_poisons: BTreeMap::new(),
             store_ghost_keeps: BTreeMap::new(),
             ctor_ghost_keeps: BTreeMap::new(),

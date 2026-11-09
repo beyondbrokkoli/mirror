@@ -98,6 +98,11 @@ type PlanSets = (BTreeSet<String>, BTreeSet<String>, Option<i64>);
 
 struct LaneSink<'a> {
     plans: &'a BTreeMap<NodeId, PlanSets>,
+    /// The walk's per-statement row-kind facts: a store whose value
+    /// inferred table-typed, ctor spelling or not. The lane's row laws
+    /// (the row-stored decline and the row_stored marking) key on this
+    /// union with the syntactic TableCtor check.
+    row_values: &'a BTreeSet<NodeId>,
     fast: BTreeMap<NodeId, FastStoreElig>,
     ctor: BTreeMap<NodeId, BTreeSet<NodeId>>,
     /// The surface index base the walk runs under; `GuardOffset` shapes
@@ -168,6 +173,7 @@ impl Analyzer {
             .collect();
         let mut sink = LaneSink {
             plans: &sets,
+            row_values: &self.own.row_value_stores,
             fast: BTreeMap::new(),
             ctor: BTreeMap::new(),
             claims: BTreeMap::new(),
@@ -239,12 +245,14 @@ impl LaneSink<'_> {
     /// Book one sighting into its (loop, base) group. The poisoned
     /// group declines. A same-shape repeat is the P21 law: the first
     /// sighting of a slot keeps the claim (its slot is fresh), the
-    /// repeats ride the checked face. A distinct new shape after a
-    /// mint collapses the group, because the two store windows overlap
-    /// across trips — at trip i the guard store writes slot i and the
-    /// offset store writes slot i + k, and the next trip's guard store
-    /// clobbers the offset row with no runtime face in between — so
-    /// nothing already minted can stay.
+    /// repeats ride the checked face. A distinct new shape collapses
+    /// the group even when no earlier sighting minted: a mintless
+    /// sighting still runs on the checked face and populates slots
+    /// across trips, and the new shape's fresh-slot proof cannot see
+    /// those checked writes — when the new shape's offset is the
+    /// smaller one, its fast window lands on slots the checked shape
+    /// already filled, with no reclaim face in between. So any two
+    /// distinct shapes on one (loop, base) poison the group.
     fn book_sighting(&mut self, loop_id: NodeId, base: &str, shape: KeyShape) -> Sighting {
         let rec = self.claims.entry((loop_id, base.to_string())).or_default();
         if rec.poisoned {
@@ -253,7 +261,7 @@ impl LaneSink<'_> {
         if !rec.shapes.insert(shape) {
             return Sighting::Decline;
         }
-        if !rec.minted.is_empty() {
+        if rec.shapes.len() > 1 {
             let dead = std::mem::take(&mut rec.minted);
             rec.poisoned = true;
             for (stmt_id, _) in dead {
@@ -287,6 +295,20 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                     Some(Expr::Integer { value, .. }) => Some(*value),
                     _ => None,
                 };
+                // The decl-side twin of the store-side marking: an init
+                // that is not a provably empty fresh table may house
+                // rows at construction (`local t = { {} }`, a moved-in
+                // binding, a call's answer), and no IndexAssign ever
+                // announces them — so the base marks fail-closed and
+                // later row stores keep the fresh-slot proof honest.
+                // An empty ctor stays unmarked (the canonical fill
+                // target), and scalar inits mark harmlessly: a scalar
+                // base never takes a row store, and a re-declared name
+                // inherits the walk-wide decline by design.
+                if !matches!(exprs.get(idx), Some(Expr::TableCtor { entries, .. }) if entries.is_empty())
+                {
+                    sink.row_stored.insert(name.clone());
+                }
                 env.declare(name, init);
                 for frame in frames.iter_mut() {
                     if frame.guard == *name {
@@ -298,6 +320,11 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
         }
         Stmt::Assignment { name, expr, .. } => {
             scan_expr(expr, sink);
+            // Same decl-side law for a re-binding: only a fresh empty
+            // table is provably row-free; anything else marks.
+            if !matches!(expr, Expr::TableCtor { entries, .. } if entries.is_empty()) {
+                sink.row_stored.insert(name.clone());
+            }
             env.assign(name);
             for frame in frames.iter_mut() {
                 if frame.guard == *name {
@@ -311,9 +338,16 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
             scan_expr(obj, sink);
             scan_expr(key, sink);
             scan_expr(value, sink);
-            let row_kind = matches!(value, Expr::TableCtor { .. });
+            // The row kind is the walk's Tbl-value fact (ctor spelling
+            // or not — `t[i] = r` with r a row infers Tbl too) plus the
+            // syntactic ctor as a belt for any arm the walk declined.
+            // The ctor reserve bookkeeping below stays syntactic: the
+            // lowerer mints the row's own reserve under a TableCtor
+            // check, so a fact-only row kind would reserve nothing.
+            let is_ctor = matches!(value, Expr::TableCtor { .. });
+            let row_kind = is_ctor || sink.row_values.contains(&stmt.id());
             claim_store(stmt.id(), obj, key, row_kind, frames, sink);
-            if row_kind && let Some(base) = get_base_identifier(obj) {
+            if is_ctor && let Some(base) = get_base_identifier(obj) {
                 for frame in frames.iter().rev() {
                     if frame.nested.contains(base) {
                         sink.ctor
@@ -501,9 +535,14 @@ fn claim_store(
         // The depth law: a claim whose own loop is the only enclosing
         // loop owns the whole trip dimension over it; a deeper claim
         // re-runs its store domain once per enclosing trip, and the
-        // slots it touches are the enclosing trips' rows. Deeper
-        // claims keep the checked face.
-        if sink.loop_depth != 1 {
+        // slots it touches are the enclosing trips' rows — reclaim
+        // territory, so a row-kind claim keeps the checked face. A
+        // scalar claim re-runs safely once per enclosing trip: it
+        // replaces a scalar word wherever it lands, and the
+        // cells-hold-one-kind law forbids rows on a scalar binding, so
+        // there is nothing to reclaim at any depth (the staircase's
+        // inner fill rides the lane).
+        if row_kind && sink.loop_depth != 1 {
             continue;
         }
         // A plain-name store on a pre-header-reserved table rides the

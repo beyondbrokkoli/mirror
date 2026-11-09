@@ -379,12 +379,15 @@ fn fast_lane_facts_pin_second_row_fill_widens_nothing() {
 }
 
 #[test]
-fn fast_lane_facts_pin_nested_store_never_claims() {
-    // The depth law: a store inside the inner loop re-runs once per
-    // enclosing trip, and the slots it touches are the enclosing
-    // trips' rows — the checked face. The depth counter rises for
-    // every entered while body, planned or not, so no frame claims
-    // through it: no fast fact and the outer plan widens nothing.
+fn fast_lane_facts_pin_nested_scalar_store_claims_row_stays_checked() {
+    // The depth law, split by value kind. A scalar claim re-runs once
+    // per enclosing trip and replaces a scalar word wherever it lands
+    // — the cells-hold-one-kind law forbids rows on a scalar binding,
+    // so nothing needs reclaiming at any depth: the store rides the
+    // lane under its own loop's... the frame it resolves under (the
+    // outer guard) — the claim books into the outer group and mints.
+    // The row-kind twin keeps the checked face: its slots are the
+    // enclosing trips' rows, reclaim territory the plan never minted.
     expect_lane(
         "local t = {}\n\
          local i = 0\n\
@@ -396,8 +399,22 @@ fn fast_lane_facts_pin_nested_store_never_claims() {
          \x20 end\n\
          \x20 i = i + 1\n\
          end\n",
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &[], Some(0))],
+    );
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 local j = 0\n\
+         \x20 while j < 2 do\n\
+         \x20   t[i] = { { j } }\n\
+         \x20   j = j + 1\n\
+         \x20 end\n\
+         \x20 i = i + 1\n\
+         end\n",
         &[],
-        &[(&["t"], &[], None)],
+        &[(&["t"], &["t"], None)],
     );
 }
 
@@ -693,6 +710,127 @@ fn const_key_value_shifts_once_in_physical_space() {
         const_key_value(&int(i64::MIN), 1),
         None,
         "a shift overflow declines the constant"
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_mintless_sibling_shape_collapses_the_group() {
+    // The group law holds even when no earlier sighting minted: the
+    // inner loop's `t[i+1]` books its shape into the outer group and
+    // the depth law declines its mint (loop_depth 2), but the store
+    // still runs once per outer trip — the checked face — writing
+    // slot i + 1. A `t[i]` mint at the outer level would land its
+    // fast window on slots the checked shape already filled (at trip
+    // 1, slot 1 holds trip 0's `t[i+1]` store). The distinct shape
+    // collapses the group instead: zero fast facts, the plan widens
+    // nothing. Scalars keep the example inside one cell kind; the law
+    // is about the shape pair, not the value kind.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 local j = 0\n\
+         \x20 while j < 2 do\n\
+         \x20   t[i + 1] = j + 7\n\
+         \x20   j = j + 1\n\
+         \x20 end\n\
+         \x20 t[i] = i + 3\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &[], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_depth_declined_sibling_shape_collapses_the_group() {
+    // The nesting twin: the inner loop's `t[i+1]` books its shape into
+    // the outer group and the depth law declines its mint (loop_depth
+    // 2), but the store still runs — the checked face — once per outer
+    // trip, writing slot i + 1. The outer `t[i]`'s mint would clobber
+    // those slots at trip 1 onward; the distinct shape collapses.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 local j = 0\n\
+         \x20 while j < 2 do\n\
+         \x20   t[i + 1] = { { j } }\n\
+         \x20   j = j + 1\n\
+         \x20 end\n\
+         \x20 t[i] = { { i } }\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &["t"], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_identifier_row_store_marks_the_base() {
+    // The row-kind law reads the walk's Tbl-value fact, not the ctor
+    // spelling: loop 1's `t[i] = r` moves rows into fresh slots and
+    // keeps the lane (its slots were fresh), and it marks the base —
+    // so loop 2's row store is not proven a fresh slot and keeps the
+    // checked face, whose replace-reclaim frees loop 1's displaced
+    // rows. The syntactic-only check missed both markings.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 local r = { { i } }\n\
+         \x20 t[i] = r\n\
+         \x20 i = i + 1\n\
+         end\n\
+         local j = 2\n\
+         while j < 4 do\n\
+         \x20 t[j] = { { j } }\n\
+         \x20 j = j + 1\n\
+         end\n",
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &["t"], None), (&["t"], &["t"], Some(0))],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_pre_loop_identifier_row_store_declines_the_lane() {
+    // The pre-loop twin of the marking law: `t[0] = r` moves a row
+    // into slot 0 before the loop — no ctor anywhere — and the
+    // fail-closed marking at the mint-less path records the base, so
+    // the conversion loop's row store keeps the checked face instead
+    // of clobbering slot 0 with no reclaim face in between.
+    expect_lane(
+        "local t = {}\n\
+         local r = { { 9 } }\n\
+         t[0] = r\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i] = { { i } }\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &["t"], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_pre_populated_ctor_declines_the_lane() {
+    // The literal twin of the marking law: `local t = { {} }` houses a
+    // row at slot 0 at construction time — a LocalDecl, never an
+    // IndexAssign, so the store-side marking never sees it. A decl
+    // whose init is not a provably empty fresh table marks the base
+    // fail-closed, and the fill loop's row store keeps the checked
+    // face instead of clobbering the constructor's row with no
+    // reclaim face in between.
+    expect_lane(
+        "local t = { {} }\n\
+         local i = 0\n\
+         while i < 3 do\n\
+         \x20 t[i] = { { i } }\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[],
+        &[(&["t"], &["t"], None)],
     );
 }
 

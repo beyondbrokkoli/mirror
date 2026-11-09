@@ -341,7 +341,11 @@ impl Analyzer {
             }
 
             Stmt::IndexAssign {
-                obj, key, value, ..
+                id,
+                obj,
+                key,
+                value,
+                ..
             } => {
                 let (t, obj_sites, _) = self.infer_expr(rec, obj)?;
                 let (kty, _, _) = self.infer_expr(rec, key)?;
@@ -434,6 +438,13 @@ impl Analyzer {
                     if !is_root(&s) && !is_ghost(&s) {
                         self.reads.user_store_sites.insert(s);
                     }
+                }
+                // The lane-side row-kind fact: same predicate as the
+                // lowerer's contains_tables, minted per store statement
+                // so a row store through a non-ctor spelling still
+                // marks its base for the fast lane's fresh-slot laws.
+                if matches!(vt, Tbl(_)) {
+                    self.own.row_value_stores.insert(*id);
                 }
 
                 let mut base_obj = obj;
