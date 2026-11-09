@@ -241,20 +241,13 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
 
-                if elig.is_some() {
-                    let TableKey::Int(k) = key else {
-                        panic!(
-                            "a fast-store fact rides a non-integer key — \
-                             the walk mints the fact only for guard-shaped \
-                             keys, which lower to the integer lane"
-                        );
-                    };
-                    let layout = self.lookup_layout_for(obj)?;
-                    self.table_set_fast(t_reg, k, v_reg, &store_elem, layout)?;
-                } else {
-                    self.table_set(t_reg, key, v_reg, &store_elem)?;
-                }
-
+                // The row's ctor-reserve is minted before the store faces
+                // (mint-order, zero dynamic flow): the reserve is a plan
+                // fact of the row itself, borrowed from the enclosing
+                // fill loop's bound, and must run while the row is alive —
+                // a refused store reclaims the row inside set_core, so a
+                // reserve minted after the face would load the freed
+                // header and trip the runtime's poison guard.
                 if matches!(value, Expr::TableCtor { .. }) {
                     let bound = self.reserves.iter().rev().find_map(|r| {
                         self.shape
@@ -269,6 +262,20 @@ impl<'a> IrLowerer<'a> {
                             bound,
                         });
                     }
+                }
+
+                if elig.is_some() {
+                    let TableKey::Int(k) = key else {
+                        panic!(
+                            "a fast-store fact rides a non-integer key — \
+                             the walk mints the fact only for guard-shaped \
+                             keys, which lower to the integer lane"
+                        );
+                    };
+                    let layout = self.lookup_layout_for(obj)?;
+                    self.table_set_fast(t_reg, k, v_reg, &store_elem, layout)?;
+                } else {
+                    self.table_set(t_reg, key, v_reg, &store_elem)?;
                 }
 
                 self.null_moves_of(stmt)?;
