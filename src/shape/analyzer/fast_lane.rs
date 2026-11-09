@@ -109,6 +109,12 @@ struct LaneSink<'a> {
     /// arrive pre-folded from recognition, and a bare `Guard`'s physical
     /// offset `-index_base` is derived at its consumers here.
     index_base: i64,
+    /// Every (loop, base, key shape) that already minted a fast fact.
+    /// A same-slot repeat store is a replace, and the fast lane's
+    /// inline store cannot execute the reclaim the slot's displaced
+    /// occupant is owed — only a second sighting rides the checked
+    /// face, where set_core's replace arm frees it.
+    claimed: BTreeSet<(NodeId, String, KeyShape)>,
 }
 
 impl Analyzer {
@@ -138,6 +144,7 @@ impl Analyzer {
             ctor: BTreeMap::new(),
             offsets: BTreeMap::new(),
             index_base: self.index_base,
+            claimed: BTreeSet::new(),
         };
         scan_stmts(stmts, &mut Vec::new(), &mut ConstEnv::new(), &mut sink);
         for (loop_id, hits) in sink.ctor {
@@ -345,6 +352,20 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
         if !admitted {
             continue;
         }
+        // The claim law: one fast fact per (loop, base, key). A second
+        // sighting of the same slot is a replace — the fast lane's
+        // inline store would clobber the slot's first occupant's last
+        // pointer with no runtime face in between, so the displaced
+        // child leaks (the fast-lane displacement of
+        // probes/p21_sparse_overwrite_displaced_row_leak.lua' repeat
+        // probe). The repeat declines and rides the checked face, where
+        // set_core's replace-reclaim frees the displaced child; the
+        // claim itself stays with the first sighting, whose slot is
+        // fresh (span-grown or inserted) and displaces nothing.
+        let claim = (frame.loop_id, base.clone(), shape);
+        if sink.claimed.contains(&claim) {
+            continue;
+        }
         // A plain-name store on a pre-header-reserved table rides the
         // existing reserve when the name still names the binding the
         // loop's header saw; anything the plan holds as a nested row
@@ -362,6 +383,7 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: false,
                 },
             );
+            sink.claimed.insert(claim);
             widen(sink, frame.loop_id, k_phys);
             return;
         }
@@ -387,6 +409,7 @@ fn claim_store(stmt_id: NodeId, obj: &Expr, key: &Expr, frames: &[LaneFrame], si
                     row_reserve: true,
                 },
             );
+            sink.claimed.insert(claim);
             widen(sink, frame.loop_id, k_phys);
             return;
         }

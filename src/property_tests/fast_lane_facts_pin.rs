@@ -192,7 +192,13 @@ fn fast_lane_facts_pin_guard_fill_rides_the_lane() {
 }
 
 #[test]
-fn fast_lane_facts_pin_nested_row_reserves_at_the_store() {
+fn fast_lane_facts_pin_compound_host_stays_checked() {
+    // The nested claim's host law: `t[0]`'s read is a runtime slot the
+    // plan never proved live, so the store keeps the checked face,
+    // whose null arm speaks the null-row-store guard. The plan itself
+    // still holds the nested name (the row the store would mint is the
+    // recognizer's business), while no admitted store means no widest
+    // offset for the loop's reserves.
     expect_lane(
         "local t = {{}}\n\
          local i = 0\n\
@@ -200,8 +206,27 @@ fn fast_lane_facts_pin_nested_row_reserves_at_the_store() {
          \x20 t[0][i] = i\n\
          \x20 i = i + 1\n\
          end\n",
-        &[("t", true, KeyShape::Guard)],
-        &[(&[], &["t"], Some(0))],
+        &[],
+        &[(&[], &["t"], None)],
+    );
+}
+
+#[test]
+fn fast_lane_facts_pin_same_slot_repeat_stays_checked() {
+    // The claim law: one fast fact per (loop, base, key). The second
+    // store rewrites the first's slot — a replace — so it keeps the
+    // checked face, where set_core's replace-reclaim frees the
+    // displaced child; only the first sighting rides the lane.
+    expect_lane(
+        "local t = {}\n\
+         local i = 0\n\
+         while i < 2 do\n\
+         \x20 t[i] = { { i } }\n\
+         \x20 t[i] = { { i + 1 } }\n\
+         \x20 i = i + 1\n\
+         end\n",
+        &[("t", false, KeyShape::Guard)],
+        &[(&["t"], &["t"], Some(0))],
     );
 }
 

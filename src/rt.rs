@@ -505,12 +505,21 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     if tbl.mode == TableMode::Sparse {
         tbl.border = tbl.border.max(index.saturating_add(1));
         let map = unsafe { &mut *tbl.sparse_map };
+        if owns_cell {
+            let old = map.get(&index).copied().unwrap_or(0);
+            unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
+        }
         map.insert(index, cell.to_lane());
         return;
     }
 
     if index > tbl.len.saturating_add(SPARSE_THRESHOLD) {
         tbl.border = tbl.border.max(index.saturating_add(1));
+        if owns_cell && !tbl.sparse_map.is_null() {
+            let map = unsafe { &*tbl.sparse_map };
+            let old = map.get(&index).copied().unwrap_or(0);
+            unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
+        }
         unsafe { overflow_map(tbl).insert(index, cell.to_lane()) };
         return;
     }
@@ -518,10 +527,58 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     tbl.border = tbl.border.max(index.saturating_add(1));
     unsafe { span_grow(tbl, index.wrapping_add(1)) };
     let ptr = unsafe { tbl.data.add(index as usize * C::ESIZE) };
+    if owns_cell {
+        // A replace that displaces a table-typed slot word frees the old
+        // occupant before the write: its owner was the slot (the same
+        // ownership law the refuse arm reads, moved forward in life),
+        // and dropping the word would leave the child with zero owners
+        // forever — the sparse-overwrite displaced-row leak
+        // (probes/p21_sparse_overwrite_displaced_row_leak.lua). The
+        // row symbol is the proof table traffic runs through this
+        // call, the parent's contains_tables bit licenses the word as
+        // a table lane exactly the way free_tbl's child walk trusts
+        // it, and the non-owned faces keep the recorded no-op-store
+        // law — their replace drops the old cell without the free.
+        let old = unsafe { C::load_slot(ptr) };
+        unsafe { reclaim_displaced_child::<C>(tbl, old, cell) };
+    }
     unsafe { C::store_span(ptr, cell) };
     if !tbl.sparse_map.is_null() {
         unsafe { (&mut *tbl.sparse_map).remove(&index) };
     }
+}
+
+/// The displaced-child reclaim. An owned-row replace is the slot's
+/// second word of a table lane: zero words and non-pointer words skip
+/// (`valid_slot_addr`, the same consult free_tbl's child walk makes),
+/// and a self-rewrite holds the old lane, so the free never fires for
+/// it — resetting a slot to its own row is not a replace.
+unsafe fn reclaim_displaced_child<C: CellRepr>(tbl: &AlmTable, old_slot: C, new_cell: C) {
+    if C::ESIZE != 8 || tbl.contains_tables == 0 {
+        return;
+    }
+    let old_lane = old_slot.to_lane();
+    if old_lane == new_cell.to_lane() {
+        return;
+    }
+    let addr = old_lane as usize;
+    if valid_slot_addr(addr) {
+        unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
+        unsafe { free_tbl(addr as *mut AlmTable, &[]) };
+    }
+}
+
+/// The stored-slot predicate: a lane reads as a live table pointer when
+/// it sits in user space and is 8-byte aligned; zero words (unwritten
+/// slots) and kernel islands fail it. free_tbl's child walk and the
+/// replace reclaim consult the one predicate.
+fn valid_slot_addr(addr: usize) -> bool {
+    #[cfg(target_pointer_width = "64")]
+    let is_user_space = addr < 0x0000_7FFF_FFFF_FFFF;
+    #[cfg(not(target_pointer_width = "64"))]
+    let is_user_space = true;
+
+    addr > 0x0100_0000 && is_user_space && (addr & 7) == 0
 }
 
 unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
@@ -940,20 +997,11 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
     unsafe { ptr::write_volatile(&mut tbl.esize, FREE_POISON_ESIZE) };
 
     if tbl.contains_tables != 0 {
-        let is_valid_ptr = |addr: usize| -> bool {
-            #[cfg(target_pointer_width = "64")]
-            let is_user_space = addr < 0x0000_7FFF_FFFF_FFFF;
-            #[cfg(not(target_pointer_width = "64"))]
-            let is_user_space = true;
-
-            addr > 0x0100_0000 && is_user_space && (addr & 7) == 0
-        };
-
         if tbl.mode == TableMode::Dense && !tbl.data.is_null() {
             let ptrs =
                 std::slice::from_raw_parts(tbl.data.cast::<*mut AlmTable>(), tbl.len as usize);
             for &child in ptrs {
-                if is_valid_ptr(child as usize) {
+                if valid_slot_addr(child as usize) {
                     unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
                     unsafe { free_tbl(child, keeps) };
                 }
@@ -962,7 +1010,7 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
         if !tbl.sparse_map.is_null() {
             let map = unsafe { &*tbl.sparse_map };
             for &child_addr in map.values() {
-                if is_valid_ptr(child_addr as usize) {
+                if valid_slot_addr(child_addr as usize) {
                     unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
                     unsafe { free_tbl(child_addr as *mut AlmTable, keeps) };
                 }
@@ -1648,6 +1696,101 @@ mod strkey_tests {
         );
         unsafe { alm_tbl_free(parent) };
         unsafe { alm_tbl_free(child) };
+    }
+
+    #[test]
+    fn replaced_row_store_reclaims_the_displaced_child() {
+        // The replace law: a slot that already houses a table stores a
+        // second one, so the displaced occupant is left with zero owners
+        // the moment its last pointer is clobbered — set_core frees it
+        // before the write, and the replacement rides the slot after.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let first = unsafe { alm_tbl_new(8, 0) };
+        let second = unsafe { alm_tbl_new(8, 0) };
+
+        let a: *const u8 = std::ptr::addr_of!(first).cast();
+        unsafe { alm_tbl_set_row(parent, 0, a) };
+        let b: *const u8 = std::ptr::addr_of!(second).cast();
+        unsafe { alm_tbl_set_row(parent, 0, b) };
+
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*first).esize).read() },
+            FREE_POISON_ESIZE,
+            "the displaced row is freed at the store that displaces it"
+        );
+        assert_ne!(
+            unsafe { std::ptr::addr_of!((*second).esize).read() },
+            FREE_POISON_ESIZE,
+            "the replacement rides the slot untouched"
+        );
+        assert_eq!(
+            unsafe { alm_tbl_len(parent) },
+            1,
+            "a replace holds the border, never grows it"
+        );
+        // The slot's owner is the replacement now; the parent's exit
+        // free walks its valid slot words and collects it.
+        unsafe { alm_tbl_free(parent) };
+    }
+
+    #[test]
+    fn row_store_self_replace_reclaims_nothing() {
+        // Resetting a slot to its own row is not a replace: the old and
+        // the new are the same table, and freeing the lane the incoming
+        // store is about to house would clobber a live owner.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+
+        let slot: *const u8 = std::ptr::addr_of!(child).cast();
+        unsafe { alm_tbl_set_row(parent, 0, slot) };
+        let border = unsafe { alm_tbl_len(parent) };
+        unsafe { alm_tbl_set_row(parent, 0, slot) };
+
+        assert_ne!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "a self-replace holds the child, never frees it"
+        );
+        assert_eq!(
+            unsafe { alm_tbl_len(parent) },
+            border,
+            "a self-replace rewrites one slot, nothing else"
+        );
+        unsafe { alm_tbl_free(parent) };
+    }
+
+    #[test]
+    fn handle_replace_drops_the_displaced_row_as_before() {
+        // The non-owned faces keep their recorded no-op-store law: a
+        // pooled handle (interned string, closure env) is never owned
+        // by the destination, so its replace drops the old cell without
+        // the free — freeing could reach a borrowed env. The orphaning
+        // that law implies for row slots is the static Row/Handle
+        // split's problem to never mint, not the runtime's to guess.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+
+        let row: *const u8 = std::ptr::addr_of!(child).cast();
+        unsafe { alm_tbl_set_row(parent, 0, row) };
+        let word = 5u64.to_ne_bytes();
+        unsafe { alm_tbl_set(parent, 0, word.as_ptr().cast()) };
+
+        assert_ne!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "the handle replace drops, never frees, the displaced row"
+        );
+        let word_slot = unsafe { (*parent).data } as *const u64;
+        assert_eq!(
+            unsafe { word_slot.read() },
+            5,
+            "the scalar landed in the displaced slot"
+        );
+        // The orphaned child is this test's own; free it directly. The
+        // 5-word slot fails valid_slot_addr, so the parent's exit walk
+        // skips it instead of freeing the scalar as a table.
+        unsafe { alm_tbl_free(child) };
+        unsafe { alm_tbl_free(parent) };
     }
 
     #[test]

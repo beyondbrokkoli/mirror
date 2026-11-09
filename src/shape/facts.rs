@@ -98,7 +98,7 @@ pub struct InstanceInfo {
 /// How a fast-store key relates to its loop's guard. `Guard` is the
 /// key the guard name currently names; `GuardOffset(k)` is that name
 /// plus the constant `k` (`j - 1` is `GuardOffset(-1)`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum KeyShape {
     Guard,
     GuardOffset(i64),
