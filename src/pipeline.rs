@@ -16,6 +16,12 @@ pub struct PipelineOpts {
     /// Surface index base (0 default, 1 for Lua-style). Physical key =
     /// user key − index_base at every seam.
     pub index_base: i64,
+    /// Surface for-limit mode. False (default) is exclusive: the guard
+    /// is `i < latched-limit`. True is inclusive: the latch is
+    /// `limit + 1` and the guard never changes — desugar-tier only
+    /// (docs/dialects/for.md), it never reaches the analyzer or the
+    /// lowerer.
+    pub for_limit_inclusive: bool,
 }
 
 #[derive(Debug)]
@@ -71,7 +77,8 @@ pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<
     }
 
     let mut parser = Parser::new(tokens.into_iter().zip(offsets).collect(), source)
-        .with_index_base(opts.index_base);
+        .with_index_base(opts.index_base)
+        .with_for_limit_inclusive(opts.for_limit_inclusive);
     let ast = parser.parse_program();
     front_diagnostics.extend(parser.diagnostics);
 

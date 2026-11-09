@@ -39,6 +39,11 @@ pub struct Parser<'a> {
     /// is physical from the moment it exists. Positional entries mint
     /// physical `0..k-1` in every base and never shift.
     index_base: i64,
+    /// The for-limit surface: exclusive keeps the raw limit; inclusive
+    /// latches `limit + 1` at the desugar (docs/dialects/for.md). The
+    /// guard never changes, so this never reaches the analyzer or the
+    /// lowerer.
+    for_limit_inclusive: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -57,11 +62,17 @@ impl<'a> Parser<'a> {
                 .map(|(i, _)| i)
                 .collect(),
             index_base: 0,
+            for_limit_inclusive: false,
         }
     }
 
     pub fn with_index_base(mut self, index_base: i64) -> Self {
         self.index_base = index_base;
+        self
+    }
+
+    pub fn with_for_limit_inclusive(mut self, inclusive: bool) -> Self {
+        self.for_limit_inclusive = inclusive;
         self
     }
 
@@ -244,7 +255,12 @@ impl<'a> Parser<'a> {
                 }
 
                 Ok(crate::elaborate::desugar_numeric_for(
-                    at, var, start, limit, body,
+                    at,
+                    var,
+                    start,
+                    limit,
+                    body,
+                    self.for_limit_inclusive,
                 ))
             }
             Some(Token::Break) => {

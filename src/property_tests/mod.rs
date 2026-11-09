@@ -44,6 +44,7 @@ fn property_opts(walk_pins: bool) -> PipelineOpts {
         source_file: "property_case.lua".into(),
         walk_pins,
         index_base: 0,
+        for_limit_inclusive: false,
     }
 }
 
@@ -94,6 +95,7 @@ fn compile_exe(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
                 source_file: "property_case.lua".into(),
                 walk_pins: true,
                 index_base: 0,
+                for_limit_inclusive: false,
             },
         )
     })) {
@@ -517,6 +519,31 @@ fn parse_parts(source: &str) -> Vec<Stmt> {
     ast
 }
 
+fn parse_parts_with(source: &str, for_limit_inclusive: bool) -> Vec<Stmt> {
+    let mut tokens = Vec::new();
+    let mut offsets = Vec::new();
+    let mut lex = lexer::Token::lexer(source);
+    loop {
+        match lex.next() {
+            Some(Ok(token)) => {
+                offsets.push(lex.span().start);
+                tokens.push(token);
+            }
+            Some(Err(_)) => panic!("H5 pin source failed to lex"),
+            None => break,
+        }
+    }
+    let mut parser = Parser::new(tokens.into_iter().zip(offsets).collect(), source)
+        .with_for_limit_inclusive(for_limit_inclusive);
+    let ast = parser.parse_program();
+    assert!(
+        parser.diagnostics.is_empty(),
+        "H5 pin source failed to parse: {:?}",
+        parser.diagnostics
+    );
+    ast
+}
+
 include!("generated_programs_keep_one_elem_truth.rs");
 include!("generator_sweep_survives_fresh_seeds.rs");
 include!("hand_pinned_shapes_match_the_any_law.rs");
@@ -526,6 +553,7 @@ include!("walk_pin_computed_scalars_stay_legal_pin.rs");
 include!("walk_pin_unary_neg_scalar_stays_legal_pin.rs");
 include!("w3a_crossing_faces_reject_on_both_drive_and_spawn.rs");
 include!("h5_for_desugar_reports_at_the_header_pin.rs");
+include!("h5_for_desugar_inclusive_latch_pin.rs");
 include!("h5_one_to_one_sugars_and_elseif_attribution_pin.rs");
 include!("h5_census_trips_on_right_count_wrong_line.rs");
 include!("h8_elaborator_unit_goldens_pin.rs");

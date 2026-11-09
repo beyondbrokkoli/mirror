@@ -275,6 +275,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
     let mut verbose = false;
     let mut output_file: Option<String> = None;
     let mut index_base: i64 = 0;
+    let mut for_limit_inclusive = false;
     let mut idx = 1;
     while let Some(flag) = args.get(idx).map(String::as_str) {
         match flag {
@@ -333,6 +334,22 @@ it defaults to libalm_out.so (or alm_out for --exe).";
                 };
                 idx += 1;
             }
+            _ if flag.starts_with("--for-limit=") => {
+                let raw = &flag["--for-limit=".len()..];
+                for_limit_inclusive = match raw {
+                    "exclusive" => false,
+                    "inclusive" => true,
+                    _ => {
+                        eprintln!(
+                            "alm compiler error: --for-limit must be 'exclusive' or 'inclusive', \
+                             got '{raw}' (inclusive latches limit + 1 and keeps the guard; \
+                             the value is a declared surface, not a number)"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                idx += 1;
+            }
             _ if flag.starts_with('-') => {
                 eprintln!(
                     "alm compiler error: Unknown flag '{flag}'. Flags must come before the source file."
@@ -373,6 +390,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
             source_file: std::fs::canonicalize(source_path).unwrap_or_else(|_| source_path.into()),
             walk_pins: true,
             index_base,
+            for_limit_inclusive,
         },
     ) {
         Ok(ir) => ir,

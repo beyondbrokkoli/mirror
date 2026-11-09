@@ -25,6 +25,7 @@ fn h8_elaborator_unit_goldens_pin() {
             loc: Loc { line: 8, col: 1 },
             id: NodeId::mint(),
         }],
+        false,
     );
     let Stmt::Do { body, .. } = &for_stmt else {
         panic!("the numeric-for desugar rides a Do block");
