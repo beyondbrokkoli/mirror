@@ -78,10 +78,13 @@ struct FreeHandles {
 /// One active conversion loop's bound register, pushed at the loop's
 /// header and popped at its body's end. The eligibility and reserve
 /// decisions live in the walk facts, read by NodeId; only the lowered
-/// bound register is emission state.
+/// bound register is emission state. The offset register pairs with
+/// the bound at the runtime's checked sum (the widening seam); row
+/// and ctor reserves borrow both.
 struct ActiveReserve {
     loop_id: NodeId,
     bound: Reg<Int>,
+    offset: Option<Reg<Int>>,
 }
 
 pub struct IrLowerer<'a> {

@@ -319,6 +319,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     let mut needs_div_guard = false;
     let mut needs_tbl_new_decl = false;
     let mut needs_tbl_reserve_decl = false;
+    let mut needs_tbl_reserve_widened_decl = false;
     let mut needs_tbl_free_decl = false;
     let mut needs_tbl_free_except_decl = false;
     let mut needs_tbl_free_except_n_decl = false;
@@ -534,6 +535,18 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                     code.push_str(&format!(
                         "  call void @alm_tbl_reserve(ptr %v{}, i64 %v{})\n",
                         table.id, bound.id
+                    ));
+                }
+
+                Instruction::TableReserveWidened {
+                    table,
+                    bound,
+                    offset,
+                } => {
+                    needs_tbl_reserve_widened_decl = true;
+                    code.push_str(&format!(
+                        "  call void @alm_tbl_reserve_widened(ptr %v{}, i64 %v{}, i64 %v{})\n",
+                        table.id, bound.id, offset.id
                     ));
                 }
 
@@ -906,6 +919,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     }
     if needs_tbl_reserve_decl {
         head.push_str("declare void @alm_tbl_reserve(ptr, i64)\n");
+    }
+    if needs_tbl_reserve_widened_decl {
+        head.push_str("declare void @alm_tbl_reserve_widened(ptr, i64, i64)\n");
     }
     if needs_tbl_free_decl {
         head.push_str("declare void @alm_tbl_free(ptr)\n");

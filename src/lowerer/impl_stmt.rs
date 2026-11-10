@@ -210,20 +210,17 @@ impl<'a> IrLowerer<'a> {
                 if let Some(elig) = elig
                     && elig.row_reserve
                 {
-                    let bound = self
+                    let (bound, offset) = self
                         .reserves
                         .iter()
                         .rev()
                         .find(|r| r.loop_id == elig.loop_id)
-                        .map(|r| r.bound)
+                        .map(|r| (r.bound, r.offset))
                         .expect(
                             "a nested-row store's loop is active — the walk \
                              mints eligibility only inside its loop's body",
                         );
-                    self.emit(Instruction::TableReserve {
-                        table: t_reg,
-                        bound,
-                    });
+                    self.emit_table_reserve(t_reg, bound, offset);
                 }
 
                 let store_elem = self.elem_face_of(obj)?;
@@ -249,18 +246,15 @@ impl<'a> IrLowerer<'a> {
                 // reserve minted after the face would load the freed
                 // header and trip the runtime's poison guard.
                 if matches!(value, Expr::TableCtor { .. }) {
-                    let bound = self.reserves.iter().rev().find_map(|r| {
+                    let reserved = self.reserves.iter().rev().find_map(|r| {
                         self.shape
                             .reserve_plans
                             .get(&r.loop_id)
                             .is_some_and(|p| p.ctor_reserves.contains(&stmt.id()))
-                            .then_some(r.bound)
+                            .then_some((r.bound, r.offset))
                     });
-                    if let Some(bound) = bound {
-                        self.emit(Instruction::TableReserve {
-                            table: ptr_of(v_reg)?,
-                            bound,
-                        });
+                    if let Some((bound, offset)) = reserved {
+                        self.emit_table_reserve(ptr_of(v_reg)?, bound, offset);
                     }
                 }
 
@@ -330,38 +324,36 @@ impl<'a> IrLowerer<'a> {
                 };
                 let mut conv_bound_reg: Option<Reg<Int>> = None;
                 let mut reserve_bound_reg: Option<Reg<Int>> = None;
+                let mut reserve_offset_reg: Option<Reg<Int>> = None;
                 if let (Some((_, plan)), Some(bound_expr)) = (&plan, conv_bound) {
                     let saved_scopes = self.scopes.clone();
                     let TypedReg { reg: b_any, .. } = self.lower_expr(bound_expr, None)?;
                     self.scopes = saved_scopes;
                     let b_reg = int_of(b_any)?;
                     conv_bound_reg = Some(b_reg);
-                    // Offset keys reach `bound + K_eff`; the reserves
-                    // cover them with one widened register (signed — a
-                    // negative offset tightens the reserve) while the
-                    // loop's condition keeps testing the raw bound.
-                    // `None` or a claimed 0 both emit the raw bound:
-                    // no admitted offset, no widening register.
-                    let reserve_reg = match plan.key_offset {
-                        Some(off) if off != 0 => {
-                            let k_reg = self.next_reg();
-                            self.emit(Instruction::LoadInt {
-                                target: Reg::new(k_reg),
-                                val: off,
-                            });
-                            let sum = self.next_reg();
-                            self.num3(Instruction::Add, sum, b_reg, Reg::new(k_reg));
-                            Reg::new(sum)
-                        }
-                        _ => b_reg,
-                    };
-                    reserve_bound_reg = Some(reserve_reg);
+                    // Offset keys reach `bound + K_eff`; the sum is the
+                    // runtime's checked add (the widening seam), never
+                    // an IR `add` — a wrapped sum would flow into the
+                    // reserve as negative, `span_grow` would no-op it,
+                    // and the fast stores ahead would write past the
+                    // short span. `None` or a claimed 0 keeps the raw
+                    // bound: no admitted offset, no widening seam.
+                    reserve_bound_reg = Some(b_reg);
+                    if let Some(off) = plan.key_offset.filter(|off| *off != 0) {
+                        let k_reg = self.next_reg();
+                        self.emit(Instruction::LoadInt {
+                            target: Reg::new(k_reg),
+                            val: off,
+                        });
+                        reserve_offset_reg = Some(Reg::new(k_reg));
+                    }
                     for name in &plan.pre_header {
                         let t_reg = ptr_of(self.read_var(name)?.reg)?;
-                        self.emit(Instruction::TableReserve {
-                            table: t_reg,
-                            bound: reserve_reg,
-                        });
+                        self.emit_table_reserve(
+                            t_reg,
+                            b_reg,
+                            reserve_offset_reg,
+                        );
                     }
                     self.emit_cond_temp_frees(stmt);
                 }
@@ -412,14 +404,12 @@ impl<'a> IrLowerer<'a> {
                     );
                     for name in &plan.nested {
                         let local = self.read_var(name)?;
-                        self.emit(Instruction::TableReserve {
-                            table: ptr_of(local.reg)?,
-                            bound,
-                        });
+                        self.emit_table_reserve(ptr_of(local.reg)?, bound, reserve_offset_reg);
                     }
                     self.reserves.push(ActiveReserve {
                         loop_id: stmt.id(),
                         bound,
+                        offset: reserve_offset_reg,
                     });
                 }
 

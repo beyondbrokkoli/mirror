@@ -40,9 +40,8 @@ pub struct Parser<'a> {
     /// physical `0..k-1` in every base and never shift.
     index_base: i64,
     /// The for-limit surface: exclusive keeps the raw limit; inclusive
-    /// latches `limit + 1` at the desugar (docs/dialects/for.md). The
-    /// guard never changes, so this never reaches the analyzer or the
-    /// lowerer.
+    /// latches `limit + 1` at the desugar. The guard never changes, so
+    /// this never reaches the analyzer or the lowerer.
     for_limit_inclusive: bool,
 }
 

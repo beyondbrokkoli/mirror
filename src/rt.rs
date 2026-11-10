@@ -303,6 +303,23 @@ pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
     unsafe { span_grow(tbl, n) };
 }
 
+/// The widened pre-header reserve: `bound + K_eff` as a checked sum.
+/// The fast stores downstream trust the reserve blindly (raw GEP, no
+/// bounds check), so an overflowing widening must abort loud — a
+/// silent skip would leave the span short and the stores writing
+/// past it (segfaulted by cases/fill_reserve_offset_wrap_panic.lua
+/// before the check existed). Underflow can only reach here on a
+/// zero-trip loop (the nonneg gate pins entry >= 0), accepted as a
+/// pathological false alarm alongside abort_alloc.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_tbl_reserve_widened(t: *mut AlmTable, n: i64, k: i64) {
+    let Some(widened) = n.checked_add(k) else {
+        eprintln!("alm fatal: reserve overflow (bound={n}, offset={k})");
+        std::process::abort();
+    };
+    unsafe { alm_tbl_reserve(t, widened) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_len(t: *const AlmTable) -> i64 {
     if t.is_null() {

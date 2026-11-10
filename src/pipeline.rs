@@ -18,9 +18,8 @@ pub struct PipelineOpts {
     pub index_base: i64,
     /// Surface for-limit mode. False (default) is exclusive: the guard
     /// is `i < latched-limit`. True is inclusive: the latch is
-    /// `limit + 1` and the guard never changes — desugar-tier only
-    /// (docs/dialects/for.md), it never reaches the analyzer or the
-    /// lowerer.
+    /// `limit + 1` and the guard never changes — desugar-tier only,
+    /// it never reaches the analyzer or the lowerer.
     pub for_limit_inclusive: bool,
 }
 

@@ -1100,6 +1100,15 @@ pub enum Instruction {
         table: Reg<Ptr>,
         bound: Reg<Int>,
     },
+    /// The widened pre-header reserve: the runtime computes
+    /// `bound + offset` as a checked sum. The fast stores downstream
+    /// trust the reserve blindly (raw GEP, no bounds check), so an
+    /// overflowing widening is a loud fatal, never a silent skip.
+    TableReserveWidened {
+        table: Reg<Ptr>,
+        bound: Reg<Int>,
+        offset: Reg<Int>,
+    },
     TableSetFast(CellSetFast),
     TableSet(CellSet),
     TableFree {

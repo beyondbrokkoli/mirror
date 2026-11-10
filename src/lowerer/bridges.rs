@@ -323,6 +323,26 @@ impl IrLowerer<'_> {
         E::any(Reg::new(target))
     }
 
+    /// One reserve seam, raw or widened. The widened form hands the
+    /// bound and the offset to the runtime separately: the sum is the
+    /// runtime's checked add, so an overflowing widening aborts loud
+    /// instead of skipping the reserve the fast stores trust.
+    pub(super) fn emit_table_reserve(
+        &mut self,
+        table: Reg<Ptr>,
+        bound: Reg<Int>,
+        offset: Option<Reg<Int>>,
+    ) {
+        match offset {
+            Some(offset) => self.emit(Instruction::TableReserveWidened {
+                table,
+                bound,
+                offset,
+            }),
+            None => self.emit(Instruction::TableReserve { table, bound }),
+        }
+    }
+
     pub(super) fn table_set(
         &mut self,
         table: Reg<Ptr>,
