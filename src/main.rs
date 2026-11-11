@@ -266,6 +266,9 @@ FLAGS:
     --index-base=N  Surface index base for table keys: 0 (default) or 1
                     (Lua-style; constructor literals and bracket keys shift
                     at their choke points, #t stays base-blind).
+    --for-limit=M   Surface limit kind for numeric for loops: 'exclusive'
+                    (default, Rust-style half-open) or 'inclusive'
+                    (Lua-style; latches limit + 1 and keeps the guard).
 
 The compiler performs a pure transform to native code. If --output is omitted,
 it defaults to libalm_out.so (or alm_out for --exe).";

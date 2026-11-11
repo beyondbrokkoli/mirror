@@ -952,7 +952,7 @@ impl Analyzer {
         }
 
         let mutated = self.collect_mutated_names(rec, body);
-        let stored = collect_stored_bases(body);
+        let stored = collect_index_assign_bases(body);
         if idents_of(bound)
             .iter()
             .any(|v| mutated.contains(v) || stored.contains(v))
@@ -1150,7 +1150,7 @@ fn idents_of(expr: &Expr) -> BTreeSet<String> {
     out
 }
 
-fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
+fn collect_index_assign_bases(stmts: &[Stmt]) -> BTreeSet<String> {
     let mut stored = BTreeSet::new();
     for stmt in stmts {
         match stmt {
@@ -1160,15 +1160,15 @@ fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
                 }
             }
             Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                stored.extend(collect_stored_bases(body));
+                stored.extend(collect_index_assign_bases(body));
             }
             Stmt::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                stored.extend(collect_stored_bases(then_body));
-                stored.extend(collect_stored_bases(else_body));
+                stored.extend(collect_index_assign_bases(then_body));
+                stored.extend(collect_index_assign_bases(else_body));
             }
             _ => {}
         }

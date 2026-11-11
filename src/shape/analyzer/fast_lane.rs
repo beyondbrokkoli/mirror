@@ -55,39 +55,67 @@ fn restore(frames: &mut [LaneFrame], saved: &LaneSnapshot) {
 }
 
 /// Compile-time integer knowledge of names, mirroring the binding
-/// semantics the lowerer's registers carry: a declaration writes the
-/// current block's overlay (and lifts at the block's end), an
-/// assignment kills the persistent entry outright.
+/// semantics the lowerer's registers carry: every visible binding holds
+/// a constant or a kill, an assignment kills the innermost visible
+/// binding wherever it was declared (kills persist past block ends),
+/// and a declaration shadows for the current block only — at the
+/// block's end the shadow lifts and the outer binding resurfaces with
+/// its own pre-block state, which assignments under the shadow never
+/// touched.
 #[derive(Clone)]
 struct ConstEnv {
-    base: BTreeMap<String, i64>,
-    overlay: BTreeMap<String, Option<i64>>,
+    /// Every visible binding: `Some(v)` = the binding's value is the
+    /// literal `v`, `None` = the binding exists but its value is not a
+    /// known constant. Absent = no binding by that name.
+    bindings: BTreeMap<String, Option<i64>>,
+    /// One shadow record per open block: the names declared in it,
+    /// each mapped to the outer binding's state to restore at the
+    /// block's end (`None` = the name had no binding before it).
+    shadows: Vec<BTreeMap<String, Option<Option<i64>>>>,
 }
 
 impl ConstEnv {
     fn new() -> Self {
         ConstEnv {
-            base: BTreeMap::new(),
-            overlay: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            shadows: vec![BTreeMap::new()],
         }
     }
 
     fn get(&self, name: &str) -> Option<i64> {
-        match self.overlay.get(name) {
-            Some(Some(v)) => Some(*v),
-            Some(None) => None,
-            None => self.base.get(name).copied(),
-        }
+        self.bindings.get(name).copied().flatten()
     }
 
     fn declare(&mut self, name: &str, init: Option<i64>) {
-        self.overlay.insert(name.to_string(), init);
+        let prev = self.bindings.get(name).copied();
+        self.shadows
+            .last_mut()
+            .expect("the root block never closes")
+            .insert(name.to_string(), prev);
+        self.bindings.insert(name.to_string(), init);
     }
 
     fn assign(&mut self, name: &str) {
-        self.base.remove(name);
-        if self.overlay.contains_key(name) {
-            self.overlay.insert(name.to_string(), None);
+        self.bindings.insert(name.to_string(), None);
+    }
+
+    fn enter_block(&mut self) {
+        self.shadows.push(BTreeMap::new());
+    }
+
+    fn exit_block(&mut self) {
+        let Some(lifted) = self.shadows.pop() else {
+            return;
+        };
+        for (name, prev) in lifted {
+            match prev {
+                Some(state) => {
+                    self.bindings.insert(name, state);
+                }
+                None => {
+                    self.bindings.remove(&name);
+                }
+            }
         }
     }
 }
@@ -136,6 +164,20 @@ struct LaneSink<'a> {
     /// domain once per enclosing trip, and the slots the claim touches
     /// are the enclosing trips' rows — nothing to prove fresh there.
     loop_depth: u32,
+    /// The runtime loop ids enclosing the scan right now, one entry
+    /// per open body (the id-side twin of `loop_depth`).
+    active_loops: Vec<NodeId>,
+    /// Every plan loop the scan has completed, as (guard, loop id,
+    /// the runtime loops that enclosed it when it ran). A loop's entry
+    /// facts describe its first entry only; this registry is what the
+    /// late-assignment law reads to decide whether a later store can
+    /// change a re-entry.
+    completed: Vec<(String, NodeId, BTreeSet<NodeId>)>,
+    /// Plan loops whose guard took an assignment after the loop while
+    /// a shared enclosing runtime loop was still active: their entry
+    /// facts are stale for re-entries, so every claim of the loop is
+    /// dead (unclaimed in place) and later sightings decline.
+    late_assigned: BTreeSet<NodeId>,
 }
 
 /// One (loop, base) group. `shapes` carries every resolvable key shape
@@ -179,6 +221,9 @@ impl Analyzer {
             claims: BTreeMap::new(),
             row_stored: BTreeSet::new(),
             loop_depth: 0,
+            active_loops: Vec::new(),
+            completed: Vec::new(),
+            late_assigned: BTreeSet::new(),
             index_base: self.index_base,
         };
         scan_stmts(stmts, &mut Vec::new(), &mut ConstEnv::new(), &mut sink);
@@ -271,6 +316,44 @@ impl LaneSink<'_> {
         }
         Sighting::FallThrough
     }
+
+    /// The late-assignment law: a completed plan loop's entry facts
+    /// describe its first entry only (the walk minted them before the
+    /// enclosing body's tail was recorded, and the scan's frame is
+    /// gone). An assignment to the guard after the loop, while any
+    /// runtime loop that already enclosed the loop is still active,
+    /// changes the loop's re-entries — the shared back edge re-runs
+    /// the enclosing body and reaches the loop again with the new
+    /// value, before which the admission gate cannot prove the first
+    /// key lands at or after zero. Every claim of the loop dies (its
+    /// minted facts unclaimed in place, the poison service's move) and
+    /// later sightings decline. With no shared enclosing loop the loop
+    /// cannot run again after this assignment, and nothing dies: the
+    /// first entry's facts stay the only facts.
+    fn note_late_assignment(&mut self, name: &str) {
+        let victims: Vec<NodeId> = self
+            .completed
+            .iter()
+            .filter(|(guard, loop_id, enclosing)| {
+                guard == name
+                    && !self.late_assigned.contains(loop_id)
+                    && enclosing.iter().any(|e| self.active_loops.contains(e))
+            })
+            .map(|(_, loop_id, _)| *loop_id)
+            .collect();
+        for loop_id in victims {
+            self.late_assigned.insert(loop_id);
+            let bases: Vec<String> = self
+                .claims
+                .keys()
+                .filter(|(l, _)| *l == loop_id)
+                .map(|(_, b)| b.clone())
+                .collect();
+            for base in bases {
+                self.poison(loop_id, &base);
+            }
+        }
+    }
 }
 
 fn scan_stmts(
@@ -331,6 +414,7 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                     frame.guard_assigned = true;
                 }
             }
+            sink.note_late_assignment(name);
         }
         Stmt::IndexAssign {
             obj, key, value, ..
@@ -363,8 +447,15 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
             condition, body, ..
         } => {
             scan_expr(condition, sink);
+            // The runtime loops enclosing this one, snapshotted before
+            // it goes active: what a completed plan loop's
+            // late-assignment verdict is measured against.
+            let enclosing: BTreeSet<NodeId> = sink.active_loops.iter().copied().collect();
+            let plan_guard = extract_guard(condition)
+                .filter(|_| sink.plans.contains_key(&stmt.id()))
+                .map(|(g, _)| g.to_string());
             let mut pushed = false;
-            if let Some((guard, _)) = extract_guard(condition)
+            if let Some(guard) = plan_guard.as_deref()
                 && let Some((pre_header, nested, entry_lb)) = sink.plans.get(&stmt.id())
             {
                 frames.push(LaneFrame {
@@ -381,10 +472,17 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                 pushed = true;
             }
             sink.loop_depth += 1;
+            sink.active_loops.push(stmt.id());
             scan_block(body, frames, env, sink);
+            sink.active_loops.pop();
             sink.loop_depth -= 1;
             if pushed {
                 frames.pop();
+                sink.completed.push((
+                    plan_guard.expect("pushed implies a guard"),
+                    stmt.id(),
+                    enclosing,
+                ));
             }
         }
         Stmt::Do { body, .. } => {
@@ -410,20 +508,21 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
                     saved[i].0 || then_frames[i].guard_assigned || else_frames[i].guard_assigned;
             }
             restore(frames, &saved);
-            // A name whose constant either arm lost is not constant at
-            // the join; declarations lift with the arms' overlays.
-            let lost: Vec<String> = saved_env
-                .base
-                .keys()
-                .filter(|n| {
-                    then_env.base.get(*n) != saved_env.base.get(*n)
-                        || else_env.base.get(*n) != saved_env.base.get(*n)
-                })
-                .cloned()
-                .collect();
+            // A binding's constant survives the join only when both
+            // arms left it at the same known constant — a name neither
+            // arm touched trivially does, a name either arm killed or
+            // changed does not, and nothing either arm declared leaks
+            // (the arms scanned on clones). Spending a stale constant
+            // here is the F2 corruption: the entry the loop actually
+            // takes can be the smaller arm's value.
             *env = saved_env;
-            for name in lost {
-                env.assign(&name);
+            let names: Vec<String> = env.bindings.keys().cloned().collect();
+            for name in names {
+                let t = then_env.bindings.get(&name).copied().flatten();
+                let e = else_env.bindings.get(&name).copied().flatten();
+                if t != e || t.is_none() {
+                    env.assign(&name);
+                }
             }
         }
         Stmt::Print { exprs, .. } => {
@@ -442,8 +541,10 @@ fn scan_stmt(stmt: &Stmt, frames: &mut Vec<LaneFrame>, env: &mut ConstEnv, sink:
 }
 
 /// A nested block's statements run in sequence, and whatever they
-/// assigned leaks out past the block's end (the lowerer updates the
-/// visible binding in place), while shadows lift at the end.
+/// assigned to a binding declared outside the block leaks out past the
+/// block's end (the lowerer updates the visible binding in place),
+/// while the block's own declarations lift at the end and the outer
+/// bindings resurface with their pre-block state.
 fn scan_block(
     stmts: &[Stmt],
     frames: &mut Vec<LaneFrame>,
@@ -451,13 +552,13 @@ fn scan_block(
     sink: &mut LaneSink,
 ) {
     let saved = snapshot(frames);
-    let saved_overlay = env.overlay.clone();
+    env.enter_block();
     scan_stmts(stmts, frames, env, sink);
     for (frame, s) in frames.iter_mut().zip(&saved) {
         frame.guard_assigned = frame.guard_assigned || s.0;
     }
     restore(frames, &saved);
-    env.overlay = saved_overlay;
+    env.exit_block();
 }
 
 /// One store site's lane laws. Pass one is the poison service (an
@@ -492,6 +593,11 @@ fn claim_store(
     }
     for frame in frames.iter().rev() {
         if !frame.guard_live() {
+            continue;
+        }
+        // The late-assignment law killed this loop's entry facts: no
+        // admission from them again, whatever shape the key carries.
+        if sink.late_assigned.contains(&frame.loop_id) {
             continue;
         }
         let Some(shape) = guard_key_shape(key, &frame.guard, sink.index_base) else {
@@ -615,17 +721,27 @@ fn claim_store(
 /// or the constants around their literals (a conversion loop's body
 /// admits no calls), so both stacks start empty inside them. The
 /// function's own stores face the function's trip counters only: the
-/// depth counter resets for the body's scan and restores after.
-/// `row_stored` stays walk-wide — name reuse across a call boundary
-/// keeps the fail-closed decline.
+/// depth counter and the active-loop registry reset for the body's
+/// scan and restore after (an outer loop cannot re-enter the body; a
+/// later call replays it with caller-controlled entries, which the
+/// params-as-killed constants keep out of every admission). Parameters
+/// enter as killed bindings — their values are the caller's, not any
+/// outer same-named literal's. `row_stored` stays walk-wide — name
+/// reuse across a call boundary keeps the fail-closed decline.
 fn scan_expr(expr: &Expr, sink: &mut LaneSink) {
     match expr {
-        Expr::Function { body, .. } => {
+        Expr::Function { params, body, .. } => {
             let saved_depth = sink.loop_depth;
+            let saved_loops = std::mem::take(&mut sink.active_loops);
             sink.loop_depth = 0;
             let mut fresh = Vec::new();
-            scan_stmts(body, &mut fresh, &mut ConstEnv::new(), sink);
+            let mut env = ConstEnv::new();
+            for p in params {
+                env.declare(p, None);
+            }
+            scan_stmts(body, &mut fresh, &mut env, sink);
             sink.loop_depth = saved_depth;
+            sink.active_loops = saved_loops;
         }
         Expr::TableCtor { entries, .. } => {
             for (k, v) in entries {

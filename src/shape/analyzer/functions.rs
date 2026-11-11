@@ -292,6 +292,13 @@ impl Analyzer {
         self.with_scope(|an| {
             let scope = an.walk.scopes.last_mut().unwrap();
             for p in params {
+                // A parameter is a fresh binding whose value is the
+                // caller's argument: record it as the unknowable shape
+                // so an outer same-named literal cannot lend its
+                // nonneg/lower-bound facts to a loop over the
+                // parameter — the entry facts would describe the
+                // caller's argument, not the literal (the F3 probe).
+                an.holds.num_assigns.insert(p.clone(), vec![NumExpr::Other]);
                 scope.insert(
                     p.clone(),
                     TableShape {
