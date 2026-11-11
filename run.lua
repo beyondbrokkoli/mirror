@@ -21,6 +21,9 @@ Flags (any position):
   --no-test    skip the cargo test gate (a zero-arg leg)
   --no-exe     skip the standalone-twin section
   --quick       corpus only (= --no-fmt --no-clippy --no-exe)
+  --miri        opt-in extra leg: the lib unit tests under Miri
+                (cargo +nightly miri test --lib — the rt.rs UB oracle;
+                slow, needs the nightly toolchain with the component)
 
 Quiet when green: one summary line; failures and action-needed notices
 print as they happen; exit nonzero on any failure.]])
@@ -39,7 +42,7 @@ if ARGS[1] == "probe" then
     end
 end
 
-local NO_LOCK, NO_FMT, NO_CLIPPY, NO_EXE, NO_TEST, RELOCK = false, false, false, false, false, false
+local NO_LOCK, NO_FMT, NO_CLIPPY, NO_EXE, NO_TEST, RELOCK, MIRI = false, false, false, false, false, false, false
 local CASES_OVERRIDE = nil
 local filters = {}
 do
@@ -58,6 +61,8 @@ do
             NO_EXE = true
         elseif a == "--quick" then
             NO_FMT, NO_CLIPPY, NO_EXE, NO_TEST = true, true, true, true
+        elseif a == "--miri" then
+            MIRI = true
         elseif a == "--relock" then
             RELOCK = true
         elseif a == "--cases" then
@@ -79,7 +84,7 @@ do
 end
 
 if RELOCK and (CASES_OVERRIDE or NO_LOCK or NO_FMT or NO_CLIPPY or NO_EXE or NO_TEST
-               or #filters > 0 or mode == "probe") then
+               or MIRI or #filters > 0 or mode == "probe") then
     io.stderr:write("\n--relock must stand alone (it rewrites every baseline; verify after with a zero-arg run)\n")
     os.exit(1)
 end
@@ -168,11 +173,19 @@ local function diff_against_lock(name)
         report_fail("lock", name, "compile succeeded but libalm_out.ll is empty/missing")
         return nil
     end
+    -- Both sides normalized (conf.lua normalize_ir): old
+    -- machine-absolute locks and post-normalization portable locks
+    -- compare identically.
+    local lockcode = normalize_ir(read_file(lock))
     local df = DIFF_DIR .. "/" .. lock_name(name)
     local f = io.open(df, "w")
     f:write(code)
     f:close()
-    local p = io.popen(string.format("diff -u '%s' '%s'", lock, df))
+    local lf = df .. ".fromlock"
+    f = io.open(lf, "w")
+    f:write(lockcode)
+    f:close()
+    local p = io.popen(string.format("diff -u '%s' '%s'", lf, df))
     local d = p:read("*a")
     p:close()
     if d == "" then
@@ -237,6 +250,20 @@ if not NO_TEST and #filters == 0 then
     if not (res == 0 or res == true) then
         print(c(RED, "  ✗ cargo test failed (full output: " .. TEST_OUT .. "):")
             .. "\n" .. read_file(TEST_OUT) .. read_file(BERR))
+        os.exit(1)
+    end
+end
+-- The Miri leg, recorded so it stops being a commit-receipt ritual:
+-- interprets the lib unit tests (the rt.rs UB oracle — poison reads
+-- are cfg'd out, the ownership laws run interpreted). Opt-in because
+-- it costs ~20s and a nightly toolchain; it tests the library, not
+-- the corpus, so filters do not gate it.
+if MIRI then
+    local MIRI_OUT = "target/miri_out.txt"
+    local res = os.execute("cargo +nightly miri test --lib --quiet > " .. MIRI_OUT .. " 2> " .. BERR)
+    if not (res == 0 or res == true) then
+        print(c(RED, "  ✗ miri failed (full output: " .. MIRI_OUT .. "):")
+            .. "\n" .. read_file(MIRI_OUT) .. read_file(BERR))
         os.exit(1)
     end
 end
@@ -445,6 +472,7 @@ if not CASES_OVERRIDE and not NO_LOCK then
 end
 local hygiene = {}
 if not NO_TEST and #filters == 0 then table.insert(hygiene, "test") end
+if MIRI then table.insert(hygiene, "miri") end
 if not NO_FMT then table.insert(hygiene, "fmt") end
 if not NO_CLIPPY then table.insert(hygiene, "clippy") end
 if #hygiene > 0 then table.insert(parts, table.concat(hygiene, "+") .. " clean") end

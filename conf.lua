@@ -138,8 +138,20 @@ function first_error(path)
         or "(no error output)"
 end
 
+-- The lock oracle normalizes the DIFile directory out of the compared
+-- IR: the compiler truthfully embeds the source's absolute directory
+-- (backend.rs DebugMeta), which would make every lock machine-absolute
+-- and every differently-named checkout read as 100% drift. Both sides
+-- of the comparison are normalized (the freshly captured IR here, the
+-- lock on disk at diff time in run.lua), so absolute-path locks from
+-- before the normalization keep passing, and reset.lua writes portable
+-- ones. The filename stays: it names the case and does not vary.
+function normalize_ir(code)
+    return (code:gsub('(!DIFile%([^\n]-directory: ")([^"]*)(")', "%1<CASES_DIR>%3"))
+end
+
 function captured_ir()
     local code = read_file("libalm_out.ll")
-    if code ~= "" then return code end
+    if code ~= "" then return normalize_ir(code) end
     return nil
 end

@@ -4,8 +4,6 @@ alm_out
 *.ll
 .alm_rt_trace.bin
 .alm_trace.bin
-.glm_rt_trace.bin
-.glm_trace.bin
 __pycache__
 diff
 .gdb_history

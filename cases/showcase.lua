@@ -12,7 +12,7 @@
 -- EXPECT: === 5. Boolean Tables ===
 -- EXPECT: Flags:	true	true	true	true
 -- EXPECT: === 6. String Tables ===
--- EXPECT: Names:	GLM	Compiler	Rust
+-- EXPECT: Names:	ALM	Compiler	Rust
 -- EXPECT: === 7. Lifetime Management ===
 -- EXPECT: Cache hit:	42
 -- EXPECT: Cache released safely
@@ -71,7 +71,7 @@ print("Flags:", flags[0], flags[1], flags[2], flags[3])
 
 print("=== 6. String Tables ===")
 local names = {}
-names[0] = "GLM"
+names[0] = "ALM"
 names[1] = "Compiler"
 names[2] = "Rust"
 print("Names:", names[0], names[1], names[2])

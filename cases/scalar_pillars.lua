@@ -78,11 +78,11 @@ end
 print(on)
 end
 
--- EXPECT: Hello, glm!
+-- EXPECT: Hello, alm!
 -- EXPECT: tab	joined
 -- EXPECT: second
 do
-local greeting = "Hello, glm!"
+local greeting = "Hello, alm!"
 print(greeting)
 print("tab", "joined")
 

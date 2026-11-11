@@ -2121,3 +2121,93 @@ mod strkey_tests {
         unsafe { alm_tbl_free(t) };
     }
 }
+
+#[cfg(test)]
+mod free_except_tests {
+    use super::*;
+
+    // The keep faces behind every returned-table borrow: free_tbl
+    // walks the parent's valid slot words and the keep set is the
+    // exact-match veto at each recursion step. These seams carried
+    // zero unit tests until W2 — the closure-over-rows corpus case
+    // exercises them end to end; these pin the veto law at the seam.
+
+    #[test]
+    fn free_except_spares_the_kept_row_and_frees_the_rest() {
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let keep = unsafe { alm_tbl_new(8, 0) };
+        let dropme = unsafe { alm_tbl_new(8, 0) };
+
+        unsafe { alm_tbl_set_row(parent, 0, std::ptr::addr_of!(keep).cast()) };
+        unsafe { alm_tbl_set_row(parent, 1, std::ptr::addr_of!(dropme).cast()) };
+        assert_eq!(unsafe { alm_tbl_len(parent) }, 2);
+
+        unsafe { alm_tbl_free_except(parent, keep) };
+
+        // The unkept sibling died at the walk (real-allocator law; the
+        // Miri stance is the strkey_tests poison note).
+        #[cfg(not(miri))]
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*dropme).esize).read() },
+            FREE_POISON_ESIZE,
+            "the unkept row is reclaimed by the parent's walk"
+        );
+        // The kept row is alive and usable, then freeable clean — the
+        // keep was a skip, not a mark: validate_header_before_free
+        // must still pass on it.
+        let word: u64 = 7;
+        unsafe { alm_tbl_set(keep, 0, ptr::addr_of!(word).cast()) };
+        let mut back: u64 = 0;
+        unsafe { alm_tbl_get(keep, 0, ptr::addr_of_mut!(back).cast(), 8) };
+        assert_eq!(back, 7, "the kept row survived the parent's free");
+        unsafe { alm_tbl_free(keep) };
+    }
+
+    #[test]
+    fn free_except_n_spares_every_kept_row() {
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let a = unsafe { alm_tbl_new(8, 0) };
+        let b = unsafe { alm_tbl_new(8, 0) };
+        let c = unsafe { alm_tbl_new(8, 0) };
+
+        unsafe { alm_tbl_set_row(parent, 0, std::ptr::addr_of!(a).cast()) };
+        unsafe { alm_tbl_set_row(parent, 1, std::ptr::addr_of!(b).cast()) };
+        unsafe { alm_tbl_set_row(parent, 2, std::ptr::addr_of!(c).cast()) };
+
+        let keeps = [a, c];
+        unsafe { alm_tbl_free_except_n(parent, keeps.as_ptr(), keeps.len()) };
+
+        #[cfg(not(miri))]
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*b).esize).read() },
+            FREE_POISON_ESIZE,
+            "only the listed rows are spared"
+        );
+        for (i, t) in [a, c].into_iter().enumerate() {
+            let word = 10 + i as u64;
+            unsafe { alm_tbl_set(t, 0, ptr::addr_of!(word).cast()) };
+            let mut back: u64 = 0;
+            unsafe { alm_tbl_get(t, 0, ptr::addr_of_mut!(back).cast(), 8) };
+            assert_eq!(back, word, "kept row {i} survived the parent's free");
+            unsafe { alm_tbl_free(t) };
+        }
+    }
+
+    #[test]
+    fn free_except_n_null_keeps_frees_everything() {
+        // The null slice is the plain-free arm by contract: no veto,
+        // every valid slot word reclaimed.
+        let parent = unsafe { alm_tbl_new(8, 0x80) };
+        let child = unsafe { alm_tbl_new(8, 0) };
+        unsafe { alm_tbl_set_row(parent, 0, std::ptr::addr_of!(child).cast()) };
+
+        unsafe { alm_tbl_free_except_n(parent, std::ptr::null(), 0) };
+
+        #[cfg(not(miri))]
+        assert_eq!(
+            unsafe { std::ptr::addr_of!((*child).esize).read() },
+            FREE_POISON_ESIZE,
+            "a null keep list reclaims the whole subtree"
+        );
+    }
+}
