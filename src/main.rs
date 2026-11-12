@@ -17,6 +17,7 @@ mod pipeline;
 #[cfg(test)]
 mod property_tests;
 mod shape;
+mod visit;
 
 use alm_rt::rt::AlmTable;
 

@@ -587,3 +587,4 @@ include!("h12_lowerer_consumes_the_records_pin.rs");
 include!("h12_recursion_guard_reads_the_instance_chain_pin.rs");
 include!("h12_loop_truth_is_sugar_blind_pin.rs");
 include!("fast_lane_facts_pin.rs");
+include!("visit_order_golden_pin.rs");
