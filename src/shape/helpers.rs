@@ -31,7 +31,26 @@ fn const_key_raw(e: &Expr) -> Option<i64> {
             expr,
             ..
         } => const_key_raw(expr).and_then(|v| v.checked_neg()),
-        _ => None,
+        // C: only literal/arith keys fold — everything else rides the
+        // expression lane
+        Expr::UnaryOp {
+            op: UnOp::Not | UnOp::Len,
+            ..
+        }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::Identifier { .. }
+        | Expr::Index { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
     }
 }
 
@@ -95,7 +114,26 @@ pub fn guard_key_shape(key: &Expr, guard: &str, index_base: i64) -> Option<crate
                 None
             }
         }
-        _ => None,
+        // C: every other key shape has no relation to the guard — the
+        // arithmetic operators, every non-guard identifier, and every
+        // non-numeric leaf or composite
+        Expr::BinaryOp { .. }
+        | Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::Identifier { .. }
+        | Expr::Index { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
     }
 }
 

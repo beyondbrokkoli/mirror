@@ -1,189 +1,165 @@
 
+// The touched-name collectors ride the traversal engine. One law carries
+// over from the hand walkers: a function *literal's* body is not descended
+// (its names are reached through the call cross-edge below), so
+// visit_function skips — everything else is the engine's default.
+
+use crate::visit::{self, Visitor};
+use std::convert::Infallible;
+
+struct FnTouch<'a> {
+    shape: &'a ShapeFacts,
+    out: &'a mut BTreeSet<String>,
+    seen: &'a mut BTreeSet<NodeId>,
+    /// read `move_poisons` at every statement (find_moved_names)
+    poisons: bool,
+    /// record plain-assignment names (find_mutated_vars)
+    mutated: bool,
+}
+
+impl Visitor for FnTouch<'_> {
+    type Break = Infallible;
+
+    fn enter_stmt(&mut self, stmt: &Stmt) -> Result<(), Self::Break> {
+        if self.poisons
+            && let Some(names) = self.shape.move_poisons.get(&stmt.id())
+        {
+            self.out.extend(names.iter().cloned());
+        }
+        Ok(())
+    }
+
+    fn visit_assignment(
+        &mut self,
+        name: &str,
+        expr: &Expr,
+        _loc: crate::ast::Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        if self.mutated {
+            self.out.insert(name.to_string());
+        }
+        visit::walk_expr(self, expr)
+    }
+
+    fn visit_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        id: NodeId,
+    ) -> Result<(), Self::Break> {
+        if let Some(fns) = self.shape.call_fns.get(&id) {
+            for &fn_ptr in fns {
+                if let Some(touched) = self.shape.fn_touched.get(&fn_ptr) {
+                    self.out.extend(touched.iter().cloned());
+                }
+                if self.seen.insert(fn_ptr)
+                    && let Some(def) = self.shape.fn_defs.get(&fn_ptr)
+                {
+                    // cross-edge into the callee's body: same collector,
+                    // fresh walk — poisons and mutation recording belong
+                    // to the statement lane, not the call edge
+                    let shape = self.shape;
+                    let out = &mut *self.out;
+                    let seen = &mut *self.seen;
+                    let mut edge = FnTouch {
+                        shape,
+                        out,
+                        seen,
+                        poisons: false,
+                        mutated: false,
+                    };
+                    let _ = visit::walk_stmts(&mut edge, def.body());
+                }
+            }
+        }
+        visit::walk_expr(self, callee)?;
+        for a in args {
+            visit::walk_expr(self, a)?;
+        }
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
+    }
+}
+
 fn const_of(expr: &Expr) -> Option<i64> {
+    // C: single-node classifier — only an Integer is a constant.
     match expr {
         Expr::Integer { value: v, .. } => Some(*v),
-        _ => None,
+        Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::Identifier { .. }
+        | Expr::Index { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
+    }
+}
+
+fn as_ident(expr: &Expr) -> Option<&str> {
+    // C: single-node classifier — only an Identifier names a variable.
+    match expr {
+        Expr::Identifier { name, .. } => Some(name),
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::Index { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
     }
 }
 
 fn find_moved_names(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut moved = BTreeSet::new();
     let mut seen = BTreeSet::new();
-    find_moved_names_into(stmts, shape, &mut moved, &mut seen);
+    let mut v = FnTouch {
+        shape,
+        out: &mut moved,
+        seen: &mut seen,
+        poisons: true,
+        mutated: false,
+    };
+    let _ = visit::walk_stmts(&mut v, stmts);
     moved
-}
-
-fn find_moved_names_into(
-    stmts: &[Stmt],
-    shape: &ShapeFacts,
-    out: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<NodeId>,
-) {
-    for stmt in stmts {
-        if let Some(names) = shape.move_poisons.get(&stmt.id()) {
-            out.extend(names.iter().cloned());
-        }
-        stmt_call_touched(stmt, shape, out, seen);
-        match stmt {
-            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                find_moved_names_into(body, shape, out, seen);
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                find_moved_names_into(then_body, shape, out, seen);
-                find_moved_names_into(else_body, shape, out, seen);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn calls_touched(
-    expr: &Expr,
-    shape: &ShapeFacts,
-    out: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<NodeId>,
-) {
-    match expr {
-        Expr::Call { callee, args, .. } => {
-            let key = expr.id();
-            if let Some(fns) = shape.call_fns.get(&key) {
-                for &fn_ptr in fns {
-                    if let Some(touched) = shape.fn_touched.get(&fn_ptr) {
-                        out.extend(touched.iter().cloned());
-                    }
-                    if seen.insert(fn_ptr)
-                        && let Some(def) = shape.fn_defs.get(&fn_ptr)
-                    {
-                        fn_stmts_touched(def.body(), shape, out, seen);
-                    }
-                }
-            }
-            calls_touched(callee, shape, out, seen);
-            for a in args {
-                calls_touched(a, shape, out, seen);
-            }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            calls_touched(left, shape, out, seen);
-            calls_touched(right, shape, out, seen);
-        }
-        Expr::UnaryOp { expr, .. } => calls_touched(expr, shape, out, seen),
-        Expr::Index { obj, key, .. } => {
-            calls_touched(obj, shape, out, seen);
-            calls_touched(key, shape, out, seen);
-        }
-        Expr::Field { obj, .. } => calls_touched(obj, shape, out, seen),
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    calls_touched(ke, shape, out, seen);
-                }
-                calls_touched(v, shape, out, seen);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn fn_stmts_touched(
-    stmts: &[Stmt],
-    shape: &ShapeFacts,
-    out: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<NodeId>,
-) {
-    for s in stmts {
-        stmt_call_touched(s, shape, out, seen);
-        match s {
-            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                fn_stmts_touched(body, shape, out, seen);
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                fn_stmts_touched(then_body, shape, out, seen);
-                fn_stmts_touched(else_body, shape, out, seen);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn stmt_call_touched(
-    stmt: &Stmt,
-    shape: &ShapeFacts,
-    out: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<NodeId>,
-) {
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                calls_touched(e, shape, out, seen);
-            }
-        }
-        Stmt::Assignment { expr, .. } => calls_touched(expr, shape, out, seen),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            calls_touched(obj, shape, out, seen);
-            calls_touched(key, shape, out, seen);
-            calls_touched(value, shape, out, seen);
-        }
-        Stmt::While { condition, .. } => calls_touched(condition, shape, out, seen),
-        Stmt::If { condition, .. } => calls_touched(condition, shape, out, seen),
-        Stmt::Expr { expr, .. } => calls_touched(expr, shape, out, seen),
-        Stmt::Return { value: Some(e), .. } => calls_touched(e, shape, out, seen),
-        _ => {}
-    }
 }
 
 fn find_mutated_vars(stmts: &[Stmt], shape: &ShapeFacts) -> BTreeSet<String> {
     let mut mutated = BTreeSet::new();
     let mut seen = BTreeSet::new();
-    find_mutated_names_into(stmts, shape, &mut mutated, &mut seen);
+    let mut v = FnTouch {
+        shape,
+        out: &mut mutated,
+        seen: &mut seen,
+        poisons: false,
+        mutated: true,
+    };
+    let _ = visit::walk_stmts(&mut v, stmts);
     mutated
 }
-
-fn find_mutated_names_into(
-    stmts: &[Stmt],
-    shape: &ShapeFacts,
-    out: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<NodeId>,
-) {
-    for stmt in stmts {
-        stmt_call_touched(stmt, shape, out, seen);
-        match stmt {
-            Stmt::Assignment { name, .. } => {
-                out.insert(name.clone());
-            }
-            Stmt::While { body, .. } => {
-                find_mutated_names_into(body, shape, out, seen);
-            }
-            Stmt::Do { body, .. } => {
-                find_mutated_names_into(body, shape, out, seen);
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                find_mutated_names_into(then_body, shape, out, seen);
-                find_mutated_names_into(else_body, shape, out, seen);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn as_ident(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Identifier { name, .. } => Some(name),
-        _ => None,
-    }
-}
-

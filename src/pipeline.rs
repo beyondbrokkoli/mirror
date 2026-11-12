@@ -1,5 +1,5 @@
 use crate::analysis;
-use crate::ast::{self, Stmt};
+use crate::ast::Stmt;
 use crate::backend;
 use crate::diag::Diagnostic;
 use crate::ir;
@@ -131,99 +131,37 @@ fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec
 }
 
 fn references_arg(stmts: &[Stmt]) -> bool {
-    fn expr(e: &ast::Expr) -> bool {
-        match e {
-            ast::Expr::Identifier { name, .. } => name == "arg",
-            ast::Expr::TableCtor { entries, .. } => entries
-                .iter()
-                .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key, .. } => expr(obj) || expr(key),
-            ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
-            ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args, .. } => expr(callee) || args.iter().any(expr),
-            ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer { .. }
-            | ast::Expr::Float { .. }
-            | ast::Expr::Boolean { .. }
-            | ast::Expr::String { .. }
-            | ast::Expr::Nil { .. }
-            | ast::Expr::SysAllocCount { .. }
-            | ast::Expr::SysExecCount { .. }
-            | ast::Expr::FfiModule { .. }
-            | ast::Expr::CoroModule { .. } => false,
-            ast::Expr::Field { obj, .. } => expr(obj),
+    use crate::ast::NodeId;
+    use crate::visit::{Visitor, walk_stmts};
+    use std::convert::Infallible;
+
+    struct ArgRef(bool);
+    impl Visitor for ArgRef {
+        type Break = Infallible;
+        fn visit_identifier(&mut self, name: &str, _id: NodeId) -> Result<(), Self::Break> {
+            self.0 |= name == "arg";
+            Ok(())
         }
     }
-    fn go(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
-            Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign {
-                obj, key, value, ..
-            } => expr(obj) || expr(key) || expr(value),
-            Stmt::While {
-                condition, body, ..
-            } => expr(condition) || go(body),
-            Stmt::Do { body, .. } => go(body),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner, .. } => expr(inner),
-            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
-            Stmt::Break { .. } => false,
-        })
-    }
-    go(stmts)
+    let mut v = ArgRef(false);
+    let _ = walk_stmts(&mut v, stmts);
+    v.0
 }
 
 fn uses_ffi(stmts: &[Stmt]) -> bool {
-    fn expr(e: &ast::Expr) -> bool {
-        match e {
-            ast::Expr::FfiModule { .. } => true,
-            ast::Expr::Field { obj, .. } => expr(obj),
-            ast::Expr::TableCtor { entries, .. } => entries
-                .iter()
-                .any(|(k, v)| matches!(k, ast::CtorKey::Expr(ke) if expr(ke)) || expr(v)),
-            ast::Expr::Index { obj, key, .. } => expr(obj) || expr(key),
-            ast::Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
-            ast::Expr::UnaryOp { expr: inner, .. } => expr(inner),
-            ast::Expr::Call { callee, args, .. } => expr(callee) || args.iter().any(expr),
-            ast::Expr::Function { body, .. } => go(body),
-            ast::Expr::Integer { .. }
-            | ast::Expr::Float { .. }
-            | ast::Expr::Boolean { .. }
-            | ast::Expr::String { .. }
-            | ast::Expr::Nil { .. }
-            | ast::Expr::SysAllocCount { .. }
-            | ast::Expr::SysExecCount { .. }
-            | ast::Expr::CoroModule { .. }
-            | ast::Expr::Identifier { .. } => false,
+    use crate::ast::NodeId;
+    use crate::visit::{Visitor, walk_stmts};
+    use std::convert::Infallible;
+
+    struct FfiUsed(bool);
+    impl Visitor for FfiUsed {
+        type Break = Infallible;
+        fn visit_ffi_module(&mut self, _id: NodeId) -> Result<(), Self::Break> {
+            self.0 = true;
+            Ok(())
         }
     }
-    fn go(stmts: &[Stmt]) -> bool {
-        stmts.iter().any(|s| match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => exprs.iter().any(expr),
-            Stmt::Assignment { expr: value, .. } => expr(value),
-            Stmt::IndexAssign {
-                obj, key, value, ..
-            } => expr(obj) || expr(key) || expr(value),
-            Stmt::While {
-                condition, body, ..
-            } => expr(condition) || go(body),
-            Stmt::Do { body, .. } => go(body),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => expr(condition) || go(then_body) || go(else_body),
-            Stmt::Expr { expr: inner, .. } => expr(inner),
-            Stmt::Return { value, .. } => value.as_ref().is_some_and(expr),
-            Stmt::Break { .. } => false,
-        })
-    }
-    go(stmts)
+    let mut v = FfiUsed(false);
+    let _ = walk_stmts(&mut v, stmts);
+    v.0
 }
