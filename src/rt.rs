@@ -10,7 +10,7 @@ use crate::trace::{
     TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE,
     TRACE_FAIL_CORO_YIELD_RESERVED, TRACE_FAIL_DIV_ZERO, TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM,
     TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE, TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD,
-    TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_GROW_NULL, TRACE_RT_RESERVE_NULL,
+    TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_RESERVE_NULL,
 };
 
 #[repr(u8)]
@@ -187,11 +187,17 @@ unsafe extern "C" fn alm_trace_leak_check() {
     }
 }
 
+/// The one checked size law for span arithmetic: `len` cells of
+/// `esize` bytes each, as usize — None when the length or the product
+/// does not fit. elem_layout and span_grow abort through it (a span
+/// the process cannot address is a fatal allocation); the free-time
+/// audit reads the same law as its validity predicate.
+fn bytes_of(len: i64, esize: usize) -> Option<usize> {
+    usize::try_from(len).ok().and_then(|l| l.checked_mul(esize))
+}
+
 fn elem_layout(len: i64, esize: usize) -> Layout {
-    let bytes = usize::try_from(len)
-        .ok()
-        .and_then(|l| l.checked_mul(esize))
-        .unwrap_or_else(|| abort_alloc(usize::MAX));
+    let bytes = bytes_of(len, esize).unwrap_or_else(|| abort_alloc(usize::MAX));
     Layout::from_size_align(bytes, span_align(esize)).unwrap_or_else(|_| abort_alloc(bytes))
 }
 
@@ -255,23 +261,6 @@ pub unsafe extern "C" fn alm_tbl_new(esize: usize, flags: u8) -> *mut AlmTable {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_grow(t: *mut AlmTable, idx: i64) {
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_RT_GROW_NULL) };
-        return;
-    }
-    let tbl = unsafe { &mut *t };
-    if tbl.mode != TableMode::Dense {
-        return;
-    }
-    if idx >= 0 && idx == i64::MAX {
-        eprintln!("alm fatal: table index overflow (idx={idx})");
-        std::process::abort();
-    }
-    unsafe { span_grow(tbl, idx.wrapping_add(1)) };
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
     if t.is_null() {
         unsafe { alm_trace_set(TRACE_RT_RESERVE_NULL) };
@@ -280,11 +269,7 @@ pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
     let raw_esize = unsafe { ptr::addr_of!((*t).esize).read() };
     let raw_len = unsafe { ptr::addr_of!((*t).len).read() };
     let raw_mode = unsafe { ptr::addr_of!((*t).mode).cast::<u8>().read() };
-    if raw_esize == FREE_POISON_ESIZE
-        || raw_len < 0
-        || !matches!(raw_esize, 1 | 8 | 16)
-        || raw_mode > 1
-    {
+    if !header_is_sane(raw_esize, raw_len, raw_mode) {
         eprintln!(
             "alm fatal: alm_tbl_reserve called on freed or corrupted AlmTable {:p} (len={}, esize=0x{:x}, mode={})",
             t, raw_len, raw_esize, raw_mode
@@ -447,46 +432,6 @@ const _: () = {
     assert!(span_align(u128::ESIZE) == u128::ALIGN);
 };
 
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub struct KeyedCell(u128);
-
-#[allow(dead_code)]
-impl cell_sealed::Sealed for KeyedCell {}
-
-#[allow(dead_code)]
-impl CellRepr for KeyedCell {
-    const ESIZE: usize = 16;
-    const ALIGN: usize = 16;
-    unsafe fn load_slot(slot: *const u8) -> Self {
-        debug_assert!(slot.addr() & 15 == 0, "KeyedCell slot cell not 16-aligned");
-        Self(unsafe { (slot as *const u128).read() })
-    }
-    fn to_lane(self) -> u128 {
-        self.0
-    }
-    fn from_lane(lane: u128) -> Self {
-        Self(lane)
-    }
-    unsafe fn store_span(slot: *mut u8, cell: Self) {
-        debug_assert!(slot.addr() & 15 == 0, "KeyedCell span cell not 16-aligned");
-        unsafe { (slot as *mut u128).write(cell.0) };
-    }
-    unsafe fn load_span(slot: *const u8) -> Self {
-        debug_assert!(slot.addr() & 15 == 0, "KeyedCell span cell not 16-aligned");
-        Self(unsafe { (slot as *const u128).read() })
-    }
-    unsafe fn store_dst(cell: Self, dst: *mut u8) {
-        debug_assert!(dst.addr() & 15 == 0, "KeyedCell dst cell not 16-aligned");
-        unsafe { (dst as *mut u128).write(cell.0) };
-    }
-}
-
-#[allow(dead_code)]
-unsafe fn keyed_set(t: *mut AlmTable, index: i64, cell: KeyedCell) {
-    unsafe { set_core::<KeyedCell>(t, index, cell, false) };
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
     if rhs == 0 {
@@ -496,25 +441,104 @@ pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
     }
 }
 
+/// The store faces' one null-table death (registry slot 71, the
+/// FAIL_NULL_ROW_STORE law): row absence at runtime — base proved a
+/// table of tables, this cell null — is the one way a store meets a
+/// null table, and every store face shares the death while the read
+/// side stays total.
+macro_rules! refuse_null_table {
+    ($t:expr) => {
+        if $t.is_null() {
+            unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
+            eprintln!("alm runtime error: attempt to index a nil value (null table row)");
+            std::process::abort();
+        }
+    };
+}
+
+/// The byte-pointer read faces' one null answer: a null destination
+/// is a no-op read, and a null table zero-fills it — reads stay
+/// total (a null row reads the zero lane), never the stores' death.
+macro_rules! null_table_reads_zero {
+    ($t:expr, $dst:expr, $esize:expr) => {
+        if $dst.is_null() {
+            return;
+        }
+        if $t.is_null() {
+            unsafe { std::ptr::write_bytes($dst, 0, $esize) };
+            return;
+        }
+    };
+}
+
+// The per-repr trampolines behind the one esize dispatch: a family's
+// exported faces differ only in the ownership literal (set vs
+// set_row) or the core fn (index vs str key), so each family has one
+// generic body and the dispatch below varies only the repr.
+unsafe fn store_lane<C: CellRepr>(t: *mut AlmTable, index: i64, val: *const u8, owns_cell: bool) {
+    unsafe { set_core::<C>(t, index, C::load_slot(val), owns_cell) }
+}
+
+unsafe fn load_lane<C: CellRepr>(t: *mut AlmTable, index: i64, dst: *mut u8) {
+    unsafe { C::store_dst(get_core::<C>(t, index), dst) }
+}
+
+unsafe fn store_skey_lane<C: CellRepr>(t: *mut AlmTable, key: i64, val: *const u8) {
+    unsafe { set_skey_core::<C>(t, key, C::load_slot(val)) }
+}
+
+unsafe fn load_skey_lane<C: CellRepr>(t: *mut AlmTable, key: i64, dst: *mut u8) {
+    unsafe { C::store_dst(get_skey_core::<C>(t, key), dst) }
+}
+
+/// The one esize-dispatch law: the three cell reprs (u8, u64, u128
+/// lanes at esize 1, 8, 16) are the whole repr universe, and a header
+/// reading any other esize is corrupt or foreign — the face dies
+/// naming the esize and its own surface ("has no cell repr" here,
+/// "has no register cell face" in the register macro below). The
+/// trampoline arguments are repr-independent, so the dispatch and the
+/// death exist in exactly one copy.
+macro_rules! esize_dispatch {
+    ($t:expr, $lane:ident ($($args:expr),* $(,)?), $surface:literal) => {
+        match unsafe { (&*$t).esize } {
+            1 => unsafe { $lane::<u8>($($args),*) },
+            8 => unsafe { $lane::<u64>($($args),*) },
+            16 => unsafe { $lane::<u128>($($args),*) },
+            other => {
+                eprintln!(
+                    concat!("alm runtime error: AlmTable esize {} ", $surface),
+                    other
+                );
+                std::process::abort();
+            }
+        }
+    };
+}
+
+/// The register faces' dispatch: the i128 lane is a u128 cell, esize
+/// 16 only — any other esize dies naming the register face.
+macro_rules! esize_register_lane {
+    ($t:expr, $body:expr) => {
+        match unsafe { (&*$t).esize } {
+            16 => $body,
+            other => {
+                eprintln!(
+                    "alm runtime error: AlmTable esize {} has no register cell face",
+                    other
+                );
+                std::process::abort();
+            }
+        }
+    };
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_set(t: *mut AlmTable, index: i64, val: *const u8) {
     // The pooled-handle face: interned strings and closure creation
     // envs. The destination never owns the cell, so a refused store
     // drops it (ownership notes in docs/lane_single_brain.md).
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-        std::process::abort();
-    }
-    match unsafe { (&*t).esize } {
-        1 => unsafe { set_core::<u8>(t, index, u8::load_slot(val), false) },
-        8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val), false) },
-        16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val), false) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
-            std::process::abort();
-        }
-    }
+    refuse_null_table!(t);
+    esize_dispatch!(t, store_lane(t, index, val, false), "has no cell repr");
 }
 
 #[unsafe(no_mangle)]
@@ -525,20 +549,8 @@ pub unsafe extern "C" fn alm_tbl_set_row(t: *mut AlmTable, index: i64, val: *con
     // the symbol itself is the proof, so the refuse path never
     // consults the destination's header bit (env tables set that bit
     // for borrowed closure faces, so the bit cannot name ownership).
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-        std::process::abort();
-    }
-    match unsafe { (&*t).esize } {
-        1 => unsafe { set_core::<u8>(t, index, u8::load_slot(val), true) },
-        8 => unsafe { set_core::<u64>(t, index, u64::load_slot(val), true) },
-        16 => unsafe { set_core::<u128>(t, index, u128::load_slot(val), true) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
-            std::process::abort();
-        }
-    }
+    refuse_null_table!(t);
+    esize_dispatch!(t, store_lane(t, index, val, true), "has no cell repr");
 }
 
 unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell: bool) {
@@ -561,20 +573,20 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
         return;
     }
 
-    if tbl.mode == TableMode::Sparse {
+    // The two map-backed lanes, one law: a born-sparse table's record
+    // map and a far key's overflow park (allocated lazily, the park
+    // seam probes/p22_overflow_park_dense_grow_leak.lua) both stretch
+    // the border to the index and ride the word in the map, an owned
+    // displaced word reclaiming before the insert wins. The near-key
+    // dense envelope falls through to the span below.
+    if tbl.mode == TableMode::Sparse || index > tbl.len.saturating_add(SPARSE_THRESHOLD) {
         tbl.border = tbl.border.max(index.saturating_add(1));
-        let map = unsafe { &mut *tbl.sparse_map };
+        let map = if tbl.mode == TableMode::Sparse {
+            unsafe { &mut *tbl.sparse_map }
+        } else {
+            unsafe { overflow_map(tbl) }
+        };
         if let Some(old) = map.insert(index, cell.to_lane())
-            && owns_cell
-        {
-            unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
-        }
-        return;
-    }
-
-    if index > tbl.len.saturating_add(SPARSE_THRESHOLD) {
-        tbl.border = tbl.border.max(index.saturating_add(1));
-        if let Some(old) = unsafe { overflow_map(tbl).insert(index, cell.to_lane()) }
             && owns_cell
         {
             unsafe { reclaim_displaced_child::<C>(tbl, C::from_lane(old), cell) };
@@ -608,6 +620,23 @@ unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell
     }
 }
 
+/// One lane walk for free_tbl's twin child walks (the dense span and
+/// the sparse/overflow map) and the displaced-child reclaim's tail.
+/// The lane words are integer lanes the span and the map traffic as
+/// values (store_span writes the lane, never the pointer), so each
+/// reconstitutes through the exposed-provenance seam — a
+/// pointer-typed read of an integer-written slot carries no
+/// provenance (Miri: dangling [noalloc]) — and a lane reading as a
+/// live table address frees under the keep veto; zero words and
+/// kernel islands never pass valid_slot_addr.
+unsafe fn reclaim_lane(lane: u128, keeps: &[*mut AlmTable]) {
+    let child = ptr::with_exposed_provenance_mut::<AlmTable>(lane as usize);
+    if valid_slot_addr(child as usize) {
+        unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
+        unsafe { free_tbl(child, keeps) };
+    }
+}
+
 /// The displaced-child reclaim. An owned-row replace is the slot's
 /// second word of a table lane: zero words and non-pointer words skip
 /// (`valid_slot_addr`, the same consult free_tbl's child walk makes),
@@ -621,11 +650,7 @@ unsafe fn reclaim_displaced_child<C: CellRepr>(tbl: &AlmTable, old_slot: C, new_
     if old_lane == new_cell.to_lane() {
         return;
     }
-    let child = ptr::with_exposed_provenance_mut::<AlmTable>(old_lane as usize);
-    if valid_slot_addr(child as usize) {
-        unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
-        unsafe { free_tbl(child, &[]) };
-    }
+    unsafe { reclaim_lane(old_lane, &[]) };
 }
 
 /// The stored-slot predicate: a lane reads as a live table pointer when
@@ -662,22 +687,8 @@ unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_get(t: *mut AlmTable, index: i64, dst: *mut u8, esize: usize) {
-    if dst.is_null() {
-        return;
-    }
-    if t.is_null() {
-        std::ptr::write_bytes(dst, 0, esize);
-        return;
-    }
-    match unsafe { (&*t).esize } {
-        1 => unsafe { u8::store_dst(get_core::<u8>(t, index), dst) },
-        8 => unsafe { u64::store_dst(get_core::<u64>(t, index), dst) },
-        16 => unsafe { u128::store_dst(get_core::<u128>(t, index), dst) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
-            std::process::abort();
-        }
-    }
+    null_table_reads_zero!(t, dst, esize);
+    esize_dispatch!(t, load_lane(t, index, dst), "has no cell repr");
 }
 
 unsafe fn get_core<C: CellRepr>(t: *mut AlmTable, index: i64) -> C {
@@ -720,18 +731,8 @@ unsafe fn get_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64) -> C {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_set_any(t: *mut AlmTable, index: i64, val: i128) {
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-        std::process::abort();
-    }
-    match unsafe { (&*t).esize } {
-        16 => unsafe { set_core::<u128>(t, index, val as u128, false) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
-            std::process::abort();
-        }
-    }
+    refuse_null_table!(t);
+    esize_register_lane!(t, unsafe { set_core::<u128>(t, index, val as u128, false) });
 }
 
 #[unsafe(no_mangle)]
@@ -739,67 +740,25 @@ pub unsafe extern "C" fn alm_tbl_get_any(t: *mut AlmTable, index: i64) -> i128 {
     if t.is_null() {
         return 0;
     }
-    match unsafe { (&*t).esize } {
-        16 => unsafe { get_core::<u128>(t, index) as i128 },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
-            std::process::abort();
-        }
-    }
+    esize_register_lane!(t, unsafe { get_core::<u128>(t, index) as i128 })
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_set_skey(t: *mut AlmTable, key: i64, val: *const u8) {
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-        std::process::abort();
-    }
-    match unsafe { (&*t).esize } {
-        1 => unsafe { set_skey_core::<u8>(t, key, u8::load_slot(val)) },
-        8 => unsafe { set_skey_core::<u64>(t, key, u64::load_slot(val)) },
-        16 => unsafe { set_skey_core::<u128>(t, key, u128::load_slot(val)) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
-            std::process::abort();
-        }
-    }
+    refuse_null_table!(t);
+    esize_dispatch!(t, store_skey_lane(t, key, val), "has no cell repr");
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_get_skey(t: *mut AlmTable, key: i64, dst: *mut u8, esize: usize) {
-    if dst.is_null() {
-        return;
-    }
-    if t.is_null() {
-        std::ptr::write_bytes(dst, 0, esize);
-        return;
-    }
-    match unsafe { (&*t).esize } {
-        1 => unsafe { u8::store_dst(get_skey_core::<u8>(t, key), dst) },
-        8 => unsafe { u64::store_dst(get_skey_core::<u64>(t, key), dst) },
-        16 => unsafe { u128::store_dst(get_skey_core::<u128>(t, key), dst) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no cell repr");
-            std::process::abort();
-        }
-    }
+    null_table_reads_zero!(t, dst, esize);
+    esize_dispatch!(t, load_skey_lane(t, key, dst), "has no cell repr");
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_set_any_skey(t: *mut AlmTable, key: i64, val: i128) {
-    if t.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-        eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-        std::process::abort();
-    }
-    match unsafe { (&*t).esize } {
-        16 => unsafe { set_skey_core::<u128>(t, key, val as u128) },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
-            std::process::abort();
-        }
-    }
+    refuse_null_table!(t);
+    esize_register_lane!(t, unsafe { set_skey_core::<u128>(t, key, val as u128) });
 }
 
 #[unsafe(no_mangle)]
@@ -807,13 +766,7 @@ pub unsafe extern "C" fn alm_tbl_get_any_skey(t: *mut AlmTable, key: i64) -> i12
     if t.is_null() {
         return 0;
     }
-    match unsafe { (&*t).esize } {
-        16 => unsafe { get_skey_core::<u128>(t, key) as i128 },
-        other => {
-            eprintln!("alm runtime error: AlmTable esize {other} has no register cell face");
-            std::process::abort();
-        }
-    }
+    esize_register_lane!(t, unsafe { get_skey_core::<u128>(t, key) as i128 })
 }
 
 unsafe fn span_grow(tbl: &mut AlmTable, want: i64) {
@@ -824,10 +777,7 @@ unsafe fn span_grow(tbl: &mut AlmTable, want: i64) {
         return;
     }
     let new_len = want.max(tbl.len.wrapping_mul(2)).max(8);
-    let new_bytes = usize::try_from(new_len)
-        .ok()
-        .and_then(|l| l.checked_mul(tbl.esize))
-        .unwrap_or_else(|| abort_alloc(usize::MAX));
+    let new_bytes = bytes_of(new_len, tbl.esize).unwrap_or_else(|| abort_alloc(usize::MAX));
     if tbl.reserve != 0 {
         unsafe { grow_vm(tbl, new_bytes) };
         tbl.len = new_len;
@@ -986,6 +936,18 @@ pub unsafe extern "C" fn alm_tbl_free_except_n(
 
 const FREE_POISON_ESIZE: usize = 0xDEAD_F8EE_DEAD_F8EE;
 
+/// The one header-corruption law, consulted by both freed-header
+/// sniffs: a live header reads esize as one of the three cell reprs
+/// (which already excludes the free poison — it is none of 1, 8, 16),
+/// mode as one of the two TableModes, and a non-negative len.
+/// alm_tbl_reserve refuses anything not sane through it;
+/// validate_header_before_free folds it into the fuller pre-free
+/// audit (elem_kind, the bytes_of product, the span shape) after its
+/// own DOUBLE FREE diagnosis splits the poison out first.
+fn header_is_sane(esize: usize, len: i64, mode: u8) -> bool {
+    esize != FREE_POISON_ESIZE && matches!(esize, 1 | 8 | 16) && mode <= 1 && len >= 0
+}
+
 unsafe fn validate_header_before_free(t: *mut AlmTable, prev_allocs: usize) {
     let raw_data = unsafe { ptr::addr_of!((*t).data).read() };
     let raw_len = unsafe { ptr::addr_of!((*t).len).read() };
@@ -1006,21 +968,14 @@ unsafe fn validate_header_before_free(t: *mut AlmTable, prev_allocs: usize) {
         std::process::abort();
     }
 
-    let valid_esize = matches!(raw_esize, 1 | 8 | 16);
-    let valid_mode = matches!(raw_mode, 0 | 1);
     let valid_elem_kind = raw_elem_kind <= ALM_ELEM_UNDECIDED;
-    let valid_len = raw_len >= 0
-        && usize::try_from(raw_len)
-            .ok()
-            .and_then(|l| l.checked_mul(raw_esize))
-            .is_some();
+    let valid_len = bytes_of(raw_len, raw_esize).is_some();
     let valid_span = (raw_len == 0 && raw_data.is_null())
         || (raw_len > 0 && !raw_data.is_null())
         || raw_mode == 1;
 
     if prev_allocs == 0
-        || !valid_esize
-        || !valid_mode
+        || !header_is_sane(raw_esize, raw_len, raw_mode)
         || !valid_elem_kind
         || !valid_len
         || !valid_span
@@ -1071,29 +1026,15 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
 
     if tbl.contains_tables != 0 {
         if tbl.mode == TableMode::Dense && !tbl.data.is_null() {
-            // The span words are integer lanes (store_span writes the
-            // lane, never the pointer), so the child walk reads them as
-            // u64 words and reconstitutes each through the
-            // exposed-provenance seam — a pointer-typed read of an
-            // integer-written slot carries no provenance (Miri:
-            // dangling [noalloc]).
-            let lanes = std::slice::from_raw_parts(tbl.data.cast::<u64>(), tbl.len as usize);
+            let lanes =
+                unsafe { std::slice::from_raw_parts(tbl.data.cast::<u64>(), tbl.len as usize) };
             for &lane in lanes {
-                let child = ptr::with_exposed_provenance_mut::<AlmTable>(lane as usize);
-                if valid_slot_addr(child as usize) {
-                    unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
-                    unsafe { free_tbl(child, keeps) };
-                }
+                unsafe { reclaim_lane(u128::from(lane), keeps) };
             }
         }
         if !tbl.sparse_map.is_null() {
-            let map = unsafe { &*tbl.sparse_map };
-            for &child_addr in map.values() {
-                let child = ptr::with_exposed_provenance_mut::<AlmTable>(child_addr as usize);
-                if valid_slot_addr(child as usize) {
-                    unsafe { alm_trace_set(TRACE_RT_FREE_CHILD) };
-                    unsafe { free_tbl(child, keeps) };
-                }
+            for &lane in unsafe { (&*tbl.sparse_map).values() } {
+                unsafe { reclaim_lane(lane, keeps) };
             }
         }
     }
