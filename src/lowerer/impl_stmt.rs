@@ -311,6 +311,9 @@ impl<'a> IrLowerer<'a> {
                             .get(&stmt.id())
                             .map(|plan| (guard.to_string(), plan))
                     }
+                    // C: only a `name < bound` condition carries the
+                    // reserve plan seam; every other condition shape
+                    // declines
                     _ => None,
                 };
 
@@ -320,6 +323,7 @@ impl<'a> IrLowerer<'a> {
                         right: bound_expr,
                         ..
                     } if plan.is_some() => Some(bound_expr),
+                    // C: same seam — non-guard conditions have no bound
                     _ => None,
                 };
                 let mut conv_bound_reg: Option<Reg<Int>> = None;

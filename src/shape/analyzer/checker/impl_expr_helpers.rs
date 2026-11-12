@@ -119,13 +119,30 @@ impl Checker {
         if !matches!(lat.resolve(ty), Ty::Any) {
             return None;
         }
+        // C: only a plain name or a direct index off one names a value
+        // whose provenance a note could adopt
         let name = match expr {
             Expr::Identifier { name: n, .. } => n,
             Expr::Index { obj, .. } => match obj.as_ref() {
                 Expr::Identifier { name: n, .. } => n,
+                // C: a computed or nested base names nothing adoptable
                 _ => return None,
             },
-            _ => return None,
+            Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::TableCtor { .. }
+            | Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. }
+            | Expr::Field { .. }
+            | Expr::Function { .. }
+            | Expr::Call { .. } => return None,
         };
         let line = self.ctx.adopt_lines.get(name)?;
         signal!(trace::TRACE_CHK_ANY_PROVENANCE);

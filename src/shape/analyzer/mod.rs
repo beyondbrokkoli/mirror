@@ -773,10 +773,25 @@ impl Recorded {
 }
 
 fn get_base_identifier(expr: &Expr) -> Option<&String> {
+    // C: index-chain classifier — same law as stmt_base above
     match expr {
         Expr::Identifier { name, .. } => Some(name),
         Expr::Index { obj, .. } => get_base_identifier(obj),
-        _ => None,
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
     }
 }
 

@@ -135,6 +135,8 @@ impl<'a> IrLowerer<'a> {
                         )));
                         Some(Reg::new(cell))
                     }
+                    // C: only a closure value or a blessed field call
+                    // carries an env; every other callee shape is bare
                     _ => None,
                 };
                 if self

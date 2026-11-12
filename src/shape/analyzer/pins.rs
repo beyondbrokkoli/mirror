@@ -14,10 +14,25 @@ impl Analyzer {
             Expr::Index { obj, .. } | Expr::Field { obj, .. } => match obj.as_ref() {
                 Expr::Identifier { .. } => self.read_elem_node(obj),
                 Expr::Call { .. } => self.call_read_node(obj),
+                // C: a read through any other base has no single node
                 _ => None,
             },
             Expr::Call { .. } => self.call_value_node(expr),
-            _ => None,
+            // C: literals, operators, ctors, and the module faces have no
+            // lattice node to view
+            Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::TableCtor { .. }
+            | Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. }
+            | Expr::Function { .. } => None,
         }
     }
 
@@ -201,7 +216,17 @@ impl Analyzer {
                 self.rhs_pin_derived(callee) || args.iter().any(|a| self.rhs_pin_derived(a))
             }
             Expr::TableCtor { entries, .. } => entries.iter().any(|(_, e)| self.rhs_pin_derived(e)),
-            _ => false,
+            // C: leaves and module faces derive from no pin
+            Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. }
+            | Expr::Function { .. } => false,
         }
     }
 

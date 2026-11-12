@@ -60,9 +60,26 @@ impl Analyzer {
                 let mut sets = Vec::with_capacity(names.len());
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
                 for (name, expr) in names.iter().zip(exprs.iter()) {
+                    // C: only a whole-value function literal is a fn
+                    // binding; every other RHS binds a plain name
                     let ptr = match expr {
                         Expr::Function { .. } => Some(expr.id()),
-                        _ => None,
+                        Expr::Integer { .. }
+                        | Expr::Float { .. }
+                        | Expr::Boolean { .. }
+                        | Expr::String { .. }
+                        | Expr::Nil { .. }
+                        | Expr::TableCtor { .. }
+                        | Expr::Identifier { .. }
+                        | Expr::Index { .. }
+                        | Expr::BinaryOp { .. }
+                        | Expr::UnaryOp { .. }
+                        | Expr::SysAllocCount { .. }
+                        | Expr::SysExecCount { .. }
+                        | Expr::FfiModule { .. }
+                        | Expr::CoroModule { .. }
+                        | Expr::Field { .. }
+                        | Expr::Call { .. } => None,
                     };
                     self.declare_fn_binding(name, ptr);
                 }
