@@ -1,9 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use std::alloc::{Layout, alloc_zeroed, dealloc, realloc};
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Once, OnceLock};
 
 use crate::trace::{
     TRACE_CORO_CLOSE, TRACE_CORO_DEAD, TRACE_CORO_RESUME, TRACE_CORO_SPAWN, TRACE_CORO_YIELD,
@@ -33,31 +34,61 @@ pub struct AlmTable {
     pub border: i64,
 }
 
+/// Raw byte-discriminant mirror of `AlmTable` for corruption/double-free
+/// audits so reading a freed or corrupted header never materializes an
+/// invalid `TableMode` enum discriminant (which would be immediate UB).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawAlmTable {
+    data: *mut u8,
+    len: i64,
+    reserve: usize,
+    esize: usize,
+    mode: u8,
+    contains_tables: u8,
+    elem_kind: u8,
+    sparse_map: *mut HashMap<i64, u128>,
+    border: i64,
+}
+
 const _: () = {
-    use std::mem::{offset_of, size_of};
+    use std::mem::{align_of, offset_of, size_of};
     assert!(
         size_of::<AlmTable>() == 56,
         "AlmTable must stay the 56-byte ABI"
     );
-    assert!(offset_of!(AlmTable, data) == 0);
-    assert!(offset_of!(AlmTable, len) == 8);
-    assert!(offset_of!(AlmTable, reserve) == 16);
-    assert!(offset_of!(AlmTable, esize) == 24);
-    assert!(offset_of!(AlmTable, mode) == 32);
-    assert!(offset_of!(AlmTable, contains_tables) == 33);
-    assert!(offset_of!(AlmTable, elem_kind) == 34);
-    assert!(offset_of!(AlmTable, sparse_map) == 40);
-    assert!(offset_of!(AlmTable, border) == 48);
+    assert!(size_of::<RawAlmTable>() == size_of::<AlmTable>());
+    assert!(align_of::<RawAlmTable>() == align_of::<AlmTable>());
+
+    macro_rules! assert_abi_offsets {
+        ($( $field:ident == $off:expr ),* $(,)?) => {
+            $(
+                assert!(offset_of!(AlmTable, $field) == $off);
+                assert!(offset_of!(RawAlmTable, $field) == $off);
+            )*
+        };
+    }
+
+    assert_abi_offsets! {
+        data == 0,
+        len == 8,
+        reserve == 16,
+        esize == 24,
+        mode == 32,
+        contains_tables == 33,
+        elem_kind == 34,
+        sparse_map == 40,
+        border == 48,
+    }
 };
 
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 const EXEC_UNREGISTERED: i32 = -2;
-const EXEC_REGISTERING: i32 = -3;
-static EXEC_ID: AtomicI32 = AtomicI32::new(EXEC_UNREGISTERED);
+static EXEC_ID: OnceLock<i32> = OnceLock::new();
 static IS_EXE: AtomicBool = AtomicBool::new(false);
-static LOCAL_LEAK_HOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LOCAL_LEAK_HOOK: Once = Once::new();
 
 #[cfg_attr(miri, allow(dead_code))]
 unsafe extern "C" {
@@ -90,29 +121,13 @@ struct DlInfo {
 #[cfg_attr(miri, allow(dead_code))]
 static MODULE_MARK: u8 = 0;
 
+#[inline]
+fn current_exec_id() -> i32 {
+    EXEC_ID.get().copied().unwrap_or(EXEC_UNREGISTERED)
+}
+
 fn exec_id() -> i32 {
-    match EXEC_ID.load(Ordering::Relaxed) {
-        id if id != EXEC_UNREGISTERED => id,
-        _ => {
-            if EXEC_ID
-                .compare_exchange(
-                    EXEC_UNREGISTERED,
-                    EXEC_REGISTERING,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                while EXEC_ID.load(Ordering::Relaxed) == EXEC_REGISTERING {
-                    std::hint::spin_loop();
-                }
-                return EXEC_ID.load(Ordering::Relaxed);
-            }
-            let id = unsafe { register_now() };
-            EXEC_ID.store(id, Ordering::Relaxed);
-            id
-        }
-    }
+    *EXEC_ID.get_or_init(|| unsafe { register_now() })
 }
 
 // Under Miri the vx sidecar and dladdr are foreign functions the
@@ -159,7 +174,27 @@ pub unsafe extern "C" fn alm_trace_set(slot: u8) {
     }
     #[cfg(not(miri))]
     unsafe {
-        vx_trace_poke_exec(EXEC_ID.load(Ordering::Relaxed), slot)
+        vx_trace_poke_exec(current_exec_id(), slot)
+    };
+}
+
+/// Centralized cold trace-and-abort handler to keep hot paths compact.
+#[cold]
+#[inline(never)]
+fn fatal_abort(trace_slot: Option<u8>, msg: std::fmt::Arguments<'_>) -> ! {
+    if let Some(slot) = trace_slot {
+        unsafe { alm_trace_set(slot) };
+    }
+    eprintln!("{msg}");
+    std::process::abort();
+}
+
+macro_rules! alm_fatal {
+    (trace: $slot:expr, $($arg:tt)*) => {
+        fatal_abort(Some($slot), format_args!($($arg)*))
+    };
+    ($($arg:tt)*) => {
+        fatal_abort(None, format_args!($($arg)*))
     };
 }
 
@@ -209,9 +244,10 @@ const fn span_align(esize: usize) -> usize {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn abort_alloc(bytes: usize) -> ! {
-    eprintln!("alm: table allocation of {bytes} bytes failed");
-    std::process::abort();
+    alm_fatal!("alm: table allocation of {bytes} bytes failed")
 }
 
 #[unsafe(no_mangle)]
@@ -250,12 +286,10 @@ pub unsafe extern "C" fn alm_tbl_new(esize: usize, flags: u8) -> *mut AlmTable {
     let id = exec_id();
     unsafe { mirror_census(id) };
     unsafe { alm_trace_set(TRACE_RT_ALLOC) };
-    if id == -1
-        && LOCAL_LEAK_HOOK
-            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        unsafe { atexit(alm_trace_leak_check) };
+    if id == -1 {
+        LOCAL_LEAK_HOOK.call_once(|| unsafe {
+            atexit(alm_trace_leak_check);
+        });
     }
     hdr
 }
@@ -266,15 +300,15 @@ pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
         unsafe { alm_trace_set(TRACE_RT_RESERVE_NULL) };
         return;
     }
-    let raw_esize = unsafe { ptr::addr_of!((*t).esize).read() };
-    let raw_len = unsafe { ptr::addr_of!((*t).len).read() };
-    let raw_mode = unsafe { ptr::addr_of!((*t).mode).cast::<u8>().read() };
-    if !header_is_sane(raw_esize, raw_len, raw_mode) {
-        eprintln!(
+    let raw = unsafe { t.cast::<RawAlmTable>().read() };
+    if !header_is_sane(raw.esize, raw.len, raw.mode) {
+        alm_fatal!(
             "alm fatal: alm_tbl_reserve called on freed or corrupted AlmTable {:p} (len={}, esize=0x{:x}, mode={})",
-            t, raw_len, raw_esize, raw_mode
+            t,
+            raw.len,
+            raw.esize,
+            raw.mode
         );
-        std::process::abort();
     }
 
     let tbl = unsafe { &mut *t };
@@ -299,8 +333,7 @@ pub unsafe extern "C" fn alm_tbl_reserve(t: *mut AlmTable, n: i64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_tbl_reserve_widened(t: *mut AlmTable, n: i64, k: i64) {
     let Some(widened) = n.checked_add(k) else {
-        eprintln!("alm fatal: reserve overflow (bound={n}, offset={k})");
-        std::process::abort();
+        alm_fatal!("alm fatal: reserve overflow (bound={n}, offset={k})");
     };
     unsafe { alm_tbl_reserve(t, widened) }
 }
@@ -435,9 +468,10 @@ const _: () = {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
     if rhs == 0 {
-        unsafe { alm_trace_set(TRACE_FAIL_DIV_ZERO) };
-        eprintln!("alm runtime error: attempt to perform 'n/0' (integer division by zero)");
-        std::process::abort();
+        alm_fatal!(
+            trace: TRACE_FAIL_DIV_ZERO,
+            "alm runtime error: attempt to perform 'n/0' (integer division by zero)"
+        );
     }
 }
 
@@ -449,9 +483,10 @@ pub unsafe extern "C" fn alm_div_zero_guard(rhs: i64) {
 macro_rules! refuse_null_table {
     ($t:expr) => {
         if $t.is_null() {
-            unsafe { alm_trace_set(TRACE_FAIL_NULL_ROW_STORE) };
-            eprintln!("alm runtime error: attempt to index a nil value (null table row)");
-            std::process::abort();
+            alm_fatal!(
+                trace: TRACE_FAIL_NULL_ROW_STORE,
+                "alm runtime error: attempt to index a nil value (null table row)"
+            );
         }
     };
 }
@@ -471,46 +506,21 @@ macro_rules! null_table_reads_zero {
     };
 }
 
-// The per-repr trampolines behind the one esize dispatch: a family's
-// exported faces differ only in the ownership literal (set vs
-// set_row) or the core fn (index vs str key), so each family has one
-// generic body and the dispatch below varies only the repr.
-unsafe fn store_lane<C: CellRepr>(t: *mut AlmTable, index: i64, val: *const u8, owns_cell: bool) {
-    unsafe { set_core::<C>(t, index, C::load_slot(val), owns_cell) }
-}
-
-unsafe fn load_lane<C: CellRepr>(t: *mut AlmTable, index: i64, dst: *mut u8) {
-    unsafe { C::store_dst(get_core::<C>(t, index), dst) }
-}
-
-unsafe fn store_skey_lane<C: CellRepr>(t: *mut AlmTable, key: i64, val: *const u8) {
-    unsafe { set_skey_core::<C>(t, key, C::load_slot(val)) }
-}
-
-unsafe fn load_skey_lane<C: CellRepr>(t: *mut AlmTable, key: i64, dst: *mut u8) {
-    unsafe { C::store_dst(get_skey_core::<C>(t, key), dst) }
-}
-
 /// The one esize-dispatch law: the three cell reprs (u8, u64, u128
 /// lanes at esize 1, 8, 16) are the whole repr universe, and a header
 /// reading any other esize is corrupt or foreign — the face dies
 /// naming the esize and its own surface ("has no cell repr" here,
-/// "has no register cell face" in the register macro below). The
-/// trampoline arguments are repr-independent, so the dispatch and the
-/// death exist in exactly one copy.
+/// "has no register cell face" in the register macro below).
 macro_rules! esize_dispatch {
     ($t:expr, $lane:ident ($($args:expr),* $(,)?), $surface:literal) => {
         match unsafe { (&*$t).esize } {
             1 => unsafe { $lane::<u8>($($args),*) },
             8 => unsafe { $lane::<u64>($($args),*) },
             16 => unsafe { $lane::<u128>($($args),*) },
-            other => {
-                eprintln!(
-                    concat!("alm runtime error: AlmTable esize {} ", $surface),
-                    other
-                );
-                std::process::abort();
-            }
+            other => alm_fatal!(
+                concat!("alm runtime error: AlmTable esize {} ", $surface),
+                other
+            ),
         }
     };
 }
@@ -521,36 +531,97 @@ macro_rules! esize_register_lane {
     ($t:expr, $body:expr) => {
         match unsafe { (&*$t).esize } {
             16 => $body,
-            other => {
-                eprintln!(
-                    "alm runtime error: AlmTable esize {} has no register cell face",
-                    other
-                );
-                std::process::abort();
-            }
+            other => alm_fatal!(
+                "alm runtime error: AlmTable esize {} has no register cell face",
+                other
+            ),
         }
     };
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_set(t: *mut AlmTable, index: i64, val: *const u8) {
-    // The pooled-handle face: interned strings and closure creation
-    // envs. The destination never owns the cell, so a refused store
-    // drops it (ownership notes in docs/lane_single_brain.md).
-    refuse_null_table!(t);
-    esize_dispatch!(t, store_lane(t, index, val, false), "has no cell repr");
+/// Declarative generator for the entire exported table read/write ABI surface.
+macro_rules! define_table_abi {
+    (
+        ptr_stores: [ $( $(#[$s_meta:meta])* $s_fn:ident => $s_core:ident ($($s_extra:expr),*) ),* $(,)? ],
+        ptr_loads:  [ $( $(#[$l_meta:meta])* $l_fn:ident => $l_core:ident ),* $(,)? ],
+        reg_stores: [ $( $(#[$rs_meta:meta])* $rs_fn:ident => $rs_core:ident ($($rs_extra:expr),*) ),* $(,)? ],
+        reg_loads:  [ $( $(#[$rl_meta:meta])* $rl_fn:ident => $rl_core:ident ),* $(,)? ],
+    ) => {
+        $(
+            $(#[$s_meta])*
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $s_fn(t: *mut AlmTable, key: i64, val: *const u8) {
+                refuse_null_table!(t);
+                unsafe fn lane<C: CellRepr>(t: *mut AlmTable, key: i64, val: *const u8) {
+                    unsafe { $s_core::<C>(t, key, C::load_slot(val) $(, $s_extra)*) }
+                }
+                esize_dispatch!(t, lane(t, key, val), "has no cell repr");
+            }
+        )*
+        $(
+            $(#[$l_meta])*
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $l_fn(t: *mut AlmTable, key: i64, dst: *mut u8, esize: usize) {
+                null_table_reads_zero!(t, dst, esize);
+                unsafe fn lane<C: CellRepr>(t: *mut AlmTable, key: i64, dst: *mut u8) {
+                    unsafe { C::store_dst($l_core::<C>(t, key), dst) }
+                }
+                esize_dispatch!(t, lane(t, key, dst), "has no cell repr");
+            }
+        )*
+        $(
+            $(#[$rs_meta])*
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $rs_fn(t: *mut AlmTable, key: i64, val: i128) {
+                refuse_null_table!(t);
+                esize_register_lane!(
+                    t,
+                    unsafe { $rs_core::<u128>(t, key, val as u128 $(, $rs_extra)*) }
+                );
+            }
+        )*
+        $(
+            $(#[$rl_meta])*
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $rl_fn(t: *mut AlmTable, key: i64) -> i128 {
+                if t.is_null() {
+                    return 0;
+                }
+                esize_register_lane!(t, unsafe { $rl_core::<u128>(t, key) as i128 })
+            }
+        )*
+    };
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_set_row(t: *mut AlmTable, index: i64, val: *const u8) {
-    // The owned-row face: the IR mints this symbol only for `Tbl`
-    // elem stores, and the static pass has already moved the child
-    // into this store's hands. A refused store reclaims the child —
-    // the symbol itself is the proof, so the refuse path never
-    // consults the destination's header bit (env tables set that bit
-    // for borrowed closure faces, so the bit cannot name ownership).
-    refuse_null_table!(t);
-    esize_dispatch!(t, store_lane(t, index, val, true), "has no cell repr");
+define_table_abi! {
+    ptr_stores: [
+        /// The pooled-handle face: interned strings and closure creation
+        /// envs. The destination never owns the cell, so a refused store
+        /// drops it (ownership notes in docs/lane_single_brain.md).
+        alm_tbl_set => set_core(false),
+
+        /// The owned-row face: the IR mints this symbol only for `Tbl`
+        /// elem stores, and the static pass has already moved the child
+        /// into this store's hands. A refused store reclaims the child —
+        /// the symbol itself is the proof, so the refuse path never
+        /// consults the destination's header bit (env tables set that bit
+        /// for borrowed closure faces, so the bit cannot name ownership).
+        alm_tbl_set_row => set_core(true),
+
+        alm_tbl_set_skey => set_skey_core(),
+    ],
+    ptr_loads: [
+        alm_tbl_get => get_core,
+        alm_tbl_get_skey => get_skey_core,
+    ],
+    reg_stores: [
+        alm_tbl_set_any => set_core(false),
+        alm_tbl_set_any_skey => set_skey_core(),
+    ],
+    reg_loads: [
+        alm_tbl_get_any => get_core,
+        alm_tbl_get_any_skey => get_skey_core,
+    ],
 }
 
 unsafe fn set_core<C: CellRepr>(t: *mut AlmTable, index: i64, cell: C, owns_cell: bool) {
@@ -685,12 +756,6 @@ unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
     unsafe { overflow_map(tbl).insert(key, cell.to_lane()) };
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_get(t: *mut AlmTable, index: i64, dst: *mut u8, esize: usize) {
-    null_table_reads_zero!(t, dst, esize);
-    esize_dispatch!(t, load_lane(t, index, dst), "has no cell repr");
-}
-
 unsafe fn get_core<C: CellRepr>(t: *mut AlmTable, index: i64) -> C {
     let tbl = unsafe { &mut *t };
 
@@ -729,51 +794,8 @@ unsafe fn get_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64) -> C {
     C::from_lane(0)
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_set_any(t: *mut AlmTable, index: i64, val: i128) {
-    refuse_null_table!(t);
-    esize_register_lane!(t, unsafe { set_core::<u128>(t, index, val as u128, false) });
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_get_any(t: *mut AlmTable, index: i64) -> i128 {
-    if t.is_null() {
-        return 0;
-    }
-    esize_register_lane!(t, unsafe { get_core::<u128>(t, index) as i128 })
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_set_skey(t: *mut AlmTable, key: i64, val: *const u8) {
-    refuse_null_table!(t);
-    esize_dispatch!(t, store_skey_lane(t, key, val), "has no cell repr");
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_get_skey(t: *mut AlmTable, key: i64, dst: *mut u8, esize: usize) {
-    null_table_reads_zero!(t, dst, esize);
-    esize_dispatch!(t, load_skey_lane(t, key, dst), "has no cell repr");
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_set_any_skey(t: *mut AlmTable, key: i64, val: i128) {
-    refuse_null_table!(t);
-    esize_register_lane!(t, unsafe { set_skey_core::<u128>(t, key, val as u128) });
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn alm_tbl_get_any_skey(t: *mut AlmTable, key: i64) -> i128 {
-    if t.is_null() {
-        return 0;
-    }
-    esize_register_lane!(t, unsafe { get_skey_core::<u128>(t, key) as i128 })
-}
-
 unsafe fn span_grow(tbl: &mut AlmTable, want: i64) {
-    if want < 0 {
-        return;
-    }
-    if want <= tbl.len {
+    if want < 0 || want <= tbl.len {
         return;
     }
     let new_len = want.max(tbl.len.wrapping_mul(2)).max(8);
@@ -847,17 +869,8 @@ fn round_up_page(n: usize) -> usize {
 }
 
 fn vm_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let off = std::env::var_os("ALM_VM").is_some_and(|v| v == "off" || v == "0");
-            STATE.store(if off { 2 } else { 1 }, Ordering::Relaxed);
-            !off
-        }
-    }
+    static STATE: OnceLock<bool> = OnceLock::new();
+    *STATE.get_or_init(|| !std::env::var_os("ALM_VM").is_some_and(|v| v == "off" || v == "0"))
 }
 
 unsafe fn graduate(tbl: &mut AlmTable, new_bytes: usize) {
@@ -949,38 +962,33 @@ fn header_is_sane(esize: usize, len: i64, mode: u8) -> bool {
 }
 
 unsafe fn validate_header_before_free(t: *mut AlmTable, prev_allocs: usize) {
-    let raw_data = unsafe { ptr::addr_of!((*t).data).read() };
-    let raw_len = unsafe { ptr::addr_of!((*t).len).read() };
-    let raw_reserve = unsafe { ptr::addr_of!((*t).reserve).read() };
-    let raw_esize = unsafe { ptr::addr_of!((*t).esize).read() };
-    let raw_mode = unsafe { ptr::addr_of!((*t).mode).cast::<u8>().read() };
-    let raw_contains = unsafe { ptr::addr_of!((*t).contains_tables).read() };
-    let raw_elem_kind = unsafe { ptr::addr_of!((*t).elem_kind).read() };
-    let raw_sparse = unsafe { ptr::addr_of!((*t).sparse_map).read() };
-    let raw_border = unsafe { ptr::addr_of!((*t).border).read() };
+    let raw = unsafe { t.cast::<RawAlmTable>().read() };
 
-    if raw_esize == FREE_POISON_ESIZE {
-        eprintln!(
+    if raw.esize == FREE_POISON_ESIZE {
+        alm_fatal!(
             "alm fatal: DOUBLE FREE of AlmTable header {:p} \
              (tcache next/data={:p}, tcache_key/len=0x{:016x} [{}], prev_alloc_count={})",
-            t, raw_data, raw_len as u64, raw_len, prev_allocs
+            t,
+            raw.data,
+            raw.len as u64,
+            raw.len,
+            prev_allocs
         );
-        std::process::abort();
     }
 
-    let valid_elem_kind = raw_elem_kind <= ALM_ELEM_UNDECIDED;
-    let valid_len = bytes_of(raw_len, raw_esize).is_some();
-    let valid_span = (raw_len == 0 && raw_data.is_null())
-        || (raw_len > 0 && !raw_data.is_null())
-        || raw_mode == 1;
+    let valid_elem_kind = raw.elem_kind <= ALM_ELEM_UNDECIDED;
+    let valid_len = bytes_of(raw.len, raw.esize).is_some();
+    let valid_span = (raw.len == 0 && raw.data.is_null())
+        || (raw.len > 0 && !raw.data.is_null())
+        || raw.mode == 1;
 
     if prev_allocs == 0
-        || !header_is_sane(raw_esize, raw_len, raw_mode)
+        || !header_is_sane(raw.esize, raw.len, raw.mode)
         || !valid_elem_kind
         || !valid_len
         || !valid_span
     {
-        eprintln!(
+        alm_fatal!(
             "alm fatal: corrupted or already-freed AlmTable header at {:p} during free_tbl:\n  \
              prev_alloc_count = {}\n  \
              @0  data            = {:p}\n  \
@@ -994,20 +1002,19 @@ unsafe fn validate_header_before_free(t: *mut AlmTable, prev_allocs: usize) {
              @48 border          = {}",
             t,
             prev_allocs,
-            raw_data,
-            raw_len,
-            raw_len as u64,
-            raw_reserve,
-            raw_reserve,
-            raw_esize,
-            raw_esize,
-            raw_mode,
-            raw_contains,
-            raw_elem_kind,
-            raw_sparse,
-            raw_border,
+            raw.data,
+            raw.len,
+            raw.len as u64,
+            raw.reserve,
+            raw.reserve,
+            raw.esize,
+            raw.esize,
+            raw.mode,
+            raw.contains_tables,
+            raw.elem_kind,
+            raw.sparse_map,
+            raw.border,
         );
-        std::process::abort();
     }
 }
 
@@ -1017,7 +1024,7 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
     }
     unsafe { alm_trace_set(TRACE_RT_FREE) };
     let prev_allocs = ALLOC_COUNT.fetch_sub(1, Ordering::Relaxed);
-    unsafe { mirror_census(EXEC_ID.load(Ordering::Relaxed)) };
+    unsafe { mirror_census(current_exec_id()) };
     unsafe { validate_header_before_free(t, prev_allocs) };
     let mut tbl = unsafe { Box::from_raw(t) };
 
@@ -1047,8 +1054,7 @@ unsafe fn free_tbl(t: *mut AlmTable, keeps: &[*mut AlmTable]) {
             )
         };
     }
-    if tbl.mode == TableMode::Sparse {
-    } else if !tbl.data.is_null() {
+    if tbl.mode != TableMode::Sparse && !tbl.data.is_null() {
         if tbl.reserve != 0 {
             unsafe { munmap(tbl.data.cast(), tbl.reserve) };
         } else {
@@ -1081,13 +1087,7 @@ pub unsafe extern "C" fn alm_print_string(val: *const u8) {
     if val.is_null() {
         return;
     }
-    let mut len = 0usize;
-    unsafe {
-        while *val.add(len) != 0 {
-            len += 1;
-        }
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(val, len) };
+    let bytes = unsafe { cstr_bytes(val) };
     print!("{}", String::from_utf8_lossy(bytes));
 }
 
@@ -1096,13 +1096,7 @@ pub unsafe extern "C" fn alm_str_len(val: *const u8) -> i64 {
     if val.is_null() {
         return 0;
     }
-    let mut len = 0usize;
-    unsafe {
-        while *val.add(len) != 0 {
-            len += 1;
-        }
-    }
-    len as i64
+    unsafe { cstr_bytes(val).len() as i64 }
 }
 
 #[unsafe(no_mangle)]
@@ -1225,13 +1219,6 @@ pub extern "C" fn alm_any_eq(l: i128, r: i128) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alm_any_len(v: i128) -> i64 {
-    let kind_word = |k: i32| match k {
-        ALM_ARG_INT => "int",
-        ALM_ARG_FLOAT => "float",
-        ALM_ARG_BOOL => "bool",
-        ALM_ARG_STRING => "string",
-        _ => "unknown",
-    };
     match any_tag(v) {
         ALM_ARG_STRING => {
             let p = ptr::with_exposed_provenance::<u8>(any_payload(v) as usize);
@@ -1240,15 +1227,12 @@ pub extern "C" fn alm_any_len(v: i128) -> i64 {
             }
             unsafe { alm_str_len(p) }
         }
-        k => {
-            unsafe { alm_trace_set(TRACE_FAIL_ANY_LEN) };
-            eprintln!(
-                "alm runtime error: alm_any_len: '#' demands a string cell, got kind {} ({})",
-                k,
-                kind_word(k)
-            );
-            std::process::abort();
-        }
+        k => alm_fatal!(
+            trace: TRACE_FAIL_ANY_LEN,
+            "alm runtime error: alm_any_len: '#' demands a string cell, got kind {} ({})",
+            k,
+            arg_kind_short(k)
+        ),
     }
 }
 
@@ -1313,65 +1297,108 @@ unsafe fn any_of_word(w: &[u8]) -> i128 {
     }
 }
 
+#[inline]
 unsafe fn cstr_bytes(p: *const u8) -> &'static [u8] {
-    let mut len = 0usize;
-    unsafe {
-        while *p.add(len) != 0 {
-            len += 1;
-        }
-    }
-    unsafe { std::slice::from_raw_parts(p, len) }
+    unsafe { CStr::from_ptr(p.cast()).to_bytes() }
 }
 
 pub const ALM_ARG_NONE: i32 = -1;
-pub const ALM_ARG_INT: i32 = 0;
-pub const ALM_ARG_FLOAT: i32 = 1;
-pub const ALM_ARG_BOOL: i32 = 2;
-pub const ALM_ARG_STRING: i32 = 3;
-pub const ALM_ARG_ANY: i32 = 4;
-
 pub const ALM_ELEM_TABLE: u8 = 5;
 pub const ALM_ELEM_UNDECIDED: u8 = 6;
 
-pub fn arg_kind_of(elem: &crate::AlmElem) -> i32 {
-    match elem {
-        crate::AlmElem::Float => ALM_ARG_FLOAT,
-        crate::AlmElem::Boolean => ALM_ARG_BOOL,
-        crate::AlmElem::String => ALM_ARG_STRING,
-        crate::AlmElem::Any => ALM_ARG_ANY,
-        crate::AlmElem::Integer => ALM_ARG_INT,
-    }
+/// Single source of truth for ALM argument kinds, element mappings,
+/// byte widths, and diagnostic labels.
+macro_rules! define_alm_kinds {
+    ($(
+        $const_name:ident = $id:literal => {
+            elem: $elem:ident,
+            esize: $esize:literal,
+            short: $short:literal,
+            words: $words:literal,
+            table: $table:literal $(,)?
+        }
+    ),* $(,)?) => {
+        $( pub const $const_name: i32 = $id; )*
+
+        pub fn arg_kind_of(elem: &crate::AlmElem) -> i32 {
+            match elem {
+                $( crate::AlmElem::$elem => $const_name, )*
+            }
+        }
+
+        pub fn elem_of_kind(kind: i32) -> Option<crate::AlmElem> {
+            match kind {
+                $( $const_name => Some(crate::AlmElem::$elem), )*
+                _ => None,
+            }
+        }
+
+        const fn arg_kind_esize(kind: i32) -> usize {
+            match kind {
+                $( $const_name => $esize, )*
+                _ => 8,
+            }
+        }
+
+        const fn arg_kind_short(kind: i32) -> &'static str {
+            match kind {
+                $( $const_name => $short, )*
+                _ => "unknown",
+            }
+        }
+
+        const fn arg_kind_words(kind: i32) -> &'static str {
+            match kind {
+                $( $const_name => $words, )*
+                _ => "integers (64-bit)",
+            }
+        }
+
+        const fn arg_kind_table(kind: i32) -> &'static str {
+            match kind {
+                $( $const_name => $table, )*
+                _ => "Table<Integer>",
+            }
+        }
+    };
 }
 
-pub fn elem_of_kind(kind: i32) -> Option<crate::AlmElem> {
-    match kind {
-        ALM_ARG_INT => Some(crate::AlmElem::Integer),
-        ALM_ARG_FLOAT => Some(crate::AlmElem::Float),
-        ALM_ARG_BOOL => Some(crate::AlmElem::Boolean),
-        ALM_ARG_STRING => Some(crate::AlmElem::String),
-        ALM_ARG_ANY => Some(crate::AlmElem::Any),
-        _ => None,
-    }
-}
-
-fn arg_kind_words(kind: i32) -> &'static str {
-    match kind {
-        ALM_ARG_FLOAT => "numbers (64-bit floats)",
-        ALM_ARG_BOOL => "booleans ('true'/'false')",
-        ALM_ARG_STRING => "strings (any word)",
-        ALM_ARG_ANY => "int, float, bool, or string words",
-        _ => "integers (64-bit)",
-    }
-}
-
-fn arg_kind_table(kind: i32) -> &'static str {
-    match kind {
-        ALM_ARG_FLOAT => "Table<Float>",
-        ALM_ARG_BOOL => "Table<Boolean>",
-        ALM_ARG_STRING => "Table<String>",
-        ALM_ARG_ANY => "Table<Any>",
-        _ => "Table<Integer>",
-    }
+define_alm_kinds! {
+    ALM_ARG_INT = 0 => {
+        elem: Integer,
+        esize: 8,
+        short: "int",
+        words: "integers (64-bit)",
+        table: "Table<Integer>",
+    },
+    ALM_ARG_FLOAT = 1 => {
+        elem: Float,
+        esize: 8,
+        short: "float",
+        words: "numbers (64-bit floats)",
+        table: "Table<Float>",
+    },
+    ALM_ARG_BOOL = 2 => {
+        elem: Boolean,
+        esize: 1,
+        short: "bool",
+        words: "booleans ('true'/'false')",
+        table: "Table<Boolean>",
+    },
+    ALM_ARG_STRING = 3 => {
+        elem: String,
+        esize: 8,
+        short: "string",
+        words: "strings (any word)",
+        table: "Table<String>",
+    },
+    ALM_ARG_ANY = 4 => {
+        elem: Any,
+        esize: 16,
+        short: "any",
+        words: "int, float, bool, or string words",
+        table: "Table<Any>",
+    },
 }
 
 unsafe fn set_word(t: *mut AlmTable, i: i64, w: &[u8], kind: i32) -> Result<(), ()> {
@@ -1428,7 +1455,7 @@ unsafe fn exec_main_inner(
     exec: unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable,
 ) -> i32 {
     if kind == ALM_ARG_NONE {
-        let result = exec(std::ptr::null_mut());
+        let result = unsafe { exec(std::ptr::null_mut()) };
         unsafe { alm_tbl_free(result) };
         return 0;
     }
@@ -1441,11 +1468,7 @@ unsafe fn exec_main_inner(
             }
         }
     }
-    let esize = match kind {
-        ALM_ARG_BOOL => 1,
-        ALM_ARG_ANY => 16,
-        _ => 8,
-    };
+    let esize = arg_kind_esize(kind);
     let args = unsafe { alm_tbl_new(esize, ((kind as u8) & 0x07) << 1) };
     for (i, w) in words.iter().enumerate() {
         if unsafe { set_word(args, i as i64, w, kind) }.is_err() {
@@ -1459,7 +1482,7 @@ unsafe fn exec_main_inner(
             return 1;
         }
     }
-    let result = exec(args);
+    let result = unsafe { exec(args) };
     unsafe {
         if result != args {
             alm_tbl_free(args);
@@ -1494,23 +1517,32 @@ unsafe fn ffi_open_path(path: *const u8) -> Vec<u8> {
 unsafe fn ffi_dlsym_or_die(lib: *mut c_void, name: *const u8) -> *mut c_void {
     let sym = unsafe { dlsym(lib, name.cast()) };
     if sym.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_FFI_SYM) };
         let shown = if name.is_null() {
             "(null)".to_string()
         } else {
             String::from_utf8_lossy(unsafe { cstr_bytes(name) }).into_owned()
         };
-        eprintln!("alm fatal: ffi could not find symbol '{shown}' in the loaded module");
-        std::process::abort();
+        alm_fatal!(
+            trace: TRACE_FAIL_FFI_SYM,
+            "alm fatal: ffi could not find symbol '{shown}' in the loaded module"
+        );
     }
     sym
+}
+
+/// Typed `dlsym` resolver with null-library guard.
+unsafe fn ffi_fn<F: Copy>(lib: *mut c_void, sym: *const u8, null_msg: &str) -> F {
+    if lib.is_null() {
+        alm_fatal!("{null_msg}");
+    }
+    let raw = unsafe { ffi_dlsym_or_die(lib, sym) };
+    unsafe { std::mem::transmute_copy::<*mut c_void, F>(&raw) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_ffi_load(path: *const u8) -> *mut c_void {
     if path.is_null() {
-        eprintln!("alm fatal: ffi.load called with a null path");
-        std::process::abort();
+        alm_fatal!("alm fatal: ffi.load called with a null path");
     }
     let prefixed = unsafe { ffi_open_path(path) };
     let direct = prefixed.is_empty();
@@ -1525,7 +1557,6 @@ pub unsafe extern "C" fn alm_ffi_load(path: *const u8) -> *mut c_void {
         )
     };
     if handle.is_null() {
-        unsafe { alm_trace_set(TRACE_FAIL_FFI_LOAD) };
         let err = unsafe {
             let e = dlerror();
             if e.is_null() {
@@ -1534,11 +1565,11 @@ pub unsafe extern "C" fn alm_ffi_load(path: *const u8) -> *mut c_void {
                 String::from_utf8_lossy(cstr_bytes(e.cast())).into_owned()
             }
         };
-        eprintln!(
+        alm_fatal!(
+            trace: TRACE_FAIL_FFI_LOAD,
             "alm fatal: ffi.load could not open '{}' ({err})",
             String::from_utf8_lossy(unsafe { cstr_bytes(path) }),
         );
-        std::process::abort();
     }
     unsafe { alm_trace_set(TRACE_RT_FFI_LOAD) };
     handle
@@ -1546,24 +1577,23 @@ pub unsafe extern "C" fn alm_ffi_load(path: *const u8) -> *mut c_void {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_ffi_arg_kind(lib: *mut c_void) -> i64 {
-    if lib.is_null() {
-        eprintln!("alm fatal: ffi use of a null library handle");
-        std::process::abort();
-    }
-    let sym = unsafe { ffi_dlsym_or_die(lib, c"alm_arg_kind".as_ptr() as *const u8) };
-    let f = unsafe { std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn() -> i32>(&sym) };
+    let f = unsafe {
+        ffi_fn::<unsafe extern "C" fn() -> i32>(
+            lib,
+            c"alm_arg_kind".as_ptr().cast(),
+            "alm fatal: ffi use of a null library handle",
+        )
+    };
     unsafe { f() as i64 }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_ffi_call(lib: *mut c_void, sym: *const u8, arg: *mut AlmTable) {
-    if lib.is_null() {
-        eprintln!("alm fatal: ffi call on a null library handle");
-        std::process::abort();
-    }
     let exec = unsafe {
-        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable>(
-            &ffi_dlsym_or_die(lib, sym),
+        ffi_fn::<unsafe extern "C" fn(*mut AlmTable) -> *mut AlmTable>(
+            lib,
+            sym,
+            "alm fatal: ffi call on a null library handle",
         )
     };
     let result = unsafe { exec(arg) };
@@ -1571,8 +1601,10 @@ pub unsafe extern "C" fn alm_ffi_call(lib: *mut c_void, sym: *const u8, arg: *mu
         return;
     }
     let free_fn = unsafe {
-        std::mem::transmute_copy::<*mut c_void, unsafe extern "C" fn(*mut AlmTable)>(
-            &ffi_dlsym_or_die(lib, c"alm_tbl_free".as_ptr() as *const u8),
+        ffi_fn::<unsafe extern "C" fn(*mut AlmTable)>(
+            lib,
+            c"alm_tbl_free".as_ptr().cast(),
+            "alm fatal: ffi call on a null library handle",
         )
     };
     unsafe { free_fn(result) };
@@ -1600,7 +1632,7 @@ pub extern "C" fn sys_exec_count() -> i64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn alm_rt_exec_id() -> i32 {
-    EXEC_ID.load(Ordering::Relaxed)
+    current_exec_id()
 }
 
 #[unsafe(no_mangle)]
@@ -1616,13 +1648,12 @@ pub unsafe extern "C" fn alm_coro_create(lib: *mut c_void) -> i64 {
 pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
     let id = co as i32;
     if id < 0 {
-        unsafe { alm_trace_set(TRACE_FAIL_CORO_CREATE) };
-        eprintln!(
+        alm_fatal!(
+            trace: TRACE_FAIL_CORO_CREATE,
             "alm fatal: coroutine.resume on handle {co} — the coroutine registry \
              was exhausted at create time (all lanes live); test \
              coroutine.create's result before resuming"
         );
-        std::process::abort();
     }
     if unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
         let mut lanes = [0u64; 3];
@@ -1653,13 +1684,12 @@ pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
 pub unsafe extern "C" fn alm_coro_yield(value: i64) -> i64 {
     let r = unsafe { vx_coro_yield(value as u64) };
     if r == -2 {
-        unsafe { alm_trace_set(TRACE_FAIL_CORO_YIELD_RESERVED) };
-        eprintln!(
+        alm_fatal!(
+            trace: TRACE_FAIL_CORO_YIELD_RESERVED,
             "alm fatal: coroutine.yield of {value} — the drain word (i64::MIN) is \
              reserved: a drained lane answers it, and only a drained lane, at \
              coroutine.resume; stream any other i64"
         );
-        std::process::abort();
     }
     unsafe {
         alm_trace_set(if r < 0 {
