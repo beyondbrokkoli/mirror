@@ -86,7 +86,7 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
-                                fn lower_ffi_call(
+    fn lower_ffi_call(
         &mut self,
         call: &Expr,
         args: &[Expr],
