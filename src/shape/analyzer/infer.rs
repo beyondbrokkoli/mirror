@@ -25,7 +25,24 @@ pub(super) fn num_of(expr: &Expr) -> NumExpr {
             right,
             ..
         } => NumExpr::Mul(Box::new(num_of(left)), Box::new(num_of(right))),
-        _ => NumExpr::Other,
+        // C: only sums and products of literals/names carry numeric
+        // knowledge; every other operator and every non-numeric form is
+        // the unknowable
+        Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::Index { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => NumExpr::Other,
     }
 }
 
@@ -186,6 +203,10 @@ pub(super) fn guard_only_ascends(
             {
                 return false;
             }
+            // everything else leaves the guard untouched: the other
+            // statements (LocalDecl, IndexAssign, Print, Expr, Return,
+            // Break), non-guard Assignments, and an If whose branches
+            // both ascend (checked in the arm above)
             _ => {}
         }
     }
@@ -984,6 +1005,8 @@ impl Analyzer {
                         Expr::Index { .. } => {
                             nested_fills.insert(table_name.clone());
                         }
+                        // unreachable in practice: get_base_identifier
+                        // returned Some, so obj is a base — defensive only
                         _ => {}
                     }
                 }
@@ -999,7 +1022,16 @@ impl Analyzer {
                         collect_fills(then_body, guard, index_base, mutated, fills, nested_fills);
                         collect_fills(else_body, guard, index_base, mutated, fills, nested_fills);
                     }
-                    _ => {}
+                    // non-nesting statements own no fill facts: decls,
+                    // stores (checked above), prints, exprs, returns,
+                    // breaks — their expressions cannot be a fill
+                    Stmt::LocalDecl { .. }
+                    | Stmt::IndexAssign { .. }
+                    | Stmt::Assignment { .. }
+                    | Stmt::Print { .. }
+                    | Stmt::Expr { .. }
+                    | Stmt::Return { .. }
+                    | Stmt::Break { .. } => {}
                 }
             }
         }
@@ -1094,123 +1126,146 @@ impl Analyzer {
         }
     }
 
+    /// Assignment names a body may mutate — rides the traversal engine.
+    /// A function literal's body is not its enclosing scope's mutation
+    /// (the assignment lane reaches it through the call edge).
     pub(super) fn collect_mutated_names(&self, rec: Gate, stmts: &[Stmt]) -> BTreeSet<String> {
-        let mut mutated = BTreeSet::new();
-        for s in stmts {
-            match s {
-                Stmt::Assignment { name, .. } => {
-                    signal!(rec.on(), trace::TRACE_MUT_ASSIGN);
-                    mutated.insert(name.clone());
-                }
-                Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                    mutated.extend(self.collect_mutated_names(rec, body));
-                }
-                Stmt::If {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    signal!(rec.on(), trace::TRACE_MUT_IF);
-                    mutated.extend(self.collect_mutated_names(rec, then_body));
-                    mutated.extend(self.collect_mutated_names(rec, else_body));
-                }
-                _ => {}
+        struct Mutated {
+            rec: Gate,
+            out: BTreeSet<String>,
+        }
+        impl crate::visit::Visitor for Mutated {
+            type Break = std::convert::Infallible;
+            fn visit_assignment(
+                &mut self,
+                name: &str,
+                expr: &Expr,
+                _loc: crate::ast::Loc,
+                _id: NodeId,
+            ) -> Result<(), Self::Break> {
+                signal!(self.rec.on(), trace::TRACE_MUT_ASSIGN);
+                self.out.insert(name.to_string());
+                let _ = crate::visit::walk_expr(self, expr);
+                Ok(())
+            }
+            fn visit_function(
+                &mut self,
+                _params: &[String],
+                _body: &[Stmt],
+                _id: NodeId,
+            ) -> Result<(), Self::Break> {
+                Ok(())
             }
         }
-        mutated
+        let mut v = Mutated {
+            rec,
+            out: BTreeSet::new(),
+        };
+        let _ = crate::visit::walk_stmts(&mut v, stmts);
+        v.out
+    }
+}
+
+/// Identifiers an expression reads — rides the traversal engine.
+struct IdentsOf {
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for IdentsOf {
+    type Break = std::convert::Infallible;
+
+    fn visit_identifier(&mut self, name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        self.out.insert(name.to_string());
+        Ok(())
+    }
+
+    // NOTE historical shape: the hand walker never descended a Field's
+    // obj — kept bit-for-bit for the goldens.
+    fn visit_field(&mut self, _obj: &Expr, _name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        Ok(())
     }
 }
 
 fn idents_of(expr: &Expr) -> BTreeSet<String> {
-    fn go(expr: &Expr, out: &mut BTreeSet<String>) {
-        match expr {
-            Expr::Identifier { name, .. } => {
-                out.insert(name.clone());
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                go(left, out);
-                go(right, out);
-            }
-            Expr::UnaryOp { expr, .. } => go(expr, out),
-            Expr::Index { obj, key, .. } => {
-                go(obj, out);
-                go(key, out);
-            }
-            Expr::Call { callee, args, .. } => {
-                go(callee, out);
-                for a in args {
-                    go(a, out);
-                }
-            }
-            _ => {}
+    let mut v = IdentsOf {
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_expr(&mut v, expr);
+    v.out
+}
+
+/// Bases stored into by a body — rides the traversal engine; function
+/// literals inside expressions are not this body's stores.
+struct IndexAssignBases {
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for IndexAssignBases {
+    type Break = std::convert::Infallible;
+
+    fn visit_index_assign(
+        &mut self,
+        obj: &Expr,
+        key: &Expr,
+        value: &Expr,
+        _loc: crate::ast::Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        if let Some(base) = get_base_identifier(obj) {
+            self.out.insert(base.clone());
         }
+        let _ = crate::visit::walk_expr(self, obj);
+        let _ = crate::visit::walk_expr(self, key);
+        let _ = crate::visit::walk_expr(self, value);
+        Ok(())
     }
-    let mut out = BTreeSet::new();
-    go(expr, &mut out);
-    out
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
+    }
 }
 
 fn collect_index_assign_bases(stmts: &[Stmt]) -> BTreeSet<String> {
-    let mut stored = BTreeSet::new();
-    for stmt in stmts {
-        match stmt {
-            Stmt::IndexAssign { obj, .. } => {
-                if let Some(base) = get_base_identifier(obj) {
-                    stored.insert(base.clone());
-                }
-            }
-            Stmt::While { body, .. } | Stmt::Do { body, .. } => {
-                stored.extend(collect_index_assign_bases(body));
-            }
-            Stmt::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                stored.extend(collect_index_assign_bases(then_body));
-                stored.extend(collect_index_assign_bases(else_body));
-            }
-            _ => {}
-        }
-    }
-    stored
+    let mut v = IndexAssignBases {
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    v.out
 }
 
-fn expr_has_call(expr: &Expr) -> bool {
-    match expr {
-        Expr::Call { .. } => true,
-        Expr::BinaryOp { left, right, .. } => expr_has_call(left) || expr_has_call(right),
-        Expr::UnaryOp { expr, .. } => expr_has_call(expr),
-        Expr::Index { obj, key, .. } => expr_has_call(obj) || expr_has_call(key),
-        Expr::Field { obj, .. } => expr_has_call(obj),
-        Expr::TableCtor { entries, .. } => entries
-            .iter()
-            .any(|(k, v)| matches!(k, CtorKey::Expr(ke) if expr_has_call(ke)) || expr_has_call(v)),
-        _ => false,
+/// Whether any call occurs — rides the traversal engine; function
+/// literal bodies are separate scopes, not calls in this one.
+struct HasCall(bool);
+
+impl crate::visit::Visitor for HasCall {
+    type Break = std::convert::Infallible;
+
+    fn visit_call(&mut self, callee: &Expr, args: &[Expr], _id: NodeId) -> Result<(), Self::Break> {
+        self.0 = true;
+        let _ = crate::visit::walk_expr(self, callee);
+        for a in args {
+            let _ = crate::visit::walk_expr(self, a);
+        }
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
     }
 }
 
 fn body_has_call(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-            exprs.iter().any(expr_has_call)
-        }
-        Stmt::Assignment { expr, .. } => expr_has_call(expr),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => expr_has_call(obj) || expr_has_call(key) || expr_has_call(value),
-        Stmt::While {
-            condition, body, ..
-        } => expr_has_call(condition) || body_has_call(body),
-        Stmt::Do { body, .. } => body_has_call(body),
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => expr_has_call(condition) || body_has_call(then_body) || body_has_call(else_body),
-        Stmt::Expr { expr, .. } => expr_has_call(expr),
-        Stmt::Return { value: Some(e), .. } => expr_has_call(e),
-        _ => false,
-    })
+    let mut v = HasCall(false);
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    v.0
 }

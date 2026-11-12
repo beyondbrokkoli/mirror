@@ -160,163 +160,103 @@ struct LayoutFactsState {
     verdicts: Vec<LayoutVerdict>,
 }
 
+/// The ctor sites a body mentions — rides the traversal engine; the site
+/// read at every expression is the enter_expr hook.
+struct BodySites<'a> {
+    sites: &'a BTreeMap<NodeId, usize>,
+    out: BTreeSet<usize>,
+}
+
+impl crate::visit::Visitor for BodySites<'_> {
+    type Break = std::convert::Infallible;
+
+    fn enter_expr(&mut self, expr: &Expr) -> Result<(), Self::Break> {
+        if let Some(&id) = self.sites.get(&expr.id()) {
+            self.out.insert(id);
+        }
+        Ok(())
+    }
+
+    // NOTE historical shape: the hand walker never descended a Field's
+    // obj (a ctor inside `t[..].k` went unseen). Kept bit-for-bit — the
+    // goldens lock it; revisit as its own change if ever needed.
+    fn visit_field(&mut self, _obj: &Expr, _name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        Ok(())
+    }
+}
+
 fn collect_body_sites(stmts: &[Stmt], sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
-    fn walk_stmt(s: &Stmt, sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
-        match s {
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-                exprs.iter().for_each(|e| walk_expr(e, sites, out))
-            }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => walk_expr(expr, sites, out),
-            Stmt::Break { .. } => {}
-            Stmt::IndexAssign {
-                obj, key, value, ..
-            } => {
-                walk_expr(obj, sites, out);
-                walk_expr(key, sites, out);
-                walk_expr(value, sites, out);
-            }
-            Stmt::While {
-                condition, body, ..
-            } => {
-                walk_expr(condition, sites, out);
-                body.iter().for_each(|s| walk_stmt(s, sites, out));
-            }
-            Stmt::Do { body, .. } => body.iter().for_each(|s| walk_stmt(s, sites, out)),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => {
-                walk_expr(condition, sites, out);
-                then_body.iter().for_each(|s| walk_stmt(s, sites, out));
-                else_body.iter().for_each(|s| walk_stmt(s, sites, out));
-            }
-            Stmt::Return { value, .. } => {
-                if let Some(e) = value {
-                    walk_expr(e, sites, out);
-                }
-            }
+    let mut v = BodySites {
+        sites,
+        out: std::mem::take(out),
+    };
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    *out = v.out;
+}
+
+/// Bases stored into by a body — rides the traversal engine; the base of
+/// every IndexAssign obj is read before its children.
+struct StoredBases {
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for StoredBases {
+    type Break = std::convert::Infallible;
+
+    fn visit_index_assign(
+        &mut self,
+        obj: &Expr,
+        key: &Expr,
+        value: &Expr,
+        _loc: crate::ast::Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        if let Some(base) = stmt_base(obj) {
+            self.out.insert(base);
         }
+        crate::visit::walk_expr(self, obj)?;
+        crate::visit::walk_expr(self, key)?;
+        crate::visit::walk_expr(self, value)
     }
-    fn walk_expr(e: &Expr, sites: &BTreeMap<NodeId, usize>, out: &mut BTreeSet<usize>) {
-        if let Some(&id) = sites.get(&e.id()) {
-            out.insert(id);
-        }
-        match e {
-            Expr::TableCtor { entries, .. } => {
-                for (k, v) in entries {
-                    if let CtorKey::Expr(ke) = k {
-                        walk_expr(ke, sites, out);
-                    }
-                    walk_expr(v, sites, out);
-                }
-            }
-            Expr::Index { obj, key, .. } => {
-                walk_expr(obj, sites, out);
-                walk_expr(key, sites, out);
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                walk_expr(left, sites, out);
-                walk_expr(right, sites, out);
-            }
-            Expr::UnaryOp { expr, .. } => walk_expr(expr, sites, out),
-            Expr::Call { callee, args, .. } => {
-                walk_expr(callee, sites, out);
-                args.iter().for_each(|a| walk_expr(a, sites, out));
-            }
-            Expr::Function { body, .. } => body.iter().for_each(|s| walk_stmt(s, sites, out)),
-            _ => {}
-        }
+
+    // NOTE historical shape: same Field-obj blindness as the body-sites
+    // scan above — kept bit-for-bit for the goldens.
+    fn visit_field(&mut self, _obj: &Expr, _name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        Ok(())
     }
-    stmts.iter().for_each(|s| walk_stmt(s, sites, out));
+}
+
+fn stmt_base(e: &Expr) -> Option<String> {
+    // C: index-chain classifier — only an Identifier or an Index spine
+    // names a base
+    match e {
+        Expr::Identifier { name: n, .. } => Some(n.clone()),
+        Expr::Index { obj, .. } => stmt_base(obj),
+        // C: every other expression form is not an lvalue base
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::TableCtor { .. }
+        | Expr::BinaryOp { .. }
+        | Expr::UnaryOp { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. }
+        | Expr::Field { .. }
+        | Expr::Function { .. }
+        | Expr::Call { .. } => None,
+    }
 }
 
 fn collect_stored_bases(stmts: &[Stmt]) -> BTreeSet<String> {
-    fn walk_stmt(s: &Stmt, out: &mut BTreeSet<String>) {
-        match s {
-            Stmt::IndexAssign { obj, .. } => {
-                if let Some(base) = stmt_base(obj) {
-                    out.insert(base);
-                }
-                walk_obj_value(s, out);
-            }
-            Stmt::LocalDecl { exprs, .. } | Stmt::Print { exprs, .. } => {
-                exprs.iter().for_each(|e| walk_expr(e, out))
-            }
-            Stmt::Assignment { expr, .. } | Stmt::Expr { expr, .. } => walk_expr(expr, out),
-            Stmt::While {
-                condition, body, ..
-            } => {
-                walk_expr(condition, out);
-                body.iter().for_each(|s| walk_stmt(s, out));
-            }
-            Stmt::Do { body, .. } => body.iter().for_each(|s| walk_stmt(s, out)),
-            Stmt::If {
-                condition,
-                then_body,
-                else_body,
-                ..
-            } => {
-                walk_expr(condition, out);
-                then_body.iter().for_each(|s| walk_stmt(s, out));
-                else_body.iter().for_each(|s| walk_stmt(s, out));
-            }
-            Stmt::Return { value, .. } => {
-                if let Some(e) = value {
-                    walk_expr(e, out);
-                }
-            }
-            Stmt::Break { .. } => {}
-        }
-    }
-    fn walk_obj_value(s: &Stmt, out: &mut BTreeSet<String>) {
-        if let Stmt::IndexAssign {
-            obj, key, value, ..
-        } = s
-        {
-            walk_expr(obj, out);
-            walk_expr(key, out);
-            walk_expr(value, out);
-        }
-    }
-    fn walk_expr(e: &Expr, out: &mut BTreeSet<String>) {
-        match e {
-            Expr::TableCtor { entries, .. } => {
-                for (k, v) in entries {
-                    if let CtorKey::Expr(ke) = k {
-                        walk_expr(ke, out);
-                    }
-                    walk_expr(v, out);
-                }
-            }
-            Expr::Index { obj, key, .. } => {
-                walk_expr(obj, out);
-                walk_expr(key, out);
-            }
-            Expr::BinaryOp { left, right, .. } => {
-                walk_expr(left, out);
-                walk_expr(right, out);
-            }
-            Expr::UnaryOp { expr, .. } => walk_expr(expr, out),
-            Expr::Call { callee, args, .. } => {
-                walk_expr(callee, out);
-                args.iter().for_each(|a| walk_expr(a, out));
-            }
-            Expr::Function { body, .. } => body.iter().for_each(|s| walk_stmt(s, out)),
-            _ => {}
-        }
-    }
-    fn stmt_base(e: &Expr) -> Option<String> {
-        match e {
-            Expr::Identifier { name: n, .. } => Some(n.clone()),
-            Expr::Index { obj, .. } => stmt_base(obj),
-            _ => None,
-        }
-    }
-    let mut out = BTreeSet::new();
-    stmts.iter().for_each(|s| walk_stmt(s, &mut out));
-    out
+    let mut v = StoredBases {
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    v.out
 }
 
 struct Analyzer {

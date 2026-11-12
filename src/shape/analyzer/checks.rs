@@ -88,12 +88,28 @@ impl Analyzer {
                 self.check_uses(rec, right)?;
             }
             Expr::Call { args, .. } => {
+                // the callee itself is inference's lane (infer_expr
+                // resolves and checks it); only the argument values are
+                // use-checked here
                 for a in args {
                     self.check_uses(rec, a)?;
                 }
             }
-            Expr::Function { .. } => {}
-            _ => {}
+            // checked by inference on its own lane: function literals
+            // (their bodies walk with the fn frame), Field objects (the
+            // receiver's use is checked where the field read is typed),
+            // and the leaves carry no names to use
+            Expr::Function { .. }
+            | Expr::Field { .. }
+            | Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. } => {}
         }
         Ok(())
     }

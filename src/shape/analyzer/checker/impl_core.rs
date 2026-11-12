@@ -158,7 +158,16 @@ impl Checker {
                 Stmt::While { body, .. } | Stmt::Do { body, .. } => {
                     self.collect_nested_fn_defs(lat, body);
                 }
-                _ => {}
+                // these statements own no nested fn declarations at
+                // their top level, and deeper expressions are not
+                // scanned: a function literal anywhere but the whole
+                // value of an Assignment or a LocalDecl expr is not a
+                // declaration this collection claims
+                Stmt::IndexAssign { .. }
+                | Stmt::Print { .. }
+                | Stmt::Expr { .. }
+                | Stmt::Return { .. }
+                | Stmt::Break { .. } => {}
             }
         }
     }

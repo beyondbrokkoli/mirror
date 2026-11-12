@@ -1,226 +1,148 @@
 use super::*;
+use crate::ast::Loc;
 
-fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
-    match stmt {
-        Stmt::LocalDecl { exprs, .. } => {
-            for expr in exprs {
-                collect_creation_reads_expr(expr, out);
-            }
+/// Names read by a creation site — rides the traversal engine. Two laws
+/// carried over from the hand walker: a function literal's body is not
+/// descended (its reads belong to the closure's own accounting), and a
+/// direct-identifier callee is a call, not a read.
+struct CreationReads {
+    out: Vec<String>,
+}
+
+impl crate::visit::Visitor for CreationReads {
+    type Break = std::convert::Infallible;
+
+    fn visit_identifier(&mut self, name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        self.out.push(name.to_string());
+        Ok(())
+    }
+
+    fn visit_call(&mut self, callee: &Expr, args: &[Expr], _id: NodeId) -> Result<(), Self::Break> {
+        if !matches!(callee, Expr::Identifier { .. }) {
+            crate::visit::walk_expr(self, callee)?;
         }
-        Stmt::Assignment { expr, .. } => collect_creation_reads_expr(expr, out),
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            collect_creation_reads_expr(obj, out);
-            collect_creation_reads_expr(key, out);
-            collect_creation_reads_expr(value, out);
+        for a in args {
+            crate::visit::walk_expr(self, a)?;
         }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            collect_creation_reads_expr(condition, out);
-            for s in body {
-                collect_creation_reads_stmt(s, out);
-            }
-        }
-        Stmt::Do { body, .. } => {
-            for s in body {
-                collect_creation_reads_stmt(s, out);
-            }
-        }
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            collect_creation_reads_expr(condition, out);
-            for s in then_body.iter().chain(else_body.iter()) {
-                collect_creation_reads_stmt(s, out);
-            }
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                collect_creation_reads_expr(e, out);
-            }
-        }
-        Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                collect_creation_reads_expr(e, out);
-            }
-        }
-        Stmt::Expr { expr, .. } => collect_creation_reads_expr(expr, out),
-        Stmt::Break { .. } => {}
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        _params: &[String],
+        _body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        Ok(())
     }
 }
 
-fn collect_creation_reads_expr(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Identifier { name: n, .. } => out.push(n.clone()),
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    collect_creation_reads_expr(ke, out);
-                }
-                collect_creation_reads_expr(v, out);
-            }
+fn collect_creation_reads_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+    let mut v = CreationReads {
+        out: std::mem::take(out),
+    };
+    let _ = crate::visit::walk_stmt(&mut v, stmt);
+    *out = v.out;
+}
+
+/// Free names of a body, transitively — rides the traversal engine with
+/// the bound-set as visitor state. If branches walk on independent clones
+/// (a binding in one arm must not satisfy the other); a function literal
+/// binds its params for its body only.
+struct FreeNames {
+    bound: BTreeSet<String>,
+    out: BTreeSet<String>,
+}
+
+impl crate::visit::Visitor for FreeNames {
+    type Break = std::convert::Infallible;
+
+    fn visit_identifier(&mut self, name: &str, _id: NodeId) -> Result<(), Self::Break> {
+        if !self.bound.contains(name) {
+            self.out.insert(name.to_string());
         }
-        Expr::Index { obj, key, .. } => {
-            collect_creation_reads_expr(obj, out);
-            collect_creation_reads_expr(key, out);
+        Ok(())
+    }
+
+    fn visit_local_decl(
+        &mut self,
+        names: &[String],
+        exprs: &[Expr],
+        _loc: Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        for e in exprs {
+            crate::visit::walk_expr(self, e)?;
         }
-        Expr::Field { obj, .. } => collect_creation_reads_expr(obj, out),
-        Expr::BinaryOp { left, right, .. } => {
-            collect_creation_reads_expr(left, out);
-            collect_creation_reads_expr(right, out);
+        for name in names {
+            self.bound.insert(name.clone());
         }
-        Expr::UnaryOp { expr, .. } => collect_creation_reads_expr(expr, out),
-        Expr::Call { callee, args, .. } => {
-            if !matches!(callee.as_ref(), Expr::Identifier { .. }) {
-                collect_creation_reads_expr(callee, out);
-            }
-            for a in args {
-                collect_creation_reads_expr(a, out);
-            }
+        Ok(())
+    }
+
+    fn visit_assignment(
+        &mut self,
+        name: &str,
+        expr: &Expr,
+        _loc: Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        crate::visit::walk_expr(self, expr)?;
+        if !self.bound.contains(name) {
+            self.out.insert(name.to_string());
         }
-        Expr::Function { .. } => {}
-        Expr::Integer { .. }
-        | Expr::Float { .. }
-        | Expr::Boolean { .. }
-        | Expr::String { .. }
-        | Expr::Nil { .. }
-        | Expr::SysAllocCount { .. }
-        | Expr::SysExecCount { .. }
-        | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. } => {}
+        Ok(())
+    }
+
+    fn visit_if(
+        &mut self,
+        condition: &Expr,
+        then_body: &[Stmt],
+        else_body: &[Stmt],
+        _loc: Loc,
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        crate::visit::walk_expr(self, condition)?;
+        let entry = self.bound.clone();
+        crate::visit::walk_stmts(self, then_body)?;
+        self.bound = entry.clone();
+        crate::visit::walk_stmts(self, else_body)?;
+        self.bound = entry;
+        Ok(())
+    }
+
+    fn visit_call(&mut self, callee: &Expr, args: &[Expr], _id: NodeId) -> Result<(), Self::Break> {
+        if !matches!(callee, Expr::Identifier { .. }) {
+            crate::visit::walk_expr(self, callee)?;
+        }
+        for a in args {
+            crate::visit::walk_expr(self, a)?;
+        }
+        Ok(())
+    }
+
+    fn visit_function(
+        &mut self,
+        params: &[String],
+        body: &[Stmt],
+        _id: NodeId,
+    ) -> Result<(), Self::Break> {
+        let saved = self.bound.clone();
+        self.bound.extend(params.iter().cloned());
+        let _ = crate::visit::walk_stmts(self, body);
+        self.bound = saved;
+        Ok(())
     }
 }
 
 fn transitive_free_names(stmts: &[Stmt], bound: &mut BTreeSet<String>) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    for stmt in stmts {
-        free_of_stmt(stmt, bound, &mut out);
-    }
-    out
-}
-
-fn free_of_stmt(stmt: &Stmt, bound: &mut BTreeSet<String>, out: &mut BTreeSet<String>) {
-    match stmt {
-        Stmt::LocalDecl { names, exprs, .. } => {
-            for expr in exprs {
-                free_of_expr(expr, bound, out);
-            }
-            for name in names {
-                bound.insert(name.clone());
-            }
-        }
-        Stmt::Assignment { name, expr, .. } => {
-            free_of_expr(expr, bound, out);
-            if !bound.contains(name) {
-                out.insert(name.clone());
-            }
-        }
-        Stmt::IndexAssign {
-            obj, key, value, ..
-        } => {
-            free_of_expr(obj, bound, out);
-            free_of_expr(key, bound, out);
-            free_of_expr(value, bound, out);
-        }
-        Stmt::While {
-            condition, body, ..
-        } => {
-            free_of_expr(condition, bound, out);
-            for s in body {
-                free_of_stmt(s, bound, out);
-            }
-        }
-        Stmt::Do { body, .. } => {
-            for s in body {
-                free_of_stmt(s, bound, out);
-            }
-        }
-        Stmt::If {
-            condition,
-            then_body,
-            else_body,
-            ..
-        } => {
-            free_of_expr(condition, bound, out);
-            let mut then_bound = bound.clone();
-            for s in then_body {
-                free_of_stmt(s, &mut then_bound, out);
-            }
-            let mut else_bound = bound.clone();
-            for s in else_body {
-                free_of_stmt(s, &mut else_bound, out);
-            }
-        }
-        Stmt::Return { value, .. } => {
-            if let Some(e) = value {
-                free_of_expr(e, bound, out);
-            }
-        }
-        Stmt::Print { exprs, .. } => {
-            for e in exprs {
-                free_of_expr(e, bound, out);
-            }
-        }
-        Stmt::Break { .. } => {}
-        Stmt::Expr { expr, .. } => free_of_expr(expr, bound, out),
-    }
-}
-
-fn free_of_expr(expr: &Expr, bound: &BTreeSet<String>, out: &mut BTreeSet<String>) {
-    match expr {
-        Expr::Identifier { name: n, .. } => {
-            if !bound.contains(n) {
-                out.insert(n.clone());
-            }
-        }
-        Expr::Integer { .. }
-        | Expr::Float { .. }
-        | Expr::Boolean { .. }
-        | Expr::String { .. }
-        | Expr::Nil { .. } => {}
-        Expr::TableCtor { entries, .. } => {
-            for (k, v) in entries {
-                if let CtorKey::Expr(ke) = k {
-                    free_of_expr(ke, bound, out);
-                }
-                free_of_expr(v, bound, out);
-            }
-        }
-        Expr::Index { obj, key, .. } => {
-            free_of_expr(obj, bound, out);
-            free_of_expr(key, bound, out);
-        }
-        Expr::Field { obj, .. } => free_of_expr(obj, bound, out),
-        Expr::BinaryOp { left, right, .. } => {
-            free_of_expr(left, bound, out);
-            free_of_expr(right, bound, out);
-        }
-        Expr::UnaryOp { expr, .. } => free_of_expr(expr, bound, out),
-        Expr::Call { callee, args, .. } => {
-            if !matches!(callee.as_ref(), Expr::Identifier { .. }) {
-                free_of_expr(callee, bound, out);
-            }
-            for a in args {
-                free_of_expr(a, bound, out);
-            }
-        }
-        Expr::Function { params, body, .. } => {
-            let mut hole = bound.clone();
-            hole.extend(params.iter().cloned());
-            for s in body {
-                free_of_stmt(s, &mut hole, out);
-            }
-        }
-        Expr::SysAllocCount { .. }
-        | Expr::SysExecCount { .. }
-        | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. } => {}
-    }
+    let mut v = FreeNames {
+        bound: std::mem::take(bound),
+        out: BTreeSet::new(),
+    };
+    let _ = crate::visit::walk_stmts(&mut v, stmts);
+    *bound = v.bound;
+    v.out
 }
 
 impl Analyzer {
@@ -393,8 +315,11 @@ impl Analyzer {
                     }
                     out
                 }
+                // C: only a direct-name callee resolves — every other
+                // callee shape has no param reach to trace
                 _ => BTreeSet::new(),
             },
+            // C: only identifiers and calls carry a param's value out
             _ => BTreeSet::new(),
         }
     }
@@ -475,6 +400,7 @@ impl Analyzer {
                         );
                     }
                 }
+                // C: any other base is neither a fresh ctor nor a fn return
                 _ => {}
             }
             self.ret_base_temp_sites(obj, out);
