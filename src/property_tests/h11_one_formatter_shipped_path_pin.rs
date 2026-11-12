@@ -47,11 +47,11 @@ fn h11_one_formatter_shipped_path_pin() {
              (table site #0)",
         ),
         (
-            "local ffi = require(\"ffi\")\nffi.cdef(\"void* alm_exec(void*);\")\n",
+            "local ffi = require(\"ffi\")\nlocal lib = ffi.load(\"libm.so\")\n",
             Stage::Ffi,
-            "alm compiler error: the ffi surface (require(\"ffi\") / ffi.load / \
-             lib.sym) is --exe-only — rebuild with --exe; a shared object loading \
-             shared objects is not acyclic destiny",
+            "alm compiler error: ffi.load is --exe-only — a shared object \
+             may not load shared objects (the callee seam: a .so exposes \
+             alm_arg_kind/alm_exec, it never loads)",
         ),
     ];
     for (source, want_stage, golden) in faces {

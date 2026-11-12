@@ -45,7 +45,7 @@ impl Stage {
             Stage::Panicked => "panicked",
             Stage::Front => "front (lexer/parser)",
             Stage::Modules => "require splice (module amalgamation)",
-            Stage::Ffi => "ffi gate (exe-only surface)",
+            Stage::Ffi => "ffi gate (ffi.load is --exe-only)",
             Stage::Analyze => "shape analyzer + checker (one walk)",
             Stage::Lower => "lowerer",
             Stage::Backend => "backend",
@@ -53,9 +53,9 @@ impl Stage {
     }
 }
 
-const FFI_EXE_ONLY: &str = "alm compiler error: the ffi surface (require(\"ffi\") / ffi.load / \
-                            lib.sym) is --exe-only — rebuild with --exe; a shared object loading \
-                            shared objects is not acyclic destiny";
+const FFI_LOAD_EXE_ONLY: &str = "alm compiler error: ffi.load is --exe-only — a shared object \
+                                 may not load shared objects (the callee seam: a .so exposes \
+                                 alm_arg_kind/alm_exec, it never loads)";
 
 pub fn compile(source: &str, opts: &PipelineOpts) -> Result<String, (Stage, Vec<Diagnostic>)> {
     let mut tokens = Vec::new();
@@ -110,8 +110,9 @@ pub fn compile_parts(
 fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec<Diagnostic>)> {
     // The splice runs ahead of the ffi gate on purpose: inlining is
     // compile-time and pure, and the amalgamated unit carries ffi only
-    // if the source does — then today's law applies to the whole unit
-    // as-is (M3 decision 8; the gate's relaxation is M4's business).
+    // if the source does — then the law applies to the whole unit
+    // as-is (M3 decision 8; M4 relaxed the law from "any ffi" to
+    // "ffi.load", resolved by the checker's verb table below).
     let ast = crate::require::expand(
         ast,
         crate::require::RequireOpts {
@@ -122,15 +123,25 @@ fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec
     )
     .map_err(|d| (Stage::Modules, d))?;
 
-    if uses_ffi(&ast) && !opts.standalone {
-        return Err((Stage::Ffi, vec![Diagnostic::bare(FFI_EXE_ONLY)]));
-    }
-
     let ctx = analysis::build_context(&ast);
 
     let shape = shape::analyze_with_base(&ctx, opts.walk_pins, opts.index_base);
     if !shape.diagnostics.is_empty() {
         return Err((Stage::Analyze, shape.diagnostics));
+    }
+
+    // The acyclicity law, as link-time accounting: a .so may use the
+    // callee seam (cdef/new/sizeof — the M4 relaxation), but it may
+    // never itself load a shared object. Loading stays --exe-only;
+    // the verbs are the checker's resolved table, so the gate names
+    // the actual load, not any ffi mention.
+    if !opts.standalone
+        && shape
+            .ffi_verbs
+            .values()
+            .any(|verb| matches!(verb, crate::shape::FfiVerb::Load))
+    {
+        return Err((Stage::Ffi, vec![Diagnostic::bare(FFI_LOAD_EXE_ONLY)]));
     }
 
     let mut ir_lowerer = lowerer::IrLowerer::new(&shape);
@@ -163,24 +174,6 @@ fn references_arg(stmts: &[Stmt]) -> bool {
         }
     }
     let mut v = ArgRef(false);
-    let _ = walk_stmts(&mut v, stmts);
-    v.0
-}
-
-fn uses_ffi(stmts: &[Stmt]) -> bool {
-    use crate::ast::NodeId;
-    use crate::visit::{Visitor, walk_stmts};
-    use std::convert::Infallible;
-
-    struct FfiUsed(bool);
-    impl Visitor for FfiUsed {
-        type Break = Infallible;
-        fn visit_ffi_module(&mut self, _id: NodeId) -> Result<(), Self::Break> {
-            self.0 = true;
-            Ok(())
-        }
-    }
-    let mut v = FfiUsed(false);
     let _ = walk_stmts(&mut v, stmts);
     v.0
 }

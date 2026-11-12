@@ -301,9 +301,10 @@ end
 local pos_passed = 0
 for _, name in ipairs(corpus.positive) do
     local pins = corpus.pins[name]
-    -- --exe-flagged positives (the ffi surface's lane) compile the
-    -- standalone executable and run it; everything else rides the
-    -- lib lane as before.
+    -- --exe-flagged positives (the loading lane: ffi.load is
+    -- --exe-only, M4's gate) compile the standalone executable and
+    -- run it; callee-seam positives ride the lib lane as everything
+    -- else does.
     if flags_exe(pins.flags) then
         if not run_case_exe(CASES_DIR .. "/" .. name, pins.flags)
             or not compile_succeeded_exe() then

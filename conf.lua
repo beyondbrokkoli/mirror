@@ -156,9 +156,11 @@ function captured_ir()
     return nil
 end
 
--- The ffi surface is --exe-only (the acyclic-destiny gate), so its
--- positives compile the standalone lane: their IR lands in
--- alm_out.ll, and the battery drives them through the exe path.
+-- ffi.load stays --exe-only (the M4 gate: a .so may ride the callee
+-- seam, but never loads), so cases that load compile the standalone
+-- lane: their IR lands in alm_out.ll, and the battery drives them
+-- through the exe path. Callee-seam-only positives (cdef/new/sizeof,
+-- no load) ride the lib lane like everything else.
 function flags_exe(flags)
     return flags ~= nil and flags:find("--exe", 1, true) ~= nil
 end
