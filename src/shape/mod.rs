@@ -1,7 +1,7 @@
 mod analyzer;
 mod core;
 mod facts;
-mod helpers;
+pub(crate) mod helpers;
 mod ty;
 
 #[cfg(test)]

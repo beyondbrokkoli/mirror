@@ -352,6 +352,12 @@ impl<'a> IrLowerer<'a> {
                         reserve_offset_reg = Some(Reg::new(k_reg));
                     }
                     for name in &plan.pre_header {
+                        // The second-writer contract's consumption
+                        // side: the mint over this name already
+                        // reserved — no second TableReserve here.
+                        if plan.pre_satisfied.contains(name) {
+                            continue;
+                        }
                         let t_reg = ptr_of(self.read_var(name)?.reg)?;
                         self.emit_table_reserve(
                             t_reg,

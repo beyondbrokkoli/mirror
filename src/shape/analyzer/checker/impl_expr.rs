@@ -117,6 +117,7 @@ impl Checker {
             Expr::Index { obj, key, .. } => {
                 let (elem, _) = self.check_index_base(lat, obj)?;
                 let _key_ty = self.check_index_key(lat, key)?;
+                self.check_mint_bounds(obj, key)?;
                 Ok(elem)
             }
             Expr::Identifier { name, .. } => {

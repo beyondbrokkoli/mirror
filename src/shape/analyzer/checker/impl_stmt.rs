@@ -29,6 +29,9 @@ impl Checker {
                 for (name, ty) in names.iter().zip(expr_types) {
                     self.declare_var(lat, name.clone(), ty)?;
                 }
+                for (name, expr) in names.iter().zip(exprs.iter()) {
+                    self.track_mint_binding(name, expr);
+                }
                 for name in &names[exprs.len()..] {
                     let inst = self
                         .instance_stack
@@ -87,10 +90,12 @@ impl Checker {
                         )));
                     }
                     self.hold_entry(name, expected);
+                    self.mint_caps.remove(name);
                     return Ok(());
                 }
                 let actual = self.check_expr(lat, expr)?;
                 Self::reject_face_extraction(expr, &actual)?;
+                self.track_mint_binding(name, expr);
                 if expected != actual {
                     lat.unify(&expected, &actual)?;
                     let resolved = lat.resolve(&actual);
@@ -105,6 +110,7 @@ impl Checker {
             } => {
                 let (elem, _obj_desc) = self.check_index_base(lat, obj)?;
                 let _key_ty = self.check_index_key(lat, key)?;
+                self.check_mint_bounds(obj, key)?;
 
                 let val_ty = self.check_expr(lat, value)?;
 

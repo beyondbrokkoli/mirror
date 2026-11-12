@@ -158,7 +158,7 @@ local lock_missing_names = {}
 
 local function lock_name(name) return name:gsub("%.lua$", "") .. ".ll" end
 
-local function diff_against_lock(name)
+local function diff_against_lock(name, is_exe)
     if CASES_OVERRIDE then return nil end
     if NO_LOCK then return nil end
     local lock = LOCK_DIR .. "/" .. lock_name(name)
@@ -167,10 +167,10 @@ local function diff_against_lock(name)
         table.insert(lock_missing_names, name)
         return nil
     end
-    local code = captured_ir()
+    local code = is_exe and captured_ir_exe() or captured_ir()
     if not code then
         lock_errored = lock_errored + 1
-        report_fail("lock", name, "compile succeeded but libalm_out.ll is empty/missing")
+        report_fail("lock", name, "compile succeeded but the emitted .ll is empty/missing")
         return nil
     end
     -- Both sides normalized (conf.lua normalize_ir): old
@@ -301,7 +301,31 @@ end
 local pos_passed = 0
 for _, name in ipairs(corpus.positive) do
     local pins = corpus.pins[name]
-    if not run_case(CASES_DIR .. "/" .. name, pins.args, false, pins.flags) then
+    -- --exe-flagged positives (the ffi surface's lane) compile the
+    -- standalone executable and run it; everything else rides the
+    -- lib lane as before.
+    if flags_exe(pins.flags) then
+        if not run_case_exe(CASES_DIR .. "/" .. name, pins.flags)
+            or not compile_succeeded_exe() then
+            report_fail("positive", name, "compile failed: " .. first_error(ERR))
+        else
+            local argstr = pins.args and (" " .. pins.args) or ""
+            if not run_exe_with(argstr) then
+                report_fail("positive", name, "run failed: " .. first_error(ERR))
+            else
+                local bad
+                if #pins.expect > 0 then
+                    bad = expect_mismatch(script_stdout(), pins.expect)
+                end
+                if bad then
+                    report_fail("positive", name, "EXPECT mismatch — " .. bad)
+                else
+                    pos_passed = pos_passed + 1
+                end
+            end
+            diff_against_lock(name, true)
+        end
+    elseif not run_case(CASES_DIR .. "/" .. name, pins.args, false, pins.flags) then
         local why = compile_succeeded() and "run failed" or "compile failed"
         report_fail("positive", name, why .. ": " .. first_error(ERR))
     else

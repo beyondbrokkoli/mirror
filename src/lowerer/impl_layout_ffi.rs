@@ -58,12 +58,53 @@ impl<'a> IrLowerer<'a> {
                 })
             }
             FfiVerb::Cdef => {
-                self.emit(Instruction::LoadNull {
+                // W4: the declaration's effect is entirely
+                // compile-time — registry rows were consumed before
+                // emission. The LoadNull placeholder is gone; the
+                // statement lowers to nothing.
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Ffi,
+                })
+            }
+            FfiVerb::New { .. } => {
+                signal!(trace::TRACE_LOWER_FFI_NEW);
+                let FfiMint { elem, capacity, .. } = self
+                    .shape
+                    .ffi_mints
+                    .get(&call.id())
+                    .cloned()
+                    .expect(
+                        "a checker-accepted ffi.new carries its mint fact — \
+                         elem and capacity recorded at the choke point",
+                    );
+                self.emit(Instruction::TableNew {
                     target: Reg::new(reg),
+                    elem: elem.clone(),
+                    flags: 0,
+                });
+                let cap_reg = self.next_reg();
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(cap_reg),
+                    val: capacity,
+                });
+                self.emit(Instruction::TableReserve {
+                    table: Reg::new(reg),
+                    bound: Reg::new(cap_reg),
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: Ty::Ffi,
+                    ty: Ty::Tbl(Box::new(elem)),
+                })
+            }
+            FfiVerb::Sizeof { bytes } => {
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(reg),
+                    val: bytes,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
                 })
             }
             FfiVerb::CoroCreate => {

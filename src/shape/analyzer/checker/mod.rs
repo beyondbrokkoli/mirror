@@ -1,11 +1,12 @@
 use super::super::core::{BOUNDARY_ROOT, MOVED_ROOT, TableShape};
-use super::super::facts::{FfiVerb, FnDef, InstanceId, InstanceInfo, KeyLane};
+use super::super::facts::{FfiMint, FfiVerb, FnDef, InstanceId, InstanceInfo, KeyLane};
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
 use super::{calls_through_fn_var_msg, dotted_callee, value_call_msg};
 use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
+use crate::shape::helpers::const_key_value;
 use crate::shape::ty::Ty;
 use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +41,45 @@ struct Frame {
     fns: BTreeMap<String, Option<NodeId>>,
 }
 
+/// The cdef grammar's scalar tier: kinds that map onto the existing
+/// esize lanes. `name`/`elem`/`capacity`/`reject-surface` are the
+/// registry row's projections.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ScalarElem {
+    Int,
+    Flt,
+    Bool,
+}
+
+impl ScalarElem {
+    /// The one reader that maps a cdef scalar onto the checker's Ty
+    /// lanes — every consumer projects through here.
+    fn ty(self) -> Ty {
+        match self {
+            ScalarElem::Int => Ty::Int,
+            ScalarElem::Flt => Ty::Flt,
+            ScalarElem::Bool => Ty::Bool,
+        }
+    }
+
+    /// esize in bytes, per the runtime's esize lanes ({1,8,16}).
+    fn esize(self) -> i64 {
+        match self {
+            ScalarElem::Int | ScalarElem::Flt => 8,
+            ScalarElem::Bool => 1,
+        }
+    }
+}
+
+/// One `ffi.cdef` registry row. `elem: None` is a struct/union name —
+/// registered so later milestones can hang typed rows off it, but
+/// `ffi.new` over it rejects by name.
+#[derive(Clone, Debug)]
+pub(super) struct CdefRow {
+    pub elem: Option<ScalarElem>,
+    pub capacity: Option<i64>,
+}
+
 #[derive(Clone)]
 pub(super) struct WalkSnap {
     binds: BTreeMap<String, TableShape>,
@@ -49,6 +89,7 @@ pub(super) struct WalkSnap {
 }
 
 pub(super) struct CheckCtx {
+    pub index_base: i64,
     pub adopt_lines: BTreeMap<String, usize>,
     pub sites: BTreeMap<NodeId, usize>,
     pub elems: Vec<Ty>,
@@ -63,6 +104,7 @@ pub(super) struct CheckFacts {
     pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    pub ffi_mints: BTreeMap<NodeId, FfiMint>,
     pub instances: BTreeMap<InstanceId, InstanceInfo>,
     pub boundary_elem: Option<Ty>,
     pub diagnostics: Vec<Diagnostic>,
@@ -94,6 +136,18 @@ pub(super) struct Checker {
     env_overrides: Vec<BTreeMap<String, Ty>>,
     cond_depth: usize,
     ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    ffi_mints: BTreeMap<NodeId, FfiMint>,
+    /// The compile-time cdef declaration registry — `name -> row`.
+    /// Lives and dies with the checker; nothing about it reaches the
+    /// runtime or the plate.
+    cdef_registry: BTreeMap<String, CdefRow>,
+    /// The declared capacity of the name's current mint binding, for
+    /// the static-key bounds check. Maintained at the local-decl and
+    /// assignment choke points.
+    mint_caps: BTreeMap<String, i64>,
+    /// The compile's index base, for physical-key comparison at the
+    /// mint bounds check.
+    index_base: i64,
     instances: BTreeMap<InstanceId, InstanceInfo>,
     local_types: BTreeMap<(NodeId, InstanceId, String), Ty>,
     bare_sites: BTreeMap<(NodeId, InstanceId, String), usize>,

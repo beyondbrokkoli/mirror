@@ -7,8 +7,8 @@ use crate::ir::{
     RegId, RegKind, SourceLoc, TableKey, Terminator, repr_of,
 };
 use crate::shape::{
-    ArmFreeEntry, DoExitFree, FfiVerb, InstanceId, Keep, KeyLane, LayoutVerdict, ReservePlan,
-    ShapeFacts, TagSrc, Ty,
+    ArmFreeEntry, DoExitFree, FfiMint, FfiVerb, InstanceId, Keep, KeyLane, LayoutVerdict,
+    ReservePlan, ShapeFacts, TagSrc, Ty,
 };
 use alm_rt::{signal, trace};
 use bridges::{

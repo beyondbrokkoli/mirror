@@ -1,5 +1,6 @@
 impl Checker {
     pub(super) fn new(ctx: CheckCtx) -> Self {
+        let index_base = ctx.index_base;
         Self {
             frames: Vec::new(),
             top: BTreeMap::new(),
@@ -36,6 +37,10 @@ impl Checker {
             expansion_break_bases: Vec::new(),
             cond_depth: 0,
             ffi_verbs: BTreeMap::new(),
+            ffi_mints: BTreeMap::new(),
+            cdef_registry: BTreeMap::new(),
+            mint_caps: BTreeMap::new(),
+            index_base,
             instances: BTreeMap::from([(
                 InstanceId::ROOT,
                 InstanceInfo {
@@ -214,6 +219,7 @@ impl Checker {
             env_faces,
             closure_fields,
             ffi_verbs,
+            ffi_mints,
             instances,
             boundary_elem,
             diagnostics,
@@ -226,6 +232,7 @@ impl Checker {
             env_faces,
             closure_fields,
             ffi_verbs,
+            ffi_mints,
             instances,
             boundary_elem,
             diagnostics,

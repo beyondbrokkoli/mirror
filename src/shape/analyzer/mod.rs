@@ -464,6 +464,7 @@ pub fn analyze_with_base(
     a.pin_justified_names.clear();
 
     let mut chk = checker::Checker::new(checker::CheckCtx {
+        index_base: a.index_base,
         adopt_lines: adopt_lines.clone(),
         sites: a.lattice.sites.clone(),
         elems: static_elems.clone(),
@@ -723,6 +724,29 @@ impl Recorded {
             cell_children.entry(parent).or_default().extend(kids);
         }
 
+        // The second-writer contract's consumption marking: a reserve
+        // plan's pre-header name whose reserve an ffi.new mint over
+        // that name already satisfied skips its own reserve — the
+        // mint's reserve is the one reserve.
+        let mint_caps: BTreeSet<&str> = self
+            .chk
+            .ffi_mints
+            .values()
+            .filter(|m| !m.name.is_empty())
+            .map(|m| m.name.as_str())
+            .collect();
+        for plan in self.layout.reserve_plans.values_mut() {
+            plan.pre_satisfied = plan
+                .pre_header
+                .iter()
+                .filter(|n| mint_caps.contains(n.as_str()))
+                .cloned()
+                .collect();
+            if !plan.pre_satisfied.is_empty() {
+                signal!(trace::TRACE_PLAN_RESERVE_PRE_SATISFIED);
+            }
+        }
+
         ShapeFacts {
             index_base: self.index_base,
             sites: self.lattice.sites,
@@ -764,6 +788,7 @@ impl Recorded {
             closure_fields: self.chk.closure_fields,
             call_fns: self.chk.call_fns,
             ffi_verbs: self.chk.ffi_verbs,
+            ffi_mints: self.chk.ffi_mints,
             instances: self.chk.instances,
             ctor_lines: self.ctor_lines,
             adopt_lines: self.adopt_lines,

@@ -42,17 +42,40 @@ pub struct FnDef {
     pub signature: Option<Vec<Ty>>,
 }
 
+/// One `ffi.new` mint, recorded at the call site the lowerer (185)
+/// and the reserve-plan builder (186) both consume straight. The
+/// elem/capacity come from the cdef registry at the checker's choke
+/// point — never re-derived downstream.
+#[derive(Clone, Debug)]
+pub struct FfiMint {
+    /// The local name the minted table binds (the second-writer
+    /// contract is per-name).
+    pub name: String,
+    pub elem: Ty,
+    pub capacity: i64,
+}
+
 #[derive(Clone)]
 pub enum FfiVerb {
     Load,
     ArgKind,
     Cdef,
+    New {
+        #[allow(dead_code)]
+        name: String,
+    },
+    Sizeof {
+        bytes: i64,
+    },
     CoroCreate,
     CoroResume,
     CoroYield,
     CoroStatus,
     CoroClose,
-    Drive { base: String, sym: String },
+    Drive {
+        base: String,
+        sym: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,6 +158,11 @@ pub struct FastStoreElig {
 #[derive(Clone, Debug)]
 pub struct ReservePlan {
     pub pre_header: Vec<String>,
+    /// Pre-header names whose reserve was already satisfied by an
+    /// `ffi.new` mint over that name — the second-writer contract's
+    /// consumption side: no second `TableReserve` is emitted for them
+    /// at the loop's pre-header seam.
+    pub pre_satisfied: Vec<String>,
     pub nested: Vec<String>,
     pub ctor_reserves: BTreeSet<NodeId>,
     /// The loop entry's sound lower bound, minted by `detect_fill_loop`
@@ -200,6 +228,7 @@ pub struct ShapeFacts {
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    pub ffi_mints: BTreeMap<NodeId, FfiMint>,
     pub instances: BTreeMap<InstanceId, InstanceInfo>,
     pub ctor_lines: Vec<usize>,
     #[allow(dead_code)]

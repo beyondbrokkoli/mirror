@@ -76,6 +76,20 @@ impl Visitor for Derivation {
             self.sites.insert(expr.id(), self.sites.len());
             self.ctor_lines.push(*line as usize);
         }
+        // An ffi.new mint is a table construction for the ownership
+        // walk's purposes — it gets a site here like any ctor, so the
+        // minted buffer is an ordinary owner-binding (W4 §1.5). A
+        // `.new` dotted call whose base is not the ffi module never
+        // reaches the mint lane, and its phantom site is inert.
+        if let Expr::Call { callee, .. } = expr
+            && let Expr::Field { obj, name, .. } = callee.as_ref()
+            && name == "new"
+            && matches!(obj.as_ref(), Expr::Identifier { .. })
+            && !self.sites.contains_key(&expr.id())
+        {
+            self.sites.insert(expr.id(), self.sites.len());
+            self.ctor_lines.push(0);
+        }
         Ok(())
     }
 

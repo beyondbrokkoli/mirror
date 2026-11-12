@@ -38,22 +38,25 @@ end
 
 local failed = {}
 for _, filename in ipairs(lockables) do
-    run_case(CASES_DIR .. "/" .. filename, nil, false, corpus.pins[filename].flags)
-    if not compile_succeeded() then
-        print(string.format("\27[31m✗\27[0m %s — compile failed: %s", filename, first_error(ERR)))
+    local pins = corpus.pins[filename]
+    local code
+    if flags_exe(pins.flags) then
+        -- The ffi surface's lane: compile standalone, lock alm_out.ll.
+        run_case_exe(CASES_DIR .. "/" .. filename, pins.flags)
+        code = compile_succeeded_exe() and captured_ir_exe() or nil
+    else
+        run_case(CASES_DIR .. "/" .. filename, nil, false, pins.flags)
+        code = compile_succeeded() and captured_ir() or nil
+    end
+    if not code then
+        print(string.format("\27[31m✗\27[0m %s — compile failed (or emitted .ll empty): %s", filename, first_error(ERR)))
         table.insert(failed, filename)
     else
-        local code = captured_ir()
-        if not code then
-            print(string.format("\27[31m✗\27[0m %s — compile succeeded but libalm_out.ll is empty/missing", filename))
-            table.insert(failed, filename)
-        else
-            local dest = LOCK_DIR .. "/" .. filename:gsub("%.lua$", "") .. ".ll"
-            local f = io.open(dest, "w")
-            f:write(code)
-            f:close()
-            print(string.format("\27[32m✓\27[0m locked %s", dest))
-        end
+        local dest = LOCK_DIR .. "/" .. filename:gsub("%.lua$", "") .. ".ll"
+        local f = io.open(dest, "w")
+        f:write(code)
+        f:close()
+        print(string.format("\27[32m✓\27[0m locked %s", dest))
     end
 end
 

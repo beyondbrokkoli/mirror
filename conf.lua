@@ -155,3 +155,16 @@ function captured_ir()
     if code ~= "" then return normalize_ir(code) end
     return nil
 end
+
+-- The ffi surface is --exe-only (the acyclic-destiny gate), so its
+-- positives compile the standalone lane: their IR lands in
+-- alm_out.ll, and the battery drives them through the exe path.
+function flags_exe(flags)
+    return flags ~= nil and flags:find("--exe", 1, true) ~= nil
+end
+
+function captured_ir_exe()
+    local code = read_file("alm_out.ll")
+    if code ~= "" then return normalize_ir(code) end
+    return nil
+end

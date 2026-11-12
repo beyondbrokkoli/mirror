@@ -67,4 +67,45 @@ impl Checker {
         signal!(trace::TRACE_CHK_FFI_VERB);
         self.ffi_verbs.insert(call.id(), verb);
     }
+
+    /// Stamp the mint fact with the local name it binds (the
+    /// second-writer contract is per-name) and track the name's
+    /// declared capacity; a non-mint initializer clears the entry.
+    fn track_mint_binding(&mut self, name: &str, expr: &Expr) {
+        if matches!(
+            self.ffi_verbs.get(&expr.id()),
+            Some(FfiVerb::New { .. })
+        ) && let Some(mint) = self.ffi_mints.get_mut(&expr.id())
+        {
+            mint.name = name.to_string();
+            self.mint_caps.insert(name.to_string(), mint.capacity);
+        } else {
+            self.mint_caps.remove(name);
+        }
+    }
+
+    /// The static-key bounds law: a literal (or checker-foldable) key
+    /// beyond a mint's declared capacity rejects at compile time,
+    /// naming the buffer and the capacity. Dynamic keys keep the
+    /// normal table semantics — the capacity is a floor, not a
+    /// ceiling (the documented divergence from C).
+    fn check_mint_bounds(&self, obj: &Expr, key: &Expr) -> Result<(), Diagnostic> {
+        let Expr::Identifier { name, .. } = obj else {
+            return Ok(());
+        };
+        let Some(&cap) = self.mint_caps.get(name) else {
+            return Ok(());
+        };
+        if let Some(phys) = const_key_value(key, self.index_base)
+            && (phys < 0 || phys >= cap)
+        {
+            return Err(Diagnostic::bounds(format!(
+                "'{name}' is a declared buffer of capacity {cap} — key {} is \
+                 beyond it (ffi.new's capacity is a floor for dynamic keys, a \
+                 wall for static ones)",
+                phys + self.index_base
+            )));
+        }
+        Ok(())
+    }
 }

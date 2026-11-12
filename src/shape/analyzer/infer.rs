@@ -253,6 +253,7 @@ impl Analyzer {
         obj: &Expr,
         name: &str,
         args: &[Expr],
+        call_id: NodeId,
     ) -> Result<(Ty, BTreeSet<usize>, RowLineage), ShapeError> {
         let base = match obj {
             Expr::Identifier { name: n, .. } => n.as_str(),
@@ -267,6 +268,27 @@ impl Analyzer {
         if module || bind.ty == FfiLib {
             for a in args {
                 self.infer_expr(rec, a)?;
+            }
+            if module && name == "new" {
+                // The mint's site was stamped at derivation — the
+                // minted buffer binds as an ordinary owner with that
+                // site's alias, so the whole ownership law (scope-exit
+                // batches, escape-by-move) applies verbatim. The ty
+                // reads the site's current lattice elem so the
+                // fixpoint converges: once a store has joined the
+                // elem, later passes bind the joined table type
+                // directly instead of churning `decide`'s rewrite.
+                for a in args {
+                    self.infer_expr(rec, a)?;
+                }
+                if let Some(&site) = self.lattice.sites.get(&call_id) {
+                    let ty = match self.lattice.site_elem[site].clone() {
+                        Pending => Pending,
+                        e => Tbl(Box::new(e)),
+                    };
+                    return Ok((ty, BTreeSet::from([site]), BTreeMap::new()));
+                }
+                return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
             }
             return Ok(if module && name == "load" {
                 (FfiLib, BTreeSet::new(), BTreeMap::new())
@@ -801,7 +823,7 @@ impl Analyzer {
                         {
                             dotted
                         } else {
-                            return self.infer_module_call(rec, obj, name, args);
+                            return self.infer_module_call(rec, obj, name, args, expr.id());
                         }
                     }
                     Expr::Identifier { name: n, .. } => n.clone(),
@@ -1117,6 +1139,9 @@ impl Analyzer {
                 while_stmt,
                 ReservePlan {
                     pre_header,
+                    // Filled by the post-check pass over the checker's
+                    // mint facts (the second-writer contract).
+                    pre_satisfied: Vec::new(),
                     nested,
                     ctor_reserves: BTreeSet::new(),
                     entry_lb: guard_lower_bound(&self.holds.num_assigns, guard),
