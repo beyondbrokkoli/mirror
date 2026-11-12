@@ -767,6 +767,16 @@ fn scan_expr(expr: &Expr, sink: &mut LaneSink) {
                 scan_expr(a, sink);
             }
         }
-        _ => {}
+        // leaves and module faces admit nothing to any lane
+        Expr::Integer { .. }
+        | Expr::Float { .. }
+        | Expr::Boolean { .. }
+        | Expr::String { .. }
+        | Expr::Nil { .. }
+        | Expr::Identifier { .. }
+        | Expr::SysAllocCount { .. }
+        | Expr::SysExecCount { .. }
+        | Expr::FfiModule { .. }
+        | Expr::CoroModule { .. } => {}
     }
 }

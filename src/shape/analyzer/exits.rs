@@ -533,7 +533,21 @@ impl Analyzer {
                     self.plan_arm_temp_frees_in_expr(a);
                 }
             }
-            _ => {}
+            // NOTE historical shape: a Field's obj is not arm-scanned
+            // (kept bit-for-bit for the goldens); function literals own
+            // their arm frees, and the leaves/sys faces carry none
+            Expr::Field { .. }
+            | Expr::Function { .. }
+            | Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::Identifier { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. } => {}
         }
     }
 
@@ -676,7 +690,20 @@ impl Analyzer {
                     self.plan_fn_bodies_in_expr(a);
                 }
             }
-            _ => {}
+            // NOTE historical shape: a Field's obj hides no fn body scan
+            // (kept bit-for-bit for the goldens); the leaves/sys faces
+            // carry no bodies to plan
+            Expr::Field { .. }
+            | Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::Identifier { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. } => {}
         }
     }
 }

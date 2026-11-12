@@ -940,7 +940,25 @@ impl Analyzer {
                 .resolve(None, src)
                 .ok()
                 .and_then(|(d, _)| self.walk.prov.get(d)?.get(src).copied().flatten()),
-            _ => None,
+            // C: only a call's return or a resolved name lends provenance
+            Some(
+                Expr::Integer { .. }
+                | Expr::Float { .. }
+                | Expr::Boolean { .. }
+                | Expr::String { .. }
+                | Expr::Nil { .. }
+                | Expr::TableCtor { .. }
+                | Expr::Index { .. }
+                | Expr::BinaryOp { .. }
+                | Expr::UnaryOp { .. }
+                | Expr::SysAllocCount { .. }
+                | Expr::SysExecCount { .. }
+                | Expr::FfiModule { .. }
+                | Expr::CoroModule { .. }
+                | Expr::Field { .. }
+                | Expr::Function { .. },
+            )
+            | None => None,
         }
     }
 
@@ -951,12 +969,29 @@ impl Analyzer {
                     out.extend(b.aliases.iter().copied().filter(|&s| !is_root(&s)));
                 }
             }
+            // NOTE historical shape: ctor values only — the Expr keys of
+            // entries are not named-site reads (kept for the goldens)
             Expr::TableCtor { entries, .. } => {
                 for (_, e) in entries {
                     self.expr_named_sites(rec, e, out);
                 }
             }
-            _ => {}
+            // every other form binds no name whose sites could surface
+            Expr::Integer { .. }
+            | Expr::Float { .. }
+            | Expr::Boolean { .. }
+            | Expr::String { .. }
+            | Expr::Nil { .. }
+            | Expr::Index { .. }
+            | Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::SysAllocCount { .. }
+            | Expr::SysExecCount { .. }
+            | Expr::FfiModule { .. }
+            | Expr::CoroModule { .. }
+            | Expr::Field { .. }
+            | Expr::Function { .. }
+            | Expr::Call { .. } => {}
         }
     }
 }
