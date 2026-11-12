@@ -489,6 +489,35 @@ impl<'a> IrLowerer<'a> {
                     ty: r_ty,
                 } = self.lower_expr(right, None)?;
                 match op {
+                    BinOp::Concat => {
+                        // Literal pairs fold here before any runtime concat
+                        // is minted, so "a" .. "b" .. x costs one
+                        // alm_str_concat, not two.
+                        if let (Expr::String { value: lv, .. }, Expr::String { value: rv, .. }) =
+                            (left.as_ref(), right.as_ref())
+                        {
+                            let joined = format!("{lv}{rv}");
+                            self.emit(Instruction::LoadString {
+                                target: Reg::new(reg),
+                                val: joined,
+                            });
+                            return Ok(TypedReg {
+                                reg: AnyReg::Str(Reg::new(reg)),
+                                ty: Ty::Str,
+                            });
+                        }
+                        let l = str_lane(l_any)?;
+                        let r = str_lane(r_any)?;
+                        self.emit(Instruction::StrConcat {
+                            target: Reg::new(reg),
+                            l,
+                            r,
+                        });
+                        return Ok(TypedReg {
+                            reg: AnyReg::Str(Reg::new(reg)),
+                            ty: Ty::Str,
+                        });
+                    }
                     BinOp::Add => match num_pair(l_any, r_any)? {
                         NumPair::II(a, b) => self.num3(Instruction::Add, reg, a, b),
                         NumPair::FF(a, b) => self.num3(Instruction::Add, reg, a, b),

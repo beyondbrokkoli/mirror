@@ -325,6 +325,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     let mut needs_tbl_free_except_n_decl = false;
     let mut tbl_decls = TableDecls::default();
     let mut needs_str_len_decl = false;
+    let mut needs_str_concat_decl = false;
     let mut needs_str_key_decl = false;
     let mut needs_sys_alloc_count_decl = false;
     let mut needs_sys_exec_count_decl = false;
@@ -438,6 +439,13 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                     code.push_str(&format!(
                         "  %v{} = call i64 @alm_str_len(ptr %v{})\n",
                         target.id, s.id
+                    ));
+                }
+                Instruction::StrConcat { target, l, r } => {
+                    needs_str_concat_decl = true;
+                    code.push_str(&format!(
+                        "  %v{} = call ptr @alm_str_concat(ptr %v{}, ptr %v{})\n",
+                        target.id, l.id, r.id
                     ));
                 }
                 Instruction::StrKey { target, s } => {
@@ -961,6 +969,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     }
     if needs_str_len_decl {
         head.push_str("declare i64 @alm_str_len(ptr)\n");
+    }
+    if needs_str_concat_decl {
+        head.push_str("declare ptr @alm_str_concat(ptr, ptr)\n");
     }
     if needs_sys_alloc_count_decl {
         head.push_str("declare i64 @sys_alloc_count()\n");

@@ -136,6 +136,30 @@ impl Checker {
                 let l = self.check_expr(lat, left)?;
                 let r = self.check_expr(lat, right)?;
                 match op {
+                    BinOp::Concat => {
+                        // '..' is the string lane: Str .. Str -> Str. An
+                        // unknown pins to Str (it can only ever join here as
+                        // one); anything else — Int, Bool, Any cells — is a
+                        // named rejection. Coercion is a later law, if ever.
+                        for t in [&l, &r] {
+                            let t = lat.resolve(t);
+                            match t {
+                                Ty::Str => {}
+                                Ty::Unknown(id) => {
+                                    lat.bind(id, Ty::Str)?;
+                                }
+                                other => {
+                                    return Err(Diagnostic::ty(format!(
+                                        "'..' concatenates String with String — \
+                                         found {} on one side (the dialect has no \
+                                         coercion; spell the conversion yourself)",
+                                        type_name(&other)
+                                    )))
+                                }
+                            }
+                        }
+                        Ok(Ty::Str)
+                    }
                     BinOp::And | BinOp::Or => {
                         let l = self.pin_bool(lat, &l)?;
                         let r = self.pin_bool(lat, &r)?;

@@ -62,6 +62,7 @@ fn bin_op_name(op: &BinOp) -> &'static str {
         BinOp::GreaterEq => ">=",
         BinOp::Equal => "==",
         BinOp::NotEqual => "~=",
+        BinOp::Concat => "..",
         BinOp::And => "and",
         BinOp::Or => "or",
     }

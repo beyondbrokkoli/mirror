@@ -77,6 +77,8 @@ pub enum Token<'a> {
     Comma,
     #[token(".")]
     Dot,
+    #[token("..")]
+    DotDot,
     #[token(":")]
     Colon,
     #[token("{")]

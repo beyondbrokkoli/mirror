@@ -1104,6 +1104,28 @@ pub unsafe extern "C" fn alm_str_register(ptrs: *const *const u8, n: usize) {
     unsafe { vx_str_register(ptrs as *mut *const u8, n) };
 }
 
+/// `..` at runtime: join the two pooled handles and intern the result,
+/// so the product is pointer-identical to any literal with the same
+/// bytes. Literals carry no NULs (the lexer rejects them) and pooled
+/// strings are NUL-terminated, so the C-string read is the whole law.
+/// A null handle reads as empty — concat with nil is the checker's
+/// rejection to make, not this seam's.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_str_concat(l: *const u8, r: *const u8) -> *const u8 {
+    let l_bytes = if l.is_null() {
+        &[][..]
+    } else {
+        unsafe { cstr_bytes(l) }
+    };
+    let r_bytes = if r.is_null() {
+        &[][..]
+    } else {
+        unsafe { cstr_bytes(r) }
+    };
+    let joined: Vec<u8> = [l_bytes, r_bytes].concat();
+    unsafe { alm_str_intern(joined.as_ptr(), joined.len()) }
+}
+
 /// The Miri stand-in for the C-side intern pool: the pool is a foreign
 /// function the interpreter cannot execute, so the law it must preserve
 /// is re-stated here — content dedup, an 8-byte str-key prefix before

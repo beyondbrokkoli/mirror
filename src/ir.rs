@@ -1070,6 +1070,15 @@ pub enum Instruction {
         target: Reg<Int>,
         s: Reg<Str>,
     },
+    /// String concatenation: interns `l ++ r` through the pool and
+    /// yields the pooled handle. The result is pointer-identical to
+    /// any literal with the same bytes — same intern discipline as
+    /// every other string the runtime mints.
+    StrConcat {
+        target: Reg<Str>,
+        l: Reg<Str>,
+        r: Reg<Str>,
+    },
     AnyLen {
         target: Reg<Int>,
         source: Reg<Any>,

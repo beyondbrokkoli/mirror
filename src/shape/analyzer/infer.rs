@@ -727,6 +727,10 @@ impl Analyzer {
                     BinOp::Equal | BinOp::NotEqual => {
                         self.pin_scalar_pair(rec, left, &lt, right, &rt);
                     }
+                    // '..' pins nothing here — the checker's Concat arm is
+                    // the one law that binds unknowns to Str; the lattice
+                    // only needs the result type below.
+                    BinOp::Concat => {}
                 }
                 match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::IntDiv | BinOp::Mod => {
@@ -753,6 +757,7 @@ impl Analyzer {
                         }
                         Ok((arith_ty(lt, rt), BTreeSet::new(), BTreeMap::new()))
                     }
+                    BinOp::Concat => Ok((Str, BTreeSet::new(), BTreeMap::new())),
                     _ => {
                         signal!(rec.on(), trace::TRACE_INFER_BINOP_OTHER);
                         Ok((Bool, BTreeSet::new(), BTreeMap::new()))

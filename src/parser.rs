@@ -668,7 +668,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let left = self.parse_term()?;
+        let left = self.parse_concat()?;
 
         let op = match self.tokens.peek() {
             Some(Token::LessThan) => BinOp::LessThan,
@@ -687,6 +687,26 @@ impl<'a> Parser<'a> {
             right: Box::new(right),
             id: NodeId::mint(),
         })
+    }
+
+    // `..` sits between comparison and +/- in Lua's precedence table.
+    // Lua makes it right-associative; for pure concatenation the fold
+    // order is immaterial, so this rides the same left-fold shape as
+    // the arithmetic levels and the checker flattens the chain.
+    fn parse_concat(&mut self) -> Result<Expr, ParseError> {
+        let mut left = self.parse_term()?;
+
+        while let Some(Token::DotDot) = self.tokens.peek() {
+            self.tokens.next();
+            let right = self.parse_term()?;
+            left = Expr::BinaryOp {
+                op: BinOp::Concat,
+                left: Box::new(left),
+                right: Box::new(right),
+                id: NodeId::mint(),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_term(&mut self) -> Result<Expr, ParseError> {
@@ -908,7 +928,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if !matches!(self.tokens.peek(), Some(Token::RightParen)) {
             loop {
-                if matches!(self.tokens.peek(), Some(Token::Dot)) {
+                if matches!(self.tokens.peek(), Some(Token::Dot) | Some(Token::DotDot)) {
                     return Err(ParseError(Diagnostic::syntax(
                         "the dialect has no varargs — \
                          name your parameters",
