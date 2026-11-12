@@ -16,6 +16,7 @@ mod parser;
 mod pipeline;
 #[cfg(test)]
 mod property_tests;
+mod require;
 mod shape;
 mod visit;
 
@@ -270,6 +271,9 @@ FLAGS:
     --for-limit=M   Surface limit kind for numeric for loops: 'exclusive'
                     (default, Rust-style half-open) or 'inclusive'
                     (Lua-style; latches limit + 1 and keeps the guard).
+    --module-root=DIR  Anchor the module tree for dotted requires:
+                    require(\"a.b\") resolves to DIR/a/b.lua and inlines
+                    at its require site (compile-time, pure).
 
 The compiler performs a pure transform to native code. If --output is omitted,
 it defaults to libalm_out.so (or alm_out for --exe).";
@@ -280,6 +284,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
     let mut output_file: Option<String> = None;
     let mut index_base: i64 = 0;
     let mut for_limit_inclusive = false;
+    let mut module_root: Option<std::path::PathBuf> = None;
     let mut idx = 1;
     while let Some(flag) = args.get(idx).map(String::as_str) {
         match flag {
@@ -354,6 +359,18 @@ it defaults to libalm_out.so (or alm_out for --exe).";
                 };
                 idx += 1;
             }
+            _ if flag.starts_with("--module-root=") => {
+                let raw = &flag["--module-root=".len()..];
+                if raw.is_empty() {
+                    eprintln!(
+                        "alm compiler error: --module-root requires a directory path \
+                         (require(\"a.b\") resolves to DIR/a/b.lua — the flag anchors the tree)"
+                    );
+                    std::process::exit(1);
+                }
+                module_root = Some(raw.into());
+                idx += 1;
+            }
             _ if flag.starts_with('-') => {
                 eprintln!(
                     "alm compiler error: Unknown flag '{flag}'. Flags must come before the source file."
@@ -395,6 +412,7 @@ it defaults to libalm_out.so (or alm_out for --exe).";
             walk_pins: true,
             index_base,
             for_limit_inclusive,
+            module_root,
         },
     ) {
         Ok(ir) => ir,

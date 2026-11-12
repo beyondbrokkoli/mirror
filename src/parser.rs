@@ -884,8 +884,9 @@ impl<'a> Parser<'a> {
                         _ => {
                             return Err(ParseError(Diagnostic::syntax(
                                 "require takes one string literal — \
-                                 require(\"ffi\") and require(\"coroutine\") are the \
-                                 modules the dialect provides",
+                                 require(\"ffi\"), require(\"coroutine\"), and \
+                                 require(\"dotted.path\") are the shapes the \
+                                 dialect provides",
                             )));
                         }
                     };
@@ -896,13 +897,24 @@ impl<'a> Parser<'a> {
                             self.expect(Token::RightParen)?;
                             return Ok(Expr::CoroModule { id: NodeId::mint() });
                         }
+                        // any other string names a module of the source
+                        // tree — it parses as an ordinary call and the
+                        // pipeline's require splice resolves it against
+                        // --module-root (M3). `bit` is that pass's named
+                        // rejection until M5.
                         other => {
-                            return Err(ParseError(Diagnostic::syntax(format!(
-                                "require(\"{other}\") — the dialect provides \
-                                 only require(\"ffi\") (the mocked LuaJIT ffi surface) and \
-                                 require(\"coroutine\") (the OS-thread parody of Lua's \
-                                 cooperative coroutines)"
-                            ))));
+                            self.expect(Token::RightParen)?;
+                            return Ok(Expr::Call {
+                                callee: Box::new(Expr::Identifier {
+                                    name: "require".to_string(),
+                                    id: NodeId::mint(),
+                                }),
+                                args: vec![Expr::String {
+                                    value: other.to_string(),
+                                    id: NodeId::mint(),
+                                }],
+                                id: NodeId::mint(),
+                            });
                         }
                     }
                     self.expect(Token::RightParen)?;

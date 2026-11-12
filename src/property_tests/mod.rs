@@ -45,6 +45,7 @@ fn property_opts(walk_pins: bool) -> PipelineOpts {
         walk_pins,
         index_base: 0,
         for_limit_inclusive: false,
+        module_root: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn compile_exe(source: &str) -> Result<String, (Stage, Vec<Diagnostic>)> {
                 walk_pins: true,
                 index_base: 0,
                 for_limit_inclusive: false,
+                module_root: None,
             },
         )
     })) {

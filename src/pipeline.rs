@@ -21,6 +21,9 @@ pub struct PipelineOpts {
     /// `limit + 1` and the guard never changes — desugar-tier only,
     /// it never reaches the analyzer or the lowerer.
     pub for_limit_inclusive: bool,
+    /// Where dotted requires anchor (`--module-root`). None leaves a
+    /// program with requires a named rejection away.
+    pub module_root: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -28,6 +31,7 @@ pub enum Stage {
     #[cfg(test)]
     Panicked,
     Front,
+    Modules,
     Ffi,
     Analyze,
     Lower,
@@ -40,6 +44,7 @@ impl Stage {
         match self {
             Stage::Panicked => "panicked",
             Stage::Front => "front (lexer/parser)",
+            Stage::Modules => "require splice (module amalgamation)",
             Stage::Ffi => "ffi gate (exe-only surface)",
             Stage::Analyze => "shape analyzer + checker (one walk)",
             Stage::Lower => "lowerer",
@@ -103,6 +108,20 @@ pub fn compile_parts(
 }
 
 fn post_front(ast: Vec<Stmt>, opts: &PipelineOpts) -> Result<String, (Stage, Vec<Diagnostic>)> {
+    // The splice runs ahead of the ffi gate on purpose: inlining is
+    // compile-time and pure, and the amalgamated unit carries ffi only
+    // if the source does — then today's law applies to the whole unit
+    // as-is (M3 decision 8; the gate's relaxation is M4's business).
+    let ast = crate::require::expand(
+        ast,
+        crate::require::RequireOpts {
+            module_root: opts.module_root.clone(),
+            index_base: opts.index_base,
+            for_limit_inclusive: opts.for_limit_inclusive,
+        },
+    )
+    .map_err(|d| (Stage::Modules, d))?;
+
     if uses_ffi(&ast) && !opts.standalone {
         return Err((Stage::Ffi, vec![Diagnostic::bare(FFI_EXE_ONLY)]));
     }

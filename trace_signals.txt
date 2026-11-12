@@ -263,3 +263,4 @@
 188 FAIL_ASSERT runtime assert trap fired — the guard met a false condition and raised the interned message (or the default) through alm_fatal; the M2 assert law’s one death
 189 FAIL_ERROR_RAISED runtime error() trap fired — the unconditional raise through alm_fatal with the interned message; the M2 error law’s one death
 190 FAIL_TONUMBER runtime tonumber met non-digit bytes at runtime — the digits-only parse has no fallback and no nil answer; a literal non-digit is the checker’s named rejection, this slot is the runtime half of the same law
+191 REQUIRE_SPLICE pipeline a dotted require resolved against --module-root and spliced — the module chunk became a local function, its one cache call, and the requirer's binding; modules required later bind the same cache name, so top-level effects run exactly once (M3, the amalgamation milestone)
