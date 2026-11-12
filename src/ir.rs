@@ -1079,6 +1079,26 @@ pub enum Instruction {
         l: Reg<Str>,
         r: Reg<Str>,
     },
+    /// `assert`'s fail path: trap through the runtime carrying the
+    /// interned message (a null reg means no message was given — the
+    /// runtime raises its default). A false condition never runs past
+    /// this instruction.
+    AssertGuard {
+        cond: Reg<Bool>,
+        msg: Reg<Str>,
+    },
+    /// `error`'s unconditional raise: the runtime trap carrying the
+    /// interned message. Code after it is dead by construction.
+    ErrorRaise {
+        msg: Reg<Str>,
+    },
+    /// `tonumber`'s runtime half: parse the pooled digits into an
+    /// Int. Non-digit bytes are a fatal trap — a literal non-digit is
+    /// the checker's named rejection, this is the same law at runtime.
+    StrToNumber {
+        target: Reg<Int>,
+        s: Reg<Str>,
+    },
     AnyLen {
         target: Reg<Int>,
         source: Reg<Any>,

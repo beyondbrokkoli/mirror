@@ -8,10 +8,11 @@ use std::sync::{Once, OnceLock};
 
 use crate::trace::{
     TRACE_CORO_CLOSE, TRACE_CORO_DEAD, TRACE_CORO_RESUME, TRACE_CORO_SPAWN, TRACE_CORO_YIELD,
-    TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_CORO_CREATE,
-    TRACE_FAIL_CORO_YIELD_RESERVED, TRACE_FAIL_DIV_ZERO, TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM,
-    TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE, TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD,
-    TRACE_RT_FREE, TRACE_RT_FREE_CHILD, TRACE_RT_RESERVE_NULL,
+    TRACE_CORO_YIELD_DROPPED, TRACE_FAIL_ANY_LEN, TRACE_FAIL_ASSERT, TRACE_FAIL_CORO_CREATE,
+    TRACE_FAIL_CORO_YIELD_RESERVED, TRACE_FAIL_DIV_ZERO, TRACE_FAIL_ERROR_RAISED,
+    TRACE_FAIL_FFI_LOAD, TRACE_FAIL_FFI_SYM, TRACE_FAIL_LEAK_DETECTED, TRACE_FAIL_NULL_ROW_STORE,
+    TRACE_FAIL_TONUMBER, TRACE_RT_ALLOC, TRACE_RT_FFI_LOAD, TRACE_RT_FREE, TRACE_RT_FREE_CHILD,
+    TRACE_RT_RESERVE_NULL,
 };
 
 #[repr(u8)]
@@ -1124,6 +1125,70 @@ pub unsafe extern "C" fn alm_str_concat(l: *const u8, r: *const u8) -> *const u8
     };
     let joined: Vec<u8> = [l_bytes, r_bytes].concat();
     unsafe { alm_str_intern(joined.as_ptr(), joined.len()) }
+}
+
+/// `assert`'s fail path: a false condition raises the interned message
+/// (the default when none was given) — one death, both messages ride
+/// the pool. The condition rides widened (i1 -> i64) across the C
+/// boundary; zero is false, everything else is true.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_assert_guard(cond: i64, msg: *const u8) {
+    if cond == 0 {
+        let text = if msg.is_null() {
+            String::from("assertion failed!")
+        } else {
+            String::from_utf8_lossy(unsafe { cstr_bytes(msg) }).into_owned()
+        };
+        alm_fatal!(
+            trace: TRACE_FAIL_ASSERT,
+            "alm runtime error: assertion failed! {text}"
+        );
+    }
+}
+
+/// `error`'s unconditional raise: the interned message through the
+/// same trap as assert's fail path — one machinery, two verbs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_error_raise(msg: *const u8) {
+    let text = if msg.is_null() {
+        String::from("(no message)")
+    } else {
+        String::from_utf8_lossy(unsafe { cstr_bytes(msg) }).into_owned()
+    };
+    alm_fatal!(
+        trace: TRACE_FAIL_ERROR_RAISED,
+        "alm runtime error: uncaught error: {text}"
+    );
+}
+
+/// `tonumber`'s runtime half: the digits-only parse. No fallback, no
+/// nil answer — non-digit bytes (or an empty handle, or a value that
+/// does not fit an i64) are the loud death; a literal non-digit is the
+/// checker's named rejection, this is the same law at runtime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn alm_str_tonumber(s: *const u8) -> i64 {
+    let bytes = if s.is_null() {
+        &[][..]
+    } else {
+        unsafe { cstr_bytes(s) }
+    };
+    let parse_failure = || {
+        alm_fatal!(
+            trace: TRACE_FAIL_TONUMBER,
+            "alm runtime error: tonumber is a digits-only parse — got '{}'",
+            String::from_utf8_lossy(bytes)
+        );
+    };
+    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
+        parse_failure();
+    }
+    match std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|t| t.parse::<i64>().ok())
+    {
+        Some(n) => n,
+        None => parse_failure(),
+    }
 }
 
 /// The Miri stand-in for the C-side intern pool: the pool is a foreign

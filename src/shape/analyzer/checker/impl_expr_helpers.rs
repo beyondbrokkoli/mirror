@@ -61,6 +61,117 @@ impl Checker {
         Ok(resolved)
     }
 
+    /// The M2 builtin table: the callee name answered to no user
+    /// binding, so assert/error/tonumber get the call. Each verb's arg
+    /// laws are checked here, once, and the verb is recorded for the
+    /// lowerer to consume straight — the same shape as ffi_verbs.
+    fn check_builtin_call(
+        &mut self,
+        lat: &mut UnknownStore,
+        expr: &Expr,
+        name: &str,
+        args: &[Expr],
+    ) -> Result<Ty, Diagnostic> {
+        let verb = match name {
+            "assert" => BuiltinVerb::Assert,
+            "error" => BuiltinVerb::Error,
+            "tonumber" => BuiltinVerb::ToNumber,
+            _ => return Err(value_call_msg(name)),
+        };
+        let arity = |want: usize| {
+            Diagnostic::ty(format!(
+                "builtin '{name}' takes {} argument{}, got {}",
+                want,
+                if want == 1 { "" } else { "s" },
+                args.len()
+            ))
+        };
+        match verb {
+            BuiltinVerb::Assert => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(arity(2));
+                }
+                let cond = self.check_expr(lat, &args[0])?;
+                let cond = self.pin_bool(lat, &cond)?;
+                if cond != Ty::Bool {
+                    return Err(Diagnostic::ty(format!(
+                        "builtin 'assert' checks a Boolean condition — found {} \
+                         (the dialect has no coercion; spell the conversion yourself)",
+                        type_name(&cond)
+                    )));
+                }
+                if let Some(msg) = args.get(1) {
+                    let ty = self.check_expr(lat, msg)?;
+                    self.pin_str(lat, &ty, "assert's message")?;
+                }
+                self.builtin_verbs.insert(expr.id(), BuiltinVerb::Assert);
+                signal!(trace::TRACE_CHK_BUILTIN_CALL);
+                Ok(Ty::Bool)
+            }
+            BuiltinVerb::Error => {
+                if !self.stmt_position_call {
+                    return Err(Diagnostic::ty(
+                        "builtin 'error' raises — it answers no value; call it \
+                         as a statement",
+                    ));
+                }
+                if args.len() != 1 {
+                    return Err(arity(1));
+                }
+                let ty = self.check_expr(lat, &args[0])?;
+                self.pin_str(lat, &ty, "error's message")?;
+                self.builtin_verbs.insert(expr.id(), BuiltinVerb::Error);
+                signal!(trace::TRACE_CHK_BUILTIN_CALL);
+                // The raise never answers; the only legal site (a
+                // statement) discards the value, so the msg's own type
+                // rides home for bookkeeping.
+                Ok(Ty::Str)
+            }
+            BuiltinVerb::ToNumber => {
+                if args.len() != 1 {
+                    return Err(arity(1));
+                }
+                let ty = self.check_expr(lat, &args[0])?;
+                let ty = self.pin_str(lat, &ty, "tonumber's operand")?;
+                if ty != Ty::Str {
+                    return Err(Diagnostic::ty(format!(
+                        "builtin 'tonumber' parses a String of digits — found {} \
+                         (cdata answers wait for ffi.cast)",
+                        type_name(&ty)
+                    )));
+                }
+                if let Expr::String { value, .. } = &args[0]
+                    && !value.bytes().all(|b| b.is_ascii_digit())
+                {
+                    return Err(Diagnostic::ty(format!(
+                        "builtin 'tonumber' is a digits-only parse — '{value}' \
+                         is not all digits"
+                    )));
+                }
+                self.builtin_verbs.insert(expr.id(), BuiltinVerb::ToNumber);
+                signal!(trace::TRACE_CHK_BUILTIN_CALL);
+                Ok(Ty::Int)
+            }
+        }
+    }
+
+    /// Pin a type to Str (unknowns bind, everything else must already
+    /// be Str) — the shared law of the builtin message/operand lanes.
+    fn pin_str(&mut self, lat: &mut UnknownStore, ty: &Ty, what: &str) -> Result<Ty, Diagnostic> {
+        let resolved = lat.resolve(ty);
+        match resolved {
+            Ty::Str => Ok(Ty::Str),
+            Ty::Unknown(id) => {
+                lat.bind(id, Ty::Str)?;
+                Ok(Ty::Str)
+            }
+            other => Err(Diagnostic::ty(format!(
+                "{what} is a String — found {} (the dialect has no coercion)",
+                type_name(&other)
+            ))),
+        }
+    }
+
     fn infer_numeric_pair(
         &mut self,
         lat: &mut UnknownStore,

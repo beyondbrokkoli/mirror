@@ -326,6 +326,9 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     let mut tbl_decls = TableDecls::default();
     let mut needs_str_len_decl = false;
     let mut needs_str_concat_decl = false;
+    let mut needs_assert_guard_decl = false;
+    let mut needs_error_raise_decl = false;
+    let mut needs_str_tonumber_decl = false;
     let mut needs_str_key_decl = false;
     let mut needs_sys_alloc_count_decl = false;
     let mut needs_sys_exec_count_decl = false;
@@ -446,6 +449,30 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                     code.push_str(&format!(
                         "  %v{} = call ptr @alm_str_concat(ptr %v{}, ptr %v{})\n",
                         target.id, l.id, r.id
+                    ));
+                }
+                Instruction::AssertGuard { cond, msg } => {
+                    needs_assert_guard_decl = true;
+                    // Bool rides i1 in the IR; the C-visible guard takes
+                    // the widened form.
+                    let f = ks;
+                    ks += 1;
+                    code.push_str(&format!(
+                        "  %ts{f}.wide = zext i1 %v{c} to i64\n  call void @alm_assert_guard(i64 %ts{f}.wide, ptr %v{m})\n",
+                        f = f,
+                        c = cond.id,
+                        m = msg.id
+                    ));
+                }
+                Instruction::ErrorRaise { msg } => {
+                    needs_error_raise_decl = true;
+                    code.push_str(&format!("  call void @alm_error_raise(ptr %v{})\n", msg.id));
+                }
+                Instruction::StrToNumber { target, s } => {
+                    needs_str_tonumber_decl = true;
+                    code.push_str(&format!(
+                        "  %v{} = call i64 @alm_str_tonumber(ptr %v{})\n",
+                        target.id, s.id
                     ));
                 }
                 Instruction::StrKey { target, s } => {
@@ -972,6 +999,15 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
     }
     if needs_str_concat_decl {
         head.push_str("declare ptr @alm_str_concat(ptr, ptr)\n");
+    }
+    if needs_assert_guard_decl {
+        head.push_str("declare void @alm_assert_guard(i64, ptr)\n");
+    }
+    if needs_error_raise_decl {
+        head.push_str("declare void @alm_error_raise(ptr)\n");
+    }
+    if needs_str_tonumber_decl {
+        head.push_str("declare i64 @alm_str_tonumber(ptr)\n");
     }
     if needs_sys_alloc_count_decl {
         head.push_str("declare i64 @sys_alloc_count()\n");

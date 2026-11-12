@@ -788,6 +788,7 @@ impl Recorded {
             closure_fields: self.chk.closure_fields,
             call_fns: self.chk.call_fns,
             ffi_verbs: self.chk.ffi_verbs,
+            builtin_verbs: self.chk.builtin_verbs,
             ffi_mints: self.chk.ffi_mints,
             instances: self.chk.instances,
             ctor_lines: self.ctor_lines,

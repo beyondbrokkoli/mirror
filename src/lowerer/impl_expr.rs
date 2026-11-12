@@ -103,6 +103,11 @@ impl<'a> IrLowerer<'a> {
                 if let Expr::Field { .. } = callee.as_ref() && kids.is_none() {
                     return self.lower_ffi_call(expr, args, reg);
                 }
+                if kids.is_none()
+                    && let Some(verb) = self.shape.builtin_verbs.get(&call_ptr).cloned()
+                {
+                    return self.lower_builtin_call(verb, args, reg);
+                }
                 let kids = kids.expect(
                     "the checker resolved this call as an expansion — children is the \
                      record view of the resolved call (7b: the fact-site guard's \

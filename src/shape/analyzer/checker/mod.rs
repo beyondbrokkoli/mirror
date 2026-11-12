@@ -1,5 +1,7 @@
 use super::super::core::{BOUNDARY_ROOT, MOVED_ROOT, TableShape};
-use super::super::facts::{FfiMint, FfiVerb, FnDef, InstanceId, InstanceInfo, KeyLane};
+use super::super::facts::{
+    BuiltinVerb, FfiMint, FfiVerb, FnDef, InstanceId, InstanceInfo, KeyLane,
+};
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
@@ -104,6 +106,7 @@ pub(super) struct CheckFacts {
     pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    pub builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,
     pub ffi_mints: BTreeMap<NodeId, FfiMint>,
     pub instances: BTreeMap<InstanceId, InstanceInfo>,
     pub boundary_elem: Option<Ty>,
@@ -136,6 +139,7 @@ pub(super) struct Checker {
     env_overrides: Vec<BTreeMap<String, Ty>>,
     cond_depth: usize,
     ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,
     ffi_mints: BTreeMap<NodeId, FfiMint>,
     /// The compile-time cdef declaration registry — `name -> row`.
     /// Lives and dies with the checker; nothing about it reaches the

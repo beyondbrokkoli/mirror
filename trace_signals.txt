@@ -259,3 +259,7 @@
 184 CHK_FFI_NEW checker ffi.new minted Ty::Tbl(elem) with the capacity site fact — the mint's elem and capacity recorded once for the lowerer (185) and the reserve plan (186) to consume straight
 185 LOWER_FFI_NEW lowerer the mint lowered: TableNew then exactly one TableReserve at the literal capacity — the second-writer contract's one reserve is born here; on one case 184 without 185 is the desync tell
 186 PLAN_RESERVE_PRE_SATISFIED analyzer a conversion loop's pre-header reserve skipped because the mint over that name already satisfied it — the second-writer contract's consumption side; pairs with 185 on the same name
+187 CHK_BUILTIN_CALL checker an assert/error/tonumber call resolved as a builtin and its arg laws checked — the name resolved to no user binding, so the builtin table answers; the verb is recorded for the lowerer to consume straight (the ffi_verbs seam, one lane over)
+188 FAIL_ASSERT runtime assert trap fired — the guard met a false condition and raised the interned message (or the default) through alm_fatal; the M2 assert law’s one death
+189 FAIL_ERROR_RAISED runtime error() trap fired — the unconditional raise through alm_fatal with the interned message; the M2 error law’s one death
+190 FAIL_TONUMBER runtime tonumber met non-digit bytes at runtime — the digits-only parse has no fallback and no nil answer; a literal non-digit is the checker’s named rejection, this slot is the runtime half of the same law

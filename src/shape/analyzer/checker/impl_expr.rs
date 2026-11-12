@@ -349,7 +349,10 @@ impl Checker {
                     None => match self.var_type_callable(lat, &name) {
                         Some(Ty::Closure(ptr)) => (ptr, true),
                         _ => {
-                            return Err(value_call_msg(&name));
+                            // The name answers to no user binding — the
+                            // M2 builtin table gets the call before the
+                            // rejection does.
+                            return self.check_builtin_call(lat, expr, &name, args);
                         }
                     },
                 };

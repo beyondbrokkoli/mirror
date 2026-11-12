@@ -15,6 +15,77 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
+    /// The M2 builtins, lowered straight from the checker's recorded
+    /// verb — assert guards its condition, error raises through the
+    /// trap, tonumber parses the pooled digits (a literal folds here,
+    /// no runtime call).
+    fn lower_builtin_call(
+        &mut self,
+        verb: BuiltinVerb,
+        args: &[Expr],
+        reg: RegId,
+    ) -> Result<TypedReg, LowerError> {
+        match verb {
+            BuiltinVerb::Assert => {
+                let TypedReg { reg: c, .. } = self.lower_expr(&args[0], None)?;
+                let cond = bool_of(c)?;
+                let msg = if let Some(msg_expr) = args.get(1) {
+                    let TypedReg { reg: m, .. } = self.lower_expr(msg_expr, None)?;
+                    str_lane(m)?
+                } else {
+                    // No message given — the default rides the strtab
+                    // like any literal, so the trap reads a pooled
+                    // handle either way.
+                    let m = self.next_reg();
+                    self.emit(Instruction::LoadString {
+                        target: Reg::new(m),
+                        val: "assertion failed!".to_string(),
+                    });
+                    Reg::new(m)
+                };
+                self.emit(Instruction::AssertGuard { cond, msg });
+                Ok(TypedReg {
+                    reg: AnyReg::Bool(cond),
+                    ty: Ty::Bool,
+                })
+            }
+            BuiltinVerb::Error => {
+                let TypedReg { reg: m, .. } = self.lower_expr(&args[0], None)?;
+                let msg = str_lane(m)?;
+                self.emit(Instruction::ErrorRaise { msg });
+                Ok(TypedReg {
+                    reg: AnyReg::Str(msg),
+                    ty: Ty::Str,
+                })
+            }
+            BuiltinVerb::ToNumber => {
+                if let Expr::String { value, .. } = &args[0] {
+                    let n: i64 = value
+                        .parse()
+                        .expect("the checker rejected non-digit literals");
+                    self.emit(Instruction::LoadInt {
+                        target: Reg::new(reg),
+                        val: n,
+                    });
+                    return Ok(TypedReg {
+                        reg: AnyReg::Int(Reg::new(reg)),
+                        ty: Ty::Int,
+                    });
+                }
+                let TypedReg { reg: s, .. } = self.lower_expr(&args[0], None)?;
+                let s = str_lane(s)?;
+                self.emit(Instruction::StrToNumber {
+                    target: Reg::new(reg),
+                    s,
+                });
+                Ok(TypedReg {
+                    reg: AnyReg::Int(Reg::new(reg)),
+                    ty: Ty::Int,
+                })
+            }
+        }
+    }
+
                                 fn lower_ffi_call(
         &mut self,
         call: &Expr,

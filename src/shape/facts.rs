@@ -78,6 +78,17 @@ pub enum FfiVerb {
     },
 }
 
+/// The M2 builtin table: assert/error/tonumber are checker builtins —
+/// a call whose name resolves to no user binding falls to the builtin
+/// table, the checker records the verb here, and the lowerer consumes
+/// it straight (the ffi_verbs seam, one lane over).
+#[derive(Clone)]
+pub enum BuiltinVerb {
+    Assert,
+    Error,
+    ToNumber,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyLane {
     Int,
@@ -228,6 +239,7 @@ pub struct ShapeFacts {
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
+    pub builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,
     pub ffi_mints: BTreeMap<NodeId, FfiMint>,
     pub instances: BTreeMap<InstanceId, InstanceInfo>,
     pub ctor_lines: Vec<usize>,
