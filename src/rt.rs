@@ -1231,6 +1231,14 @@ unsafe fn miri_intern(s: *const u8, len: usize) -> *const u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_str_intern(s: *const u8, len: usize) -> *const u8 {
+    if len == 0 {
+        // The one-empty law's Rust face: the empty string interns as the
+        // null handle — the one value the zero lane already reads as ""
+        // (len/concat/print) and the key face mints as EMPTY_STR_KEY.
+        // No pooled "" ever exists, so register identity (`==`) and
+        // keying agree on the empty with zero normalization.
+        return ptr::null();
+    }
     #[cfg(miri)]
     {
         return unsafe { miri_intern(s, len) };
@@ -2196,6 +2204,26 @@ mod strkey_tests {
             "array slot 0 must stay untouched (answering 0 would alias it)"
         );
         unsafe { alm_tbl_free(t) };
+    }
+
+    #[test]
+    fn the_empty_string_interns_as_the_null_handle() {
+        // The one-empty law, at every producing face: zero-length
+        // interning answers the null handle — the Rust export, the C
+        // pool beneath it, concat's product — so the literal "" and a
+        // missing cell's zero lane are one value. Pointer equality is
+        // all `==` ever does, and one value needs no normalization.
+        assert_eq!(unsafe { alm_str_intern(b"".as_ptr(), 0) }, ptr::null());
+        assert_eq!(
+            unsafe { alm_str_concat(ptr::null(), ptr::null()) },
+            ptr::null(),
+            "concat of two empties is the one empty"
+        );
+        assert_eq!(
+            unsafe { alm_str_key(ptr::null()) },
+            EMPTY_STR_KEY,
+            "the one empty keys as the empty string's own minted key"
+        );
     }
 }
 

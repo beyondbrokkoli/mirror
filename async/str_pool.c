@@ -36,6 +36,13 @@ static int64_t str_key_of(const uint8_t* s, size_t len) {
 }
 
 static const uint8_t* pool_intern(const uint8_t* s, size_t len) {
+    /* The one-empty law: a zero-length string is the null handle. The
+       pool never mints a second empty, so an "" literal's strtab slot
+       registers as NULL and handle identity (`==`) needs no
+       normalization to agree with the zero lane. */
+    if (len == 0) {
+        return NULL;
+    }
     int spin = 0;
     while (TAS(pool_lock)) {
         vx_spin_wait(&spin);
