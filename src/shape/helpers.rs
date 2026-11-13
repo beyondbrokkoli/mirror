@@ -47,7 +47,7 @@ fn const_key_raw(e: &Expr) -> Option<i64> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,
@@ -130,7 +130,7 @@ pub fn guard_key_shape(key: &Expr, guard: &str, index_base: i64) -> Option<crate
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,

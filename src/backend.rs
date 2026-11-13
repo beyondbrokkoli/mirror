@@ -655,14 +655,14 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                     needs_sys_exec_count_decl = true;
                     code.push_str(&format!("  %v{} = call i64 @sys_exec_count()\n", target.id));
                 }
-                Instruction::CoroCreate { target, lib } => {
+                Instruction::AsyncCreate { target, lib } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
                         "  %v{} = call i64 @alm_coro_create(ptr %v{})\n",
                         target.id, lib.id
                     ));
                 }
-                Instruction::CoroResume {
+                Instruction::AsyncResume {
                     target,
                     handle,
                     args,
@@ -673,21 +673,21 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                         target.id, handle.id, args.id
                     ));
                 }
-                Instruction::CoroYield { target, value } => {
+                Instruction::AsyncYield { target, value } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
                         "  %v{} = call i64 @alm_coro_yield(i64 %v{})\n",
                         target.id, value.id
                     ));
                 }
-                Instruction::CoroStatus { target, handle } => {
+                Instruction::AsyncStatus { target, handle } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
                         "  %v{} = call ptr @alm_coro_status(i64 %v{})\n",
                         target.id, handle.id
                     ));
                 }
-                Instruction::CoroClose { target, handle } => {
+                Instruction::AsyncClose { target, handle } => {
                     needs_coro_decls = true;
                     code.push_str(&format!(
                         "  %v{} = call i64 @alm_coro_close(i64 %v{})\n",
@@ -796,7 +796,7 @@ pub fn generate_llvm_ir(program: &IrProgram) -> Result<String, Vec<Diagnostic>> 
                             Ty::Tbl(_) => {
                                 return Err(vec![Diagnostic::ty("tables cannot be printed")]);
                             }
-                            Ty::Ffi | Ty::FfiLib | Ty::Coro => {
+                            Ty::Ffi | Ty::FfiLib | Ty::Async => {
                                 return Err(vec![Diagnostic::ty(
                                     "the module surfaces cannot be printed",
                                 )]);

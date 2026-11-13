@@ -180,8 +180,8 @@ impl Visitor for VisitRecorder {
         self.log.push("ffi_module");
         Ok(())
     }
-    fn visit_coro_module(&mut self, _: NodeId) -> Result<(), Self::Break> {
-        self.log.push("coro_module");
+    fn visit_async_module(&mut self, _: NodeId) -> Result<(), Self::Break> {
+        self.log.push("async_module");
         Ok(())
     }
     fn visit_field(&mut self, o: &Expr, _: &str, _: NodeId) -> Result<(), Self::Break> {
@@ -300,7 +300,7 @@ fn visit_order_golden_pin() {
                 exprs: vec![
                     Expr::SysExecCount { id: mint() },
                     Expr::FfiModule { id: mint() },
-                    Expr::CoroModule { id: mint() },
+                    Expr::AsyncModule { id: mint() },
                 ],
                 loc: at,
                 id: mint(),
@@ -376,7 +376,7 @@ fn visit_order_golden_pin() {
             "print",
             "sys_exec_count",
             "ffi_module",
-            "coro_module",
+            "async_module",
             // expr stmt: call -> field callee -> its obj, then args
             "expr_stmt",
             "call",

@@ -9,7 +9,7 @@ pub enum Ty {
     Tbl(Box<Ty>),
     Ffi,
     FfiLib,
-    Coro,
+    Async,
     Any,
     Closure(NodeId),
     Unknown(usize),

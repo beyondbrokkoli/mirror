@@ -251,7 +251,7 @@ pub fn repr_of(ty: &Ty) -> RegKind {
         Ty::Bool => RegKind::Bool,
         Ty::Any => RegKind::Any,
         Ty::Str | Ty::Tbl(_) | Ty::Unknown(_) => RegKind::Ptr,
-        Ty::Ffi | Ty::FfiLib | Ty::Coro => RegKind::Ptr,
+        Ty::Ffi | Ty::FfiLib | Ty::Async => RegKind::Ptr,
         Ty::Closure(_) => RegKind::Ptr,
         Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
     }
@@ -293,7 +293,7 @@ impl CellTy {
             Ty::Bool => CellTy::Bool,
             Ty::Any => CellTy::Any,
             Ty::Str | Ty::Tbl(_) => CellTy::Ptr,
-            Ty::Ffi | Ty::FfiLib | Ty::Coro | Ty::Unknown(_) => CellTy::Byte,
+            Ty::Ffi | Ty::FfiLib | Ty::Async | Ty::Unknown(_) => CellTy::Byte,
             Ty::Closure(_) => CellTy::Ptr,
             Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
         }
@@ -1156,24 +1156,24 @@ pub enum Instruction {
         target: Reg<Int>,
     },
 
-    CoroCreate {
+    AsyncCreate {
         target: Reg<Int>,
         lib: Reg<Ptr>,
     },
-    CoroResume {
+    AsyncResume {
         target: Reg<Int>,
         handle: Reg<Int>,
         args: Reg<Ptr>,
     },
-    CoroYield {
+    AsyncYield {
         target: Reg<Int>,
         value: Reg<Int>,
     },
-    CoroStatus {
+    AsyncStatus {
         target: Reg<Str>,
         handle: Reg<Int>,
     },
-    CoroClose {
+    AsyncClose {
         target: Reg<Int>,
         handle: Reg<Int>,
     },

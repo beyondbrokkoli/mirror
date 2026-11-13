@@ -8,6 +8,12 @@ o[0], o[1], o[2], o[3] = a00*b00+a10*b01+a20*b02+a30*b03,
                          a00*b00+a10*b01+a20*b02+a30*b03+690,
                          a00*b00+a10*b01+a20*b02+a30*b03+1035
 print(o[0], o[1], o[2], o[3])
+-- WIP pin for the Lua 5.1/LuaJIT conformance lane (T1): the tail's
+-- second target key t[0] reads AFTER the first store lands, so the
+-- dialect prints 5 6. The judge — LuaJIT 2.1 and PUC Lua — evaluates
+-- every target's table and key before any store (Lua 5.1 manual
+-- §2.4.3) and prints 5 0. T1 latches the target prefixes with the RHS
+-- temps and flips this pin to 5 0.
 local t = {0, 0, 0, 0, 0, 0, 0}
 t[0], t[t[0]] = 5, 6
 print(t[0], t[5])

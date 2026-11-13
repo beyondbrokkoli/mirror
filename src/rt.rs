@@ -1755,9 +1755,9 @@ pub unsafe extern "C" fn alm_coro_resume(co: i64, t: *mut AlmTable) -> i64 {
     if id < 0 {
         alm_fatal!(
             trace: TRACE_FAIL_CORO_CREATE,
-            "alm fatal: coroutine.resume on handle {co} — the coroutine registry \
+            "alm fatal: async.resume on handle {co} — the async registry \
              was exhausted at create time (all lanes live); test \
-             coroutine.create's result before resuming"
+             async.create's result before resuming"
         );
     }
     if unsafe { vx_coro_status(id) } == 1 && !t.is_null() {
@@ -1791,9 +1791,9 @@ pub unsafe extern "C" fn alm_coro_yield(value: i64) -> i64 {
     if r == -2 {
         alm_fatal!(
             trace: TRACE_FAIL_CORO_YIELD_RESERVED,
-            "alm fatal: coroutine.yield of {value} — the drain word (i64::MIN) is \
+            "alm fatal: async.yield of {value} — the drain word (i64::MIN) is \
              reserved: a drained lane answers it, and only a drained lane, at \
-             coroutine.resume; stream any other i64"
+             async.resume; stream any other i64"
         );
     }
     unsafe {

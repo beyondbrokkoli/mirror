@@ -284,7 +284,7 @@ impl Checker {
             }
             Expr::SysAllocCount { .. } | Expr::SysExecCount { .. } => Ok(Ty::Int),
             Expr::FfiModule { .. } => Ok(Ty::Ffi),
-            Expr::CoroModule { .. } => Ok(Ty::Coro),
+            Expr::AsyncModule { .. } => Ok(Ty::Async),
             Expr::Field { obj, name, .. } => {
                 let ty = self.check_expr(lat, obj)?;
                 let ty = lat.resolve(&ty);

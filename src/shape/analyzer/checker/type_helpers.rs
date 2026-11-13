@@ -40,7 +40,7 @@ pub(super) fn type_name(ty: &Ty) -> String {
         Ty::Unknown(_) => "?".to_string(),
         Ty::Ffi => "Ffi".to_string(),
         Ty::FfiLib => "FfiLib".to_string(),
-        Ty::Coro => "Coro".to_string(),
+        Ty::Async => "Async".to_string(),
         Ty::Any => "Any".to_string(),
         Ty::Closure(_) => "Closure".to_string(),
         Ty::Pending => "Pending".to_string(),

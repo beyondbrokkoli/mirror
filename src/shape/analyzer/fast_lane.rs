@@ -777,6 +777,6 @@ fn scan_expr(expr: &Expr, sink: &mut LaneSink) {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. } => {}
+        | Expr::AsyncModule { .. } => {}
     }
 }

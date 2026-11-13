@@ -98,7 +98,7 @@ pub enum Expr {
     FfiModule {
         id: NodeId,
     },
-    CoroModule {
+    AsyncModule {
         id: NodeId,
     },
     Field {
@@ -134,7 +134,7 @@ impl Expr {
             | Expr::SysAllocCount { id }
             | Expr::SysExecCount { id }
             | Expr::FfiModule { id }
-            | Expr::CoroModule { id }
+            | Expr::AsyncModule { id }
             | Expr::Field { id, .. }
             | Expr::Function { id, .. }
             | Expr::Call { id, .. } => *id,

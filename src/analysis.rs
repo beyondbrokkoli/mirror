@@ -228,7 +228,7 @@ fn base_identifier(expr: &Expr) -> Option<&String> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,

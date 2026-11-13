@@ -178,10 +178,10 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            FfiVerb::CoroCreate => {
+            FfiVerb::AsyncCreate => {
                 let lib = self.lower_expr(&args[0], None)?;
                 let lib_reg = pooled_ptr_of(lib.reg)?;
-                self.emit(Instruction::CoroCreate {
+                self.emit(Instruction::AsyncCreate {
                     target: Reg::new(reg),
                     lib: lib_reg,
                 });
@@ -190,12 +190,12 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            FfiVerb::CoroResume => {
+            FfiVerb::AsyncResume => {
                 let handle = self.lower_expr(&args[0], None)?;
                 let handle_reg = int_of(handle.reg)?;
                 let tbl = self.lower_expr(&args[1], None)?;
                 let tbl_reg = ptr_of(tbl.reg)?;
-                self.emit(Instruction::CoroResume {
+                self.emit(Instruction::AsyncResume {
                     target: Reg::new(reg),
                     handle: handle_reg,
                     args: tbl_reg,
@@ -205,10 +205,10 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            FfiVerb::CoroYield => {
+            FfiVerb::AsyncYield => {
                 let value = self.lower_expr(&args[0], None)?;
                 let value_reg = int_of(value.reg)?;
-                self.emit(Instruction::CoroYield {
+                self.emit(Instruction::AsyncYield {
                     target: Reg::new(reg),
                     value: value_reg,
                 });
@@ -217,10 +217,10 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Int,
                 })
             }
-            FfiVerb::CoroStatus => {
+            FfiVerb::AsyncStatus => {
                 let handle = self.lower_expr(&args[0], None)?;
                 let handle_reg = int_of(handle.reg)?;
-                self.emit(Instruction::CoroStatus {
+                self.emit(Instruction::AsyncStatus {
                     target: Reg::new(reg),
                     handle: handle_reg,
                 });
@@ -229,10 +229,10 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Str,
                 })
             }
-            FfiVerb::CoroClose => {
+            FfiVerb::AsyncClose => {
                 let handle = self.lower_expr(&args[0], None)?;
                 let handle_reg = int_of(handle.reg)?;
-                self.emit(Instruction::CoroClose {
+                self.emit(Instruction::AsyncClose {
                     target: Reg::new(reg),
                     handle: handle_reg,
                 });

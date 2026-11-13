@@ -67,11 +67,11 @@ pub enum FfiVerb {
     Sizeof {
         bytes: i64,
     },
-    CoroCreate,
-    CoroResume,
-    CoroYield,
-    CoroStatus,
-    CoroClose,
+    AsyncCreate,
+    AsyncResume,
+    AsyncYield,
+    AsyncStatus,
+    AsyncClose,
     Drive {
         base: String,
         sym: String,

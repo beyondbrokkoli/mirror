@@ -106,7 +106,7 @@ fn const_of(expr: &Expr) -> Option<i64> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,
@@ -129,7 +129,7 @@ fn as_ident(expr: &Expr) -> Option<&str> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,

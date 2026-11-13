@@ -109,7 +109,7 @@ impl Analyzer {
             | Expr::SysAllocCount { .. }
             | Expr::SysExecCount { .. }
             | Expr::FfiModule { .. }
-            | Expr::CoroModule { .. } => {}
+            | Expr::AsyncModule { .. } => {}
         }
         Ok(())
     }

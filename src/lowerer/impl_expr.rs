@@ -74,13 +74,13 @@ impl<'a> IrLowerer<'a> {
                     ty: Ty::Ffi,
                 })
             }
-            Expr::CoroModule { .. } => {
+            Expr::AsyncModule { .. } => {
                 self.emit(Instruction::LoadNull {
                     target: Reg::new(reg),
                 });
                 Ok(TypedReg {
                     reg: AnyReg::Ptr(Reg::new(reg)),
-                    ty: Ty::Coro,
+                    ty: Ty::Async,
                 })
             }
             Expr::Function { .. } => {

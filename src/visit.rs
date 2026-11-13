@@ -195,7 +195,7 @@ pub trait Visitor: Sized {
         Ok(())
     }
 
-    fn visit_coro_module(&mut self, _id: NodeId) -> Result<(), Self::Break> {
+    fn visit_async_module(&mut self, _id: NodeId) -> Result<(), Self::Break> {
         Ok(())
     }
 
@@ -292,7 +292,7 @@ pub fn walk_expr<V: Visitor>(v: &mut V, expr: &Expr) -> Result<(), V::Break> {
         Expr::SysAllocCount { id } => v.visit_sys_alloc_count(*id),
         Expr::SysExecCount { id } => v.visit_sys_exec_count(*id),
         Expr::FfiModule { id } => v.visit_ffi_module(*id),
-        Expr::CoroModule { id } => v.visit_coro_module(*id),
+        Expr::AsyncModule { id } => v.visit_async_module(*id),
         Expr::Field { obj, name, id } => v.visit_field(obj, name, *id),
         Expr::Function { params, body, id } => v.visit_function(params, body, *id),
         Expr::Call { callee, args, id } => v.visit_call(callee, args, *id),

@@ -31,7 +31,7 @@ impl Analyzer {
             | Expr::SysAllocCount { .. }
             | Expr::SysExecCount { .. }
             | Expr::FfiModule { .. }
-            | Expr::CoroModule { .. }
+            | Expr::AsyncModule { .. }
             | Expr::Function { .. } => None,
         }
     }
@@ -225,7 +225,7 @@ impl Analyzer {
             | Expr::SysAllocCount { .. }
             | Expr::SysExecCount { .. }
             | Expr::FfiModule { .. }
-            | Expr::CoroModule { .. }
+            | Expr::AsyncModule { .. }
             | Expr::Function { .. } => false,
         }
     }

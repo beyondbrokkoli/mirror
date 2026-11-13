@@ -132,7 +132,7 @@ impl Checker {
                                  cannot enter a dynamic cell",
                             ));
                         }
-                        Ty::Ffi | Ty::FfiLib | Ty::Coro => {
+                        Ty::Ffi | Ty::FfiLib | Ty::Async => {
                             return Err(Diagnostic::ty(
                                 "an Any table's cells hold scalars — the ffi \
                                  surface cannot enter a dynamic cell",

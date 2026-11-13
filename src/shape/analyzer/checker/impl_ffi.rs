@@ -379,20 +379,20 @@ impl Checker {
                     "unknown ffi member '{name}' — load, cdef, arg_kind, new, sizeof"
                 ))),
             },
-            Ty::Coro => match name {
+            Ty::Async => match name {
                 "create" => {
                     if args.len() != 1 {
-                        return Err(Diagnostic::ty("coroutine.create takes exactly one library"));
+                        return Err(Diagnostic::ty("async.create takes exactly one library"));
                     }
                     let raw = self.check_expr(lat, &args[0])?;
                     let t = lat.resolve(&raw);
                     match t {
                         Ty::FfiLib => {
-                            self.record_verb(call, FfiVerb::CoroCreate);
+                            self.record_verb(call, FfiVerb::AsyncCreate);
                             Ok(Ty::Int)
                         }
                         other => Err(Diagnostic::ty(format!(
-                            "coroutine.create takes a library handle, got {}",
+                            "async.create takes a library handle, got {}",
                             type_name(&other),
                         ))),
                     }
@@ -400,7 +400,7 @@ impl Checker {
                 "resume" => {
                     if args.len() != 2 {
                         return Err(Diagnostic::ty(
-                            "coroutine.resume takes a coroutine handle and one \
+                            "async.resume takes a async handle and one \
                              table — the spawn inputs (its first three cells ride the \
                              worker's boundary)",
                         ));
@@ -417,8 +417,8 @@ impl Checker {
                         Ty::Int => {}
                         other => {
                             return Err(Diagnostic::ty(format!(
-                                "coroutine.resume's first argument is a \
-                                 coroutine handle, got {}",
+                                "async.resume's first argument is a \
+                                 async handle, got {}",
                                 type_name(&other)
                             )));
                         }
@@ -433,11 +433,11 @@ impl Checker {
                                          boundary — the spawn table marshals flat cells only",
                                 ));
                             }
-                            self.record_verb(call, FfiVerb::CoroResume);
+                            self.record_verb(call, FfiVerb::AsyncResume);
                             Ok(Ty::Int)
                         }
                         other => Err(Diagnostic::ty(format!(
-                            "coroutine.resume's second argument is the input \
+                            "async.resume's second argument is the input \
                                  table, got {}",
                             type_name(&other),
                         ))),
@@ -445,7 +445,7 @@ impl Checker {
                 }
                 "yield" => {
                     if args.len() != 1 {
-                        return Err(Diagnostic::ty("coroutine.yield takes exactly one integer"));
+                        return Err(Diagnostic::ty("async.yield takes exactly one integer"));
                     }
                     let raw = self.check_expr(lat, &args[0])?;
                     let t = lat.resolve(&raw);
@@ -457,11 +457,11 @@ impl Checker {
                     };
                     match t {
                         Ty::Int => {
-                            self.record_verb(call, FfiVerb::CoroYield);
+                            self.record_verb(call, FfiVerb::AsyncYield);
                             Ok(Ty::Int)
                         }
                         other => Err(Diagnostic::ty(format!(
-                            "coroutine.yield streams one integer, got {}",
+                            "async.yield streams one integer, got {}",
                             type_name(&other),
                         ))),
                     }
@@ -469,7 +469,7 @@ impl Checker {
                 "status" => {
                     if args.len() != 1 {
                         return Err(Diagnostic::ty(
-                            "coroutine.status takes exactly one coroutine",
+                            "async.status takes exactly one async",
                         ));
                     }
                     let raw = self.check_expr(lat, &args[0])?;
@@ -482,11 +482,11 @@ impl Checker {
                     };
                     match t {
                         Ty::Int => {
-                            self.record_verb(call, FfiVerb::CoroStatus);
+                            self.record_verb(call, FfiVerb::AsyncStatus);
                             Ok(Ty::Str)
                         }
                         other => Err(Diagnostic::ty(format!(
-                            "coroutine.status takes a coroutine handle, got {}",
+                            "async.status takes a async handle, got {}",
                             type_name(&other),
                         ))),
                     }
@@ -494,7 +494,7 @@ impl Checker {
                 "close" => {
                     if args.len() != 1 {
                         return Err(Diagnostic::ty(
-                            "coroutine.close takes exactly one coroutine",
+                            "async.close takes exactly one async",
                         ));
                     }
                     let raw = self.check_expr(lat, &args[0])?;
@@ -507,17 +507,17 @@ impl Checker {
                     };
                     match t {
                         Ty::Int => {
-                            self.record_verb(call, FfiVerb::CoroClose);
+                            self.record_verb(call, FfiVerb::AsyncClose);
                             Ok(Ty::Int)
                         }
                         other => Err(Diagnostic::ty(format!(
-                            "coroutine.close takes a coroutine handle, got {}",
+                            "async.close takes a async handle, got {}",
                             type_name(&other),
                         ))),
                     }
                 }
                 _ => Err(Diagnostic::ty(format!(
-                    "unknown coroutine member '{name}' — create, resume, yield, \
+                    "unknown async member '{name}' — create, resume, yield, \
                      status, close"
                 ))),
             },
@@ -526,7 +526,7 @@ impl Checker {
                  the module's result stays in the module's world, nothing comes back to bind"
             ))),
             _ => Err(Diagnostic::ty(format!(
-                "'{base}' is not a module surface — '.' is the ffi/coroutine \
+                "'{base}' is not a module surface — '.' is the ffi/async \
                  surface's, tables use '[]'"
             ))),
         }

@@ -64,7 +64,7 @@ impl<'a> IrLowerer<'a> {
                             });
                             AnyReg::Ptr(Reg::new(reg_id))
                         }
-                        Ty::Ffi | Ty::FfiLib | Ty::Coro => {
+                        Ty::Ffi | Ty::FfiLib | Ty::Async => {
                             self.emit(Instruction::LoadNull {
                                 target: Reg::new(reg_id),
                             });

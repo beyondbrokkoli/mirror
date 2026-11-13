@@ -77,7 +77,7 @@ impl Analyzer {
                         | Expr::SysAllocCount { .. }
                         | Expr::SysExecCount { .. }
                         | Expr::FfiModule { .. }
-                        | Expr::CoroModule { .. }
+                        | Expr::AsyncModule { .. }
                         | Expr::Field { .. }
                         | Expr::Call { .. } => None,
                     };
@@ -971,7 +971,7 @@ impl Analyzer {
                 | Expr::SysAllocCount { .. }
                 | Expr::SysExecCount { .. }
                 | Expr::FfiModule { .. }
-                | Expr::CoroModule { .. }
+                | Expr::AsyncModule { .. }
                 | Expr::Field { .. }
                 | Expr::Function { .. },
             )
@@ -1005,7 +1005,7 @@ impl Analyzer {
             | Expr::SysAllocCount { .. }
             | Expr::SysExecCount { .. }
             | Expr::FfiModule { .. }
-            | Expr::CoroModule { .. }
+            | Expr::AsyncModule { .. }
             | Expr::Field { .. }
             | Expr::Function { .. }
             | Expr::Call { .. } => {}

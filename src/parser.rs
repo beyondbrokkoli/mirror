@@ -884,7 +884,7 @@ impl<'a> Parser<'a> {
                         _ => {
                             return Err(ParseError(Diagnostic::syntax(
                                 "require takes one string literal — \
-                                 require(\"ffi\"), require(\"coroutine\"), and \
+                                 require(\"ffi\"), require(\"async\"), and \
                                  require(\"dotted.path\") are the shapes the \
                                  dialect provides",
                             )));
@@ -893,9 +893,9 @@ impl<'a> Parser<'a> {
                     let name = module.trim_matches('"');
                     match name {
                         "ffi" => {}
-                        "coroutine" => {
+                        "async" => {
                             self.expect(Token::RightParen)?;
-                            return Ok(Expr::CoroModule { id: NodeId::mint() });
+                            return Ok(Expr::AsyncModule { id: NodeId::mint() });
                         }
                         // any other string names a module of the source
                         // tree — it parses as an ordinary call and the

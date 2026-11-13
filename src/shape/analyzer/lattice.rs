@@ -88,7 +88,7 @@ impl Analyzer {
             Any => Any,
             Ffi => Ffi,
             FfiLib => FfiLib,
-            Coro => Coro,
+            Async => Async,
             Ty::Closure(_) => unreachable!("a closure face never rides a site elem"),
             Ty::Unknown(_) => unreachable!(
                 "site_elem holds no nominal unknowns — the walk mints none; unknowns live in \
@@ -128,7 +128,7 @@ impl Analyzer {
             Any => Any,
             Ffi => Ffi,
             FfiLib => FfiLib,
-            Coro => Coro,
+            Async => Async,
             Ty::Closure(_) => unreachable!("a closure face never rides a site elem"),
             Tbl(inner) => {
                 signal!(trace::TRACE_TY_STATIC_TBL);

@@ -27,7 +27,7 @@ pub fn boundary_elem_of(elem: Ty) -> alm_rt::AlmElem {
         Ty::Str => alm_rt::AlmElem::String,
         Ty::Any => alm_rt::AlmElem::Any,
         Ty::Int | Ty::Tbl(_) | Ty::Unknown(_) => alm_rt::AlmElem::Integer,
-        Ty::Ffi | Ty::FfiLib | Ty::Coro => alm_rt::AlmElem::Integer,
+        Ty::Ffi | Ty::FfiLib | Ty::Async => alm_rt::AlmElem::Integer,
         Ty::Closure(_) => unreachable!("a closure never rides the boundary elem"),
         Ty::Pending | Ty::Conflict => unreachable!("flow state never rides the artifact path"),
     }

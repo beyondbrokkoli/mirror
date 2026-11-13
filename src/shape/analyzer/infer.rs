@@ -39,7 +39,7 @@ pub(super) fn num_of(expr: &Expr) -> NumExpr {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => NumExpr::Other,
@@ -298,7 +298,7 @@ impl Analyzer {
                 (Pending, BTreeSet::new(), BTreeMap::new())
             });
         }
-        if bind.ty == Coro {
+        if bind.ty == Async {
             for a in args {
                 self.infer_expr(rec, a)?;
             }
@@ -315,7 +315,7 @@ impl Analyzer {
             return Ok((Pending, BTreeSet::new(), BTreeMap::new()));
         }
         Err(ShapeError(Diagnostic::scope(format!(
-            "'{base}' is not the ffi module, a loaded library, or the coroutine \
+            "'{base}' is not the ffi module, a loaded library, or the async \
              module — '.' is the module surfaces', tables use '[]'"
         ))))
     }
@@ -795,7 +795,7 @@ impl Analyzer {
                 Ok((Int, BTreeSet::new(), BTreeMap::new()))
             }
             Expr::FfiModule { .. } => Ok((Ffi, BTreeSet::new(), BTreeMap::new())),
-            Expr::CoroModule { .. } => Ok((Coro, BTreeSet::new(), BTreeMap::new())),
+            Expr::AsyncModule { .. } => Ok((Async, BTreeSet::new(), BTreeMap::new())),
             Expr::Field { obj, .. } => {
                 let (ty, sites, lineage) = self.infer_expr(rec, obj)?;
                 match ty {

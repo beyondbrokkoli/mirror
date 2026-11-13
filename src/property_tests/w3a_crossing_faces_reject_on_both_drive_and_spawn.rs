@@ -10,14 +10,14 @@ fn w3a_crossing_faces_reject_on_both_drive_and_spawn() {
         lib.alm_exec(pkt)
     "#;
     let spawn_face = r#"
-        local coroutine = require("coroutine")
+        local async = require("async")
         local ffi = require("ffi")
         ffi.cdef("void* alm_exec(void*);")
         local lib = ffi.load(arg[0])
-        local co = coroutine.create(lib)
+        local co = async.create(lib)
         local function Tick() return 1 end
         local pkt = { step = Tick, seed = 3 }
-        coroutine.resume(co, pkt)
+        async.resume(co, pkt)
     "#;
     for (label, source, needle) in [
         (

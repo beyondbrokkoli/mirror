@@ -12,7 +12,7 @@ use super::facts::{FastStoreElig, KeyShape, ReservePlan, ShapeFacts};
 use super::helpers::{const_key_value, extract_guard, guard_key_shape, merge_table_scopes};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 pub(super) use crate::diag::Diagnostic;
-use Ty::{Any, Bool, Conflict, Coro, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
+use Ty::{Any, Async, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
 
 mod checker;
 mod checks;
@@ -244,7 +244,7 @@ fn stmt_base(e: &Expr) -> Option<String> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,
@@ -814,7 +814,7 @@ fn get_base_identifier(expr: &Expr) -> Option<&String> {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. }
+        | Expr::AsyncModule { .. }
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,
