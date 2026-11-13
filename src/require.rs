@@ -608,12 +608,14 @@ fn parse_module(
                 tokens.push(token);
             }
             Some(Err(_)) => {
-                let line = 1 + source.as_bytes()[..lexer.span().start]
+                let off = lexer.span().start;
+                let line = 1 + source.as_bytes()[..off]
                     .iter()
                     .filter(|b| **b == b'\n')
                     .count();
                 return Err(vec![
-                    Diagnostic::syntax("Lexer error").with_site(Some(line)),
+                    Diagnostic::syntax(crate::lexer::rejected_match_text(lexer.slice(), off))
+                        .with_site(Some(line)),
                 ]);
             }
             None => break,

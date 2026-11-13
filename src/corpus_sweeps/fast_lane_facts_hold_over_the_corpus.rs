@@ -2,9 +2,10 @@
 #[test]
 fn fast_lane_facts_hold_over_the_corpus() {
     fn analyze(source: &str) -> Option<crate::shape::ShapeFacts> {
-        // The corpus carries negative cases that panic inside the front
-        // end (embedded NUL literals); the other sweeps catch those and
-        // treat them as rejections, so this pin does too.
+        // The corpus carries negative cases the front end rejects before
+        // analysis (embedded NUL literals, now a lexer Err — the detailed
+        // diagnostic, no longer a panic); the sweeps treat them as
+        // rejections, so this pin does too.
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut tokens = Vec::new();
             let mut offsets = Vec::new();

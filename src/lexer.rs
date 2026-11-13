@@ -1,5 +1,22 @@
 use logos::Logos;
 
+/// Diagnostic text for a match the lexer refused: a slice carrying an
+/// embedded NUL was a string literal the String callback rejected — spell
+/// out the law; anything else is the generic lexer error. Both front-end
+/// Err arms (pipeline.rs, require.rs) route through here so the wording
+/// cannot drift between them.
+pub fn rejected_match_text(slice: &str, off: usize) -> String {
+    if slice.contains('\0') {
+        format!(
+            "Lexer error: embedded NUL byte in string literal at byte {off} \
+             — alm strings are NUL-terminated, so the literal would \
+             silently truncate at print time"
+        )
+    } else {
+        "Lexer error".to_string()
+    }
+}
+
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip(r"[ \t\n\r\f\v]+"))]
 #[logos(skip(r"(?s)--\[\[.*?\]\]"))]
@@ -101,21 +118,13 @@ pub enum Token<'a> {
     #[regex(r"[0-9]+\.[0-9]+", |lex| lex.slice().parse().ok())]
     Float(f64),
 
+    // A literal carrying an embedded NUL rejects its match (None): the
+    // front end's Err arm turns the failed span into the embedded-NUL
+    // diagnostic. alm strings are NUL-terminated, so the literal would
+    // silently truncate at print time — a diagnostic, never a panic.
     #[regex(r#""[^"]*""#, |lex| {
         let s = lex.slice();
-        if s.contains('\0') {
-            let off = lex.span().start;
-            let line = 1 + lex.source().as_bytes()[..off]
-                .iter()
-                .filter(|b| **b == b'\n')
-                .count();
-            panic!(
-                "line {line}: Lexer error: embedded NUL byte in string literal at byte {off} \
-                 — alm strings are NUL-terminated, so the literal would \
-                 silently truncate at print time"
-            );
-        }
-        Some(s)
+        (!s.contains('\0')).then_some(s)
     })]
     String(&'a str),
 }
