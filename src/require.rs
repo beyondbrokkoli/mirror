@@ -159,8 +159,9 @@ impl Expander {
     fn module(&mut self, path: &str, loc: Loc) -> Result<String, Diagnostic> {
         if path == "bit" {
             return Err(Diagnostic::ty(
-                "require(\"bit\") — the bit lane arrives with M5's \
-                 tier-3 ffi depth; until then the dialect has no bit",
+                "require(\"bit\") — the bit lane is M5 (checker Int \
+                 builtins with the LuaJIT bit semantics); until it \
+                 lands the dialect has no bit",
             )
             .with_site(Some(loc.line as usize)));
         }
@@ -589,7 +590,7 @@ fn rename_in_expr(expr: &mut Expr, from: &str, to: &str) {
         | Expr::SysAllocCount { .. }
         | Expr::SysExecCount { .. }
         | Expr::FfiModule { .. }
-        | Expr::CoroModule { .. } => {}
+        | Expr::AsyncModule { .. } => {}
     }
 }
 
