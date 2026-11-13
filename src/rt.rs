@@ -752,10 +752,7 @@ fn valid_slot_addr(addr: usize) -> bool {
 }
 
 unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
-    debug_assert!(
-        is_str_key(key) || key == NIL_KEY,
-        "skey store outside the reserved range (tagged string key or the -1 nil park)"
-    );
+    debug_assert!(is_str_key(key), "skey store outside the reserved range");
     let tbl = unsafe { &mut *t };
     unsafe { overflow_map(tbl).insert(key, cell.to_lane()) };
 }
@@ -788,10 +785,7 @@ unsafe fn get_core<C: CellRepr>(t: *mut AlmTable, index: i64) -> C {
 }
 
 unsafe fn get_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64) -> C {
-    debug_assert!(
-        is_str_key(key) || key == NIL_KEY,
-        "skey read outside the reserved range (tagged string key or the -1 nil park)"
-    );
+    debug_assert!(is_str_key(key), "skey read outside the reserved range");
     let tbl = unsafe { &mut *t };
     if !tbl.sparse_map.is_null()
         && let Some(&lane) = unsafe { (&*tbl.sparse_map).get(&key) }
@@ -1250,7 +1244,7 @@ pub unsafe extern "C" fn alm_str_intern(s: *const u8, len: usize) -> *const u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
     if s.is_null() {
-        return NIL_KEY;
+        return EMPTY_STR_KEY;
     }
     let key_ptr = unsafe { (s as *const i64).sub(1) };
     debug_assert!(key_ptr.addr() & 7 == 0, "alm_str_key prefix not 8-aligned");
@@ -1259,22 +1253,26 @@ pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
 
 pub const STR_KEY_TAG: i64 = i64::MIN;
 
-/// The nil park: alm_str_key(NULL) maps a nil key to -1 — the one
-/// non-skey occupant the skey lanes admit. Minted keys force the tag
-/// bits (top two `10`), and far integer keys park positive, so -1 is
-/// collision-free by construction.
-pub const NIL_KEY: i64 = -1;
+/// The null handle's key: a NULL string reads as empty everywhere else
+/// in the runtime (len, concat, print), so it keys as the empty string
+/// too — a missing record cell and `t[""]` are one slot, and the skey
+/// lanes never see an untagged value. Before this law the null handle
+/// answered -1, an occupant outside the minted range that turned every
+/// missing key into one hidden shared slot.
+pub const EMPTY_STR_KEY: i64 = str_key_of_bytes(b"");
 
 #[inline]
 pub fn is_str_key(index: i64) -> bool {
     (index & (3i64 << 62)) == STR_KEY_TAG
 }
 
-pub fn str_key_of_bytes(bytes: &[u8]) -> i64 {
+pub const fn str_key_of_bytes(bytes: &[u8]) -> i64 {
     let mut h: u64 = 14695981039346656037;
-    for &b in bytes {
-        h ^= b as u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
         h = h.wrapping_mul(1099511628211);
+        i += 1;
     }
     (STR_KEY_TAG as u64 | (h & 0x3FFF_FFFF_FFFF_FFFF)) as i64
 }
@@ -2173,15 +2171,24 @@ mod strkey_tests {
     }
 
     #[test]
-    fn null_handle_answers_minus_one_and_stores_noop() {
-        assert_eq!(unsafe { alm_str_key(std::ptr::null()) }, -1);
-        assert!(!is_str_key(-1));
+    fn null_handle_keys_as_the_empty_string() {
+        let empty = str_key_of_bytes(b"");
+        assert_eq!(unsafe { alm_str_key(std::ptr::null()) }, empty);
+        assert!(is_str_key(empty));
         let t = unsafe { alm_tbl_new(std::mem::size_of::<i128>(), 0) };
+        unsafe { alm_tbl_set_any_skey(t, alm_str_key(std::ptr::null()), alm_any_pack(3, 0x1234)) };
+        assert_eq!(
+            unsafe { alm_tbl_get_any_skey(t, empty) },
+            alm_any_pack(3, 0x1234),
+            "a store through the null handle lands in t[\"\"], the empty string's own slot"
+        );
+        // The int face keeps its own law: a negative index is refused
+        // (alm_str_key's null answer is a tagged key, never -1 now).
         unsafe { alm_tbl_set_any(t, -1, alm_any_pack(3, 0x1234)) };
         assert_eq!(
             unsafe { alm_tbl_len(t) },
             0,
-            "a store through the null-key sentinel must no-op"
+            "a store through a negative index must no-op"
         );
         assert_eq!(
             unsafe { alm_tbl_get_any(t, 0) },
