@@ -304,9 +304,15 @@ impl Analyzer {
 
     pub(super) fn note_assign_scalar_node(&mut self, name: &str, rhs: &Expr) {
         let entry = self.node_view(rhs);
+        // A scalar node rides its name's binding depth, not wherever a
+        // stale entry happens to sit: scanning the binding scopes (which
+        // every binder — decl, param, assignment — writes at its home
+        // depth) so a nested assignment may not orphan the node in an
+        // inner map that dies with its scope. `scopes` and
+        // `scalar_nodes` are index-aligned (enter/exit, resets).
         let depth = self
             .walk
-            .scalar_nodes
+            .scopes
             .iter()
             .rposition(|s| s.contains_key(name))
             .unwrap_or(self.walk.scalar_nodes.len() - 1);

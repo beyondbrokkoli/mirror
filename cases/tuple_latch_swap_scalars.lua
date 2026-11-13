@@ -1,9 +1,9 @@
 -- EXPECT: 2	1
--- The latch swap, hand-written: the exact composition customer #1
--- (name-target tuple assignment, the T2 lane) desugars 'x, y = y, x'
--- into. Probe-proven 2026-11-05 (P1, archived LOGS §3) and re-proven
--- 2026-11-13 at c515053; pinned in the corpus so the T2 desugar has a
--- green oracle that predates it.
+-- The latch swap, hand-written: the composition T2's 'x, y = y, x'
+-- desugars into — same temps and values; the sugar emits the stores
+-- right-to-left (the judge's order; distinct names never observe it).
+-- Probe-proven 2026-11-05 (P1, archived LOGS §3), re-proven
+-- 2026-11-13 at c515053, and oracle to tuple_name_swap since T2.
 local x = 1
 local y = 2
 do

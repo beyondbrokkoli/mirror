@@ -1,5 +1,6 @@
 use crate::ast::{BinOp, CtorKey, Expr, Loc, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
+use crate::elaborate::TupleTarget;
 use crate::lexer::Token;
 use crate::shape::BOUNDS_FAIL_THRESHOLD;
 use std::collections::BTreeSet;
@@ -467,35 +468,36 @@ impl<'a> Parser<'a> {
                 values.len()
             ))));
         }
-        let mut cells = Vec::with_capacity(targets.len());
+        // A name target rebinds through the latch like any plain '='
+        // (T2); the checker's scope law still demands the declaration,
+        // at the header's line.
+        let mut slots = Vec::with_capacity(targets.len());
         for target in targets {
             match target {
-                Expr::Index { obj, key, .. } => cells.push((*obj, *key)),
+                Expr::Index { obj, key, .. } => slots.push(TupleTarget::Cell {
+                    obj: *obj,
+                    key: *key,
+                }),
                 Expr::Field { obj, name, .. } => {
                     alm_rt::trace::compiler_trace_signal(alm_rt::trace::TRACE_PARSE_STRKEY_DOT);
-                    cells.push((
-                        *obj,
-                        Expr::String {
+                    slots.push(TupleTarget::Cell {
+                        obj: *obj,
+                        key: Expr::String {
                             value: name,
                             id: NodeId::mint(),
                         },
-                    ));
+                    });
                 }
-                Expr::Identifier { name, .. } => {
-                    return Err(ParseError(Diagnostic::syntax(format!(
-                        "cannot tuple-assign the name '{name}' — tuple assignment \
-                         targets cells ('t[k]' or 't.k'); names rebind through plain '=' or \
-                         'local'"
-                    ))));
-                }
+                Expr::Identifier { name, .. } => slots.push(TupleTarget::Name(name)),
                 _ => {
                     return Err(ParseError(Diagnostic::syntax(
-                        "tuple assignment targets cells — 't[k]' or 't.k'",
+                        "tuple assignment targets cells or names — 't[k]', 't.k', or a \
+                         declared name",
                     )));
                 }
             }
         }
-        Ok(crate::elaborate::desugar_tuple_assign(at, cells, values))
+        Ok(crate::elaborate::desugar_tuple_assign(at, slots, values))
     }
 
     fn peek_not_block_end(&mut self) -> bool {

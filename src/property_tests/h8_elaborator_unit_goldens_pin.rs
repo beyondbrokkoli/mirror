@@ -67,26 +67,26 @@ fn h8_elaborator_unit_goldens_pin() {
     assert_eq!(ubody[0].loc().line, 8);
 
     let cells = vec![
-        (
-            Expr::Identifier {
+        elaborate::TupleTarget::Cell {
+            obj: Expr::Identifier {
                 name: "o".into(),
                 id: NodeId::mint(),
             },
-            Expr::Integer {
+            key: Expr::Integer {
                 value: 0,
                 id: NodeId::mint(),
             },
-        ),
-        (
-            Expr::Identifier {
+        },
+        elaborate::TupleTarget::Cell {
+            obj: Expr::Identifier {
                 name: "o".into(),
                 id: NodeId::mint(),
             },
-            Expr::Integer {
+            key: Expr::Integer {
                 value: 1,
                 id: NodeId::mint(),
             },
-        ),
+        },
     ];
     let values = vec![
         Expr::Integer {
@@ -136,12 +136,12 @@ fn h8_elaborator_unit_goldens_pin() {
     // The dependent-key shape: target 0's key reads a cell, so it
     // latches into tuple$k0 ahead of the value temps.
     let cells = vec![
-        (
-            Expr::Identifier {
+        elaborate::TupleTarget::Cell {
+            obj: Expr::Identifier {
                 name: "o".into(),
                 id: NodeId::mint(),
             },
-            Expr::Index {
+            key: Expr::Index {
                 obj: Box::new(Expr::Identifier {
                     name: "o".into(),
                     id: NodeId::mint(),
@@ -152,17 +152,17 @@ fn h8_elaborator_unit_goldens_pin() {
                 }),
                 id: NodeId::mint(),
             },
-        ),
-        (
-            Expr::Identifier {
+        },
+        elaborate::TupleTarget::Cell {
+            obj: Expr::Identifier {
                 name: "o".into(),
                 id: NodeId::mint(),
             },
-            Expr::Integer {
+            key: Expr::Integer {
                 value: 1,
                 id: NodeId::mint(),
             },
-        ),
+        },
     ];
     let values = vec![
         Expr::Integer {

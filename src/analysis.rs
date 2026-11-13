@@ -289,14 +289,16 @@ fn for_desugar_header_check(s: &Stmt) {
 }
 
 fn tuple_assign_check(s: &Stmt) {
+    // The fingerprint is the namespace itself: '$' never lexes in a
+    // source identifier, so a block opening on a tuple$ decl is the
+    // sugar — whichever target latched first (a name target or an
+    // inline prefix at index 0 leaves the decl opening on a later
+    // target's temp).
     if let Stmt::Do { body, .. } = s
         && matches!(
             body.first(),
             Some(Stmt::LocalDecl { names, .. })
-                if !names.is_empty()
-                    && (names[0] == "tuple$o0"
-                        || names[0] == "tuple$k0"
-                        || names[0] == "tuple$t0")
+                if names.first().is_some_and(|n| n.starts_with("tuple$"))
         )
     {
         let header = s.loc().line;
@@ -377,56 +379,87 @@ fn tuple_assign_check(s: &Stmt) {
             );
         }
         // The stores run right-to-left: block statement j carries the
-        // store for target m-1-j, reading tuple$t{m-1-j} and the
-        // target's latch temps exactly where the decl declared them.
+        // store for target m-1-j, reading tuple$t{m-1-j}. A cell store
+        // reads the target's latch temps exactly where the decl
+        // declared them; a name store (T2) rebinds a source name and
+        // owns no latch — a name has no prefix to evaluate.
         for (j, stmt) in body[1..].iter().enumerate() {
             let i = m - 1 - j;
-            let Stmt::IndexAssign {
-                obj, key, value, ..
-            } = stmt
-            else {
-                panic!(
-                    "tuple-assign census: the block's statement {} is not the cell store — \
-                     the desugar shape changed; update the census with it (H8)",
-                    j + 1
-                );
-            };
-            if !matches!(value, Expr::Identifier { name: v, .. } if v == &format!("tuple$t{i}")) {
-                panic!(
-                    "tuple-assign census: store {j} does not read temp {i} — the \
-                     desugar shape changed; update the census with it (H8)"
-                );
-            }
-            for (e, want, what) in [(obj, 'o', "obj"), (key, 'k', "key")] {
-                let spelled = format!("tuple${want}{i}");
-                match e {
-                    Expr::Identifier { name, .. } if name == &spelled => {
-                        if !latched.contains(&spelled) {
+            let reads_temp = |value: &Expr| matches!(value, Expr::Identifier { name: v, .. } if v == &format!("tuple$t{i}"));
+            match stmt {
+                Stmt::IndexAssign {
+                    obj, key, value, ..
+                } => {
+                    if !reads_temp(value) {
+                        panic!(
+                            "tuple-assign census: store {j} does not read temp {i} — the \
+                             desugar shape changed; update the census with it (H8)"
+                        );
+                    }
+                    for (e, want, what) in [(obj, 'o', "obj"), (key, 'k', "key")] {
+                        let spelled = format!("tuple${want}{i}");
+                        match e {
+                            Expr::Identifier { name, .. } if name == &spelled => {
+                                if !latched.contains(&spelled) {
+                                    panic!(
+                                        "tuple-assign census: store {j}'s {what} reads \
+                                         '{spelled}' but the decl never latched it — the \
+                                         desugar shape changed; update the census with it (H8)"
+                                    );
+                                }
+                            }
+                            Expr::Identifier { name, .. } if name.starts_with("tuple$") => {
+                                panic!(
+                                    "tuple-assign census: store {j}'s {what} reads '{name}', \
+                                     not '{spelled}' — the desugar shape changed; update the \
+                                     census with it (H8)"
+                                );
+                            }
+                            _ if latched.contains(&spelled) => {
+                                panic!(
+                                    "tuple-assign census: target {i} latched its {what} but \
+                                     store {j} does not read '{spelled}' — the desugar shape \
+                                     changed; update the census with it (H8)"
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    check(&format!("cell store {j}"), stmt);
+                }
+                Stmt::Assignment { name, expr, .. } => {
+                    if !reads_temp(expr) {
+                        panic!(
+                            "tuple-assign census: store {j} does not read temp {i} — the \
+                             desugar shape changed; update the census with it (H8)"
+                        );
+                    }
+                    if name.starts_with("tuple$") {
+                        panic!(
+                            "tuple-assign census: name store {j} rebinds the synthetic \
+                             '{name}' — a name store targets a source name; the desugar \
+                             shape changed; update the census with it (H8)"
+                        );
+                    }
+                    for want in ['o', 'k'] {
+                        let spelled = format!("tuple${want}{i}");
+                        if latched.contains(&spelled) {
                             panic!(
-                                "tuple-assign census: store {j}'s {what} reads \
-                                 '{spelled}' but the decl never latched it — the \
+                                "tuple-assign census: target {i} is the name '{name}' but \
+                                 the decl latched '{spelled}' — a name has no prefix; the \
                                  desugar shape changed; update the census with it (H8)"
                             );
                         }
                     }
-                    Expr::Identifier { name, .. } if name.starts_with("tuple$") => {
-                        panic!(
-                            "tuple-assign census: store {j}'s {what} reads '{name}', \
-                             not '{spelled}' — the desugar shape changed; update the \
-                             census with it (H8)"
-                        );
-                    }
-                    _ if latched.contains(&spelled) => {
-                        panic!(
-                            "tuple-assign census: target {i} latched its {what} but \
-                             store {j} does not read '{spelled}' — the desugar shape \
-                             changed; update the census with it (H8)"
-                        );
-                    }
-                    _ => {}
+                    check(&format!("name store {j}"), stmt);
                 }
+                _ => panic!(
+                    "tuple-assign census: the block's statement {} is neither a cell store \
+                     nor a name store — the desugar shape changed; update the census with \
+                     it (H8)",
+                    j + 1
+                ),
             }
-            check(&format!("cell store {j}"), stmt);
         }
     }
 }
