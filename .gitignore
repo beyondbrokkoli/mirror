@@ -11,3 +11,9 @@ diff
 *.md
 docs
 .uncomment.toml
+async/probe/libalm_async.so
+async/probe/probe
+async/probe/probe_1lane
+async/probe/probe_backpressure
+async/probe/probe_recycle
+async/probe/probe_tenant
