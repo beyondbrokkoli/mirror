@@ -1,4 +1,3 @@
-
 BIN = "target/release/alm"
 
 OUT = "target/run_out.txt"
@@ -31,29 +30,91 @@ function copy_file(src, dst)
     return true
 end
 
--- Pin grammar and classification rules: README.md. Unknown EXPECT_*
+function clean_artifacts()
+    os.remove("libalm_out.ll")
+    os.remove("libalm_out.so")
+    os.remove("alm_out.ll")
+    os.remove("alm_out")
+    os.remove(".alm_trace.bin")
+    os.remove(".alm_rt_trace.bin")
+    os.remove(OUT)
+    os.remove(ERR)
+end
+
+-- Execute a shell command and return (ok, timed_out, exit_code)
+function exec_cmd(cmd)
+    local ok, how, code = os.execute(cmd)
+    if type(ok) == "number" then
+        -- Lua 5.1 compatibility: os.execute returns raw waitpid status
+        local status = (ok >= 256) and math.floor(ok / 256) or ok
+        return status == 0, status == 124, status
+    end
+    local timed_out = (how == "exit" and code == 124)
+    return ok == true, timed_out, code or -1
+end
+
+function split_lines(s)
+    local t = {}
+    if s == "" then return t end
+    s = s:gsub("\r\n", "\n"):gsub("\r", "\n")
+    if s:sub(-1) == "\n" then
+        s = s:sub(1, -2)
+    end
+    for line in (s .. "\n"):gmatch("(.-)\n") do
+        table.insert(t, line)
+    end
+    return t
+end
+
+-- Pin grammar and classification rules: see README.md.
+-- Unknown EXPECT_* prefixes are recorded in pins.unknown so the runner
+-- can surface typos instead of silently dropping pins.
 function parse_pins(content)
-    local pins = { expect = {}, build_fail = {}, panic = {}, unknown = {} }
-    for prefix, rest in content:gmatch("%-%-%s*(EXPECT[_A-Z]*):%s*([^\r\n]+)") do
-        if prefix == "EXPECT" then
-            table.insert(pins.expect, rest)
-        elseif prefix == "EXPECT_BUILD_FAIL" then
-            table.insert(pins.build_fail, rest)
-        elseif prefix == "EXPECT_PANIC" then
-            table.insert(pins.panic, rest)
+    local pins = {
+        expect = {},
+        build_fail = {},
+        panic = {},
+        unknown = {},
+        dup_meta = {}
+    }
+    for _, line in ipairs(split_lines(content)) do
+        local prefix, rest = line:match("^%s*%-%-%s*(EXPECT[_A-Z]*):%s?(.*)$")
+        if prefix then
+            if prefix == "EXPECT" then
+                table.insert(pins.expect, rest)
+            elseif prefix == "EXPECT_BUILD_FAIL" then
+                table.insert(pins.build_fail, rest)
+            elseif prefix == "EXPECT_PANIC" then
+                table.insert(pins.panic, rest)
+            else
+                table.insert(pins.unknown, prefix)
+            end
         else
-            table.insert(pins.unknown, prefix)
+            local args = line:match("^%s*%-%-%s*ARGS:%s*(.+)$")
+            if args then
+                if pins.args then table.insert(pins.dup_meta, "ARGS") end
+                pins.args = args
+            end
+            local flags = line:match("^%s*%-%-%s*FLAGS:%s*(.+)$")
+            if flags then
+                if pins.flags then table.insert(pins.dup_meta, "FLAGS") end
+                pins.flags = flags
+            end
         end
     end
-    pins.args = content:match("%-%-%s*ARGS:%s*([^\r\n]+)")
-    pins.flags = content:match("%-%-%s*FLAGS:%s*([^\r\n]+)")
     return pins
 end
 
 function scan_corpus()
-    local corpus = { positive = {}, negative = {}, panic = {},
-                     bad = {}, odd = {}, pins = {} }
-    local p = io.popen("ls " .. CASES_DIR .. " 2>/dev/null")
+    local corpus = {
+        positive = {},
+        negative = {},
+        panic = {},
+        bad = {},
+        odd = {},
+        pins = {}
+    }
+    local p = io.popen("ls '" .. CASES_DIR .. "' 2>/dev/null")
     for name in p:lines() do
         if name:sub(-4) == ".lua" then
             local pins = parse_pins(read_file(CASES_DIR .. "/" .. name))
@@ -64,6 +125,8 @@ function scan_corpus()
                 why = "carries both EXPECT_BUILD_FAIL and EXPECT_PANIC pins"
             elseif is_neg and #pins.expect > 0 then
                 why = "negative (EXPECT_BUILD_FAIL) but also carries EXPECT pins"
+            elseif #pins.dup_meta > 0 then
+                why = "duplicate metadata pin(s): " .. table.concat(pins.dup_meta, ", ")
             end
             if why then
                 table.insert(corpus.bad, { name, why })
@@ -84,12 +147,14 @@ function scan_corpus()
 end
 
 function run_case(src, args, with_backtrace, flags)
+    clean_artifacts()
     local bt = with_backtrace and "RUST_BACKTRACE=1 " or ""
     local argstr = args and (" " .. args) or ""
     local flagstr = flags and (flags .. " ") or ""
-    local res = os.execute(string.format(
-        "%stimeout 120 %s %s'%s'%s > %s 2> %s", bt, BIN, flagstr, src, argstr, OUT, ERR))
-    return res == true or res == 0
+    local cmd = string.format(
+        "%stimeout 120 %s %s'%s'%s > %s 2> %s",
+        bt, BIN, flagstr, src, argstr, OUT, ERR)
+    return exec_cmd(cmd)
 end
 
 function compile_succeeded()
@@ -101,22 +166,36 @@ function compile_succeeded_exe()
 end
 
 function run_case_exe(src, flags)
-    local flagstr = flags and (flags .. " ") or ""
-    local res = os.execute(string.format(
-        "timeout 120 %s %s--exe '%s' > %s 2> %s", BIN, flagstr, src, OUT, ERR))
-    return res == true or res == 0
+    clean_artifacts()
+    local clean_flags = flags and flags:gsub("%-%-exe%s*", "") or ""
+    local flagstr = (clean_flags ~= "") and (clean_flags .. " ") or ""
+    local cmd = string.format(
+        "timeout 120 %s %s--exe '%s' > %s 2> %s",
+        BIN, flagstr, src, OUT, ERR)
+    return exec_cmd(cmd)
 end
 
-function run_exe_with(argstr)
-    local res = os.execute(string.format(
-        "timeout 120 ./alm_out%s > %s 2> %s", argstr, OUT, ERR))
-    return res == true or res == 0
+function run_exe_with(argstr, with_backtrace)
+    os.remove(OUT)
+    os.remove(ERR)
+    local bt = with_backtrace and "RUST_BACKTRACE=1 " or ""
+    local cmd = string.format(
+        "%stimeout 120 ./alm_out%s > %s 2> %s",
+        bt, argstr or "", OUT, ERR)
+    return exec_cmd(cmd)
 end
 
--- report goes to stderr and never touches EXPECT pins).
+function compiler_panicked()
+    local s = read_file(ERR)
+    return s:find("panicked at", 1, true) ~= nil
+        or s:find("thread 'main' panicked", 1, true) ~= nil
+end
+
+-- Strip the compiler's own success banner from stdout so only the script's
+-- stdout lines remain (error reports go to stderr and never touch EXPECT pins).
 function script_stdout()
     local lines = {}
-    for line in read_file(OUT):gmatch("[^\r\n]+") do
+    for _, line in ipairs(split_lines(read_file(OUT))) do
         if not line:find("Success! Shared library written", 1, true)
             and not line:find("Success! executable written", 1, true) then
             table.insert(lines, line)
@@ -125,12 +204,18 @@ function script_stdout()
     return table.concat(lines, "\n")
 end
 
-function first_error(path)
+function first_error(path, timed_out)
+    if timed_out then
+        return "TIMEOUT (exceeded 120s limit)"
+    end
     local s = read_file(path)
     local msg = s:match("panicked at.-\n%s*([^\n]+)")
     if not msg then
-        for line in s:gmatch("[^\r\n]+") do
-            if line:find("Error", 1, true) then msg = line break end
+        for _, line in ipairs(split_lines(s)) do
+            if line:find("Error", 1, true) then
+                msg = line
+                break
+            end
         end
     end
     return msg
