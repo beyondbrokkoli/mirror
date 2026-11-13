@@ -293,7 +293,10 @@ fn tuple_assign_check(s: &Stmt) {
         && matches!(
             body.first(),
             Some(Stmt::LocalDecl { names, .. })
-                if !names.is_empty() && names[0] == "tuple$t0"
+                if !names.is_empty()
+                    && (names[0] == "tuple$o0"
+                        || names[0] == "tuple$k0"
+                        || names[0] == "tuple$t0")
         )
     {
         let header = s.loc().line;
@@ -310,38 +313,120 @@ fn tuple_assign_check(s: &Stmt) {
         let Stmt::LocalDecl { names, .. } = &body[0] else {
             unreachable!("the fingerprint arm matched a LocalDecl")
         };
-        for (i, name) in names.iter().enumerate() {
-            if name != &format!("tuple$t{i}") {
+        // The decl names are the latch block — per target, in target
+        // order: optional tuple$o{i} then optional tuple$k{i}, i
+        // strictly increasing — followed by the contiguous value tail
+        // tuple$t0..tuple$t{m-1}.
+        let mut latched: BTreeSet<String> = BTreeSet::new();
+        let mut last_idx: Option<usize> = None;
+        let mut seen_k = false;
+        let mut in_tail = false;
+        let mut m = 0usize;
+        for name in names {
+            let Some((kind, idx)) = name.as_str().strip_prefix("tuple$").and_then(|rest| {
+                let mut cs = rest.chars();
+                let kind = cs.next()?;
+                if !matches!(kind, 'o' | 'k' | 't') {
+                    return None;
+                }
+                Some((kind, cs.as_str().parse::<usize>().ok()?))
+            }) else {
                 panic!(
-                    "tuple-assign census: temp {i} is named '{name}', not 'tuple$t{i}' — \
-                     the desugar shape changed; update the census with it (H8)"
+                    "tuple-assign census: temp '{name}' does not spell \
+                     tuple$o<i>/tuple$k<i>/tuple$t<i> — the desugar shape changed; \
+                     update the census with it (H8)"
+                );
+            };
+            if kind == 't' {
+                if idx != m {
+                    panic!(
+                        "tuple-assign census: value temp {m} is named \
+                         'tuple$t{idx}' — the desugar shape changed; update the \
+                         census with it (H8)"
+                    );
+                }
+                in_tail = true;
+                m += 1;
+                continue;
+            }
+            if in_tail {
+                panic!(
+                    "tuple-assign census: latch temp '{name}' sits after the value \
+                     tail — the desugar shape changed; update the census with it (H8)"
                 );
             }
+            if kind == 'k' && last_idx == Some(idx) && !seen_k {
+                seen_k = true; // tuple$o{i} then tuple$k{i} — legal
+            } else if Some(idx) > last_idx {
+                last_idx = Some(idx);
+                seen_k = kind == 'k';
+            } else {
+                panic!(
+                    "tuple-assign census: latch temps out of order at '{name}' — the \
+                     desugar shape changed; update the census with it (H8)"
+                );
+            }
+            latched.insert(name.clone());
         }
         check("temp decl", &body[0]);
-        if body.len() != names.len() + 1 {
+        if body.len() != m + 1 {
             panic!(
-                "tuple-assign census: {} temps but {} statements in the block — the desugar \
-                 shape changed; update the census with it (H8)",
-                names.len(),
+                "tuple-assign census: {m} temps but {} statements in the block — the \
+                 desugar shape changed; update the census with it (H8)",
                 body.len() - 1
             );
         }
-        for (i, stmt) in body[1..].iter().enumerate() {
-            let Stmt::IndexAssign { value, .. } = stmt else {
+        // The stores run right-to-left: block statement j carries the
+        // store for target m-1-j, reading tuple$t{m-1-j} and the
+        // target's latch temps exactly where the decl declared them.
+        for (j, stmt) in body[1..].iter().enumerate() {
+            let i = m - 1 - j;
+            let Stmt::IndexAssign {
+                obj, key, value, ..
+            } = stmt
+            else {
                 panic!(
                     "tuple-assign census: the block's statement {} is not the cell store — \
                      the desugar shape changed; update the census with it (H8)",
-                    i + 1
+                    j + 1
                 );
             };
             if !matches!(value, Expr::Identifier { name: v, .. } if v == &format!("tuple$t{i}")) {
                 panic!(
-                    "tuple-assign census: store {i} does not read temp {i} — the \
+                    "tuple-assign census: store {j} does not read temp {i} — the \
                      desugar shape changed; update the census with it (H8)"
                 );
             }
-            check(&format!("cell store {i}"), stmt);
+            for (e, want, what) in [(obj, 'o', "obj"), (key, 'k', "key")] {
+                let spelled = format!("tuple${want}{i}");
+                match e {
+                    Expr::Identifier { name, .. } if name == &spelled => {
+                        if !latched.contains(&spelled) {
+                            panic!(
+                                "tuple-assign census: store {j}'s {what} reads \
+                                 '{spelled}' but the decl never latched it — the \
+                                 desugar shape changed; update the census with it (H8)"
+                            );
+                        }
+                    }
+                    Expr::Identifier { name, .. } if name.starts_with("tuple$") => {
+                        panic!(
+                            "tuple-assign census: store {j}'s {what} reads '{name}', \
+                             not '{spelled}' — the desugar shape changed; update the \
+                             census with it (H8)"
+                        );
+                    }
+                    _ if latched.contains(&spelled) => {
+                        panic!(
+                            "tuple-assign census: target {i} latched its {what} but \
+                             store {j} does not read '{spelled}' — the desugar shape \
+                             changed; update the census with it (H8)"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            check(&format!("cell store {j}"), stmt);
         }
     }
 }

@@ -1,10 +1,10 @@
--- EXPECT: 2
--- WIP pin for the Lua 5.1/LuaJIT conformance lane (T1). Duplicate
--- cell targets store left-to-right today, so the last store wins.
--- The judge disagrees: LuaJIT 2.1 and PUC Lua both print 1 (their
--- stores run right-to-left). T1 flips this pin to 1 by reversing the
--- desugar's store order; the flip is observable ONLY through
--- duplicate targets, so this case is its tripwire.
+-- EXPECT: 1
+-- The store-order tripwire (T1): duplicate cell targets store
+-- right-to-left — the judge's order — so the FIRST target's store is
+-- the last to land and wins. LuaJIT 2.1 and PUC Lua both print 1;
+-- the dialect matches since T1 flipped the desugar's store order.
+-- Observable ONLY through duplicate targets, which is why this case
+-- exists.
 local o = {0}
 o[0], o[0] = 1, 2
 print(o[0])

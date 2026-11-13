@@ -4,6 +4,8 @@
 fn h8_census_trips_on_tuple_wrong_line() {
     use crate::ast::Loc;
     let at = |line: u32| Loc { line, col: 1 };
+    // The store for target i carries temp i; the census sees them in
+    // emission order — target 1 first, target 0 last.
     let store = |i: usize, line: u32| Stmt::IndexAssign {
         obj: Expr::Identifier {
             name: "o".into(),
@@ -37,8 +39,8 @@ fn h8_census_trips_on_tuple_wrong_line() {
                 loc: at(2),
                 id: NodeId::mint(),
             },
-            store(0, 2),
-            store(1, 9),
+            store(1, 2),
+            store(0, 9),
         ],
         loc: at(2),
         id: NodeId::mint(),
