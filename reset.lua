@@ -7,6 +7,12 @@ local function usage()
     print([[
 Rewrites every buildable case's IR baseline in ]] .. LOCK_DIR .. [[/.
 
+The authoring overwrite for run.lua's drift observatory: baselines are
+rewritten from THIS build and drift detection restarts here. Relock on
+wanted drift only — a deliberate change, fix or improvement — or to give
+new cases their first baseline. A green run.lua right afterwards is a
+self-check, not a receipt: the baselines came from the same build.
+
 Usage: lua reset.lua]])
 end
 
@@ -107,5 +113,15 @@ do
     local p = io.popen("git rev-parse --short HEAD 2>/dev/null")
     local h = p:read("*l") or "?"
     p:close()
+    -- The origin stamp rides with the locks (a dotfile: the ls-based
+    -- orphan sweeps never see it). run.lua's summary reads it back, so
+    -- a green run at this commit identifies itself as a self-check.
+    local f = io.open(LOCK_DIR .. "/.origin", "w")
+    if f then
+        f:write(string.format("%s locked %s\n", h, os.date("%Y-%m-%d %H:%M:%S")))
+        f:close()
+    end
     io.write(string.format("   at commit %s, %s\n", h, os.date("locked %Y-%m-%d %H:%M:%S")))
+    io.write("   baselines describe THIS build — a green run.lua now is a self-check,\n")
+    io.write("   not a drift receipt; the observatory restarts here\n")
 end

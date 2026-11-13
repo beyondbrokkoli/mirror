@@ -25,6 +25,19 @@ Flags (any position):
                 (cargo +nightly miri test --lib — the rt.rs UB oracle;
                 slow, needs the nightly toolchain with the component)
 
+Locks (lock/ is untracked — the .ll baselines are wordy):
+  fresh clone  no baselines: bootstrap once with --relock
+  every run    the drift observatory — fresh IR byte-compared against
+               lock/; drift means a refactor changed program behaviour.
+               The locks are meant to drift when something legitimately
+               changes; the observatory makes the change visible
+  --relock     the authoring overwrite: rewrite baselines from this
+               build, on wanted drift (a deliberate change, fix or
+               improvement) or to give new cases a first baseline. A
+               green run right after is a self-check, not a receipt —
+               the baselines came from the same build (the summary
+               names the lock origin)
+
 Quiet when green: one summary line; failures and action-needed notices
 print as they happen; exit nonzero on any failure.]])
 end
@@ -601,6 +614,22 @@ end
 if not CASES_OVERRIDE and not NO_LOCK then
     local compared = lock_identical + lock_drifted + lock_errored
     local lockpart = string.format("lock %d/%d", lock_identical, compared)
+    -- Origin provenance: reset.lua stamps lock/.origin. A green run at
+    -- the same commit compared the build against itself — say so, so a
+    -- self-check never poses as a drift receipt.
+    local origin = read_file(LOCK_DIR .. "/.origin")
+    local ohash, odate = origin:match("^(%S+) locked (.-)%s*$")
+    if ohash then
+        local p = io.popen("git rev-parse --short HEAD 2>/dev/null")
+        local head = p:read("*l")
+        p:close()
+        if head and ohash == head then
+            lockpart = lockpart
+                .. string.format(" (origin = HEAD %s — self-check, not a receipt)", ohash)
+        else
+            lockpart = lockpart .. string.format(" (origin %s, %s)", ohash, odate)
+        end
+    end
     if lock_missing > 0 then
         lockpart = lockpart .. string.format(" (+%d missing)", lock_missing)
     end

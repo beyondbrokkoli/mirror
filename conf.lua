@@ -66,9 +66,10 @@ function split_lines(s)
     return t
 end
 
--- Pin grammar and classification rules: see README.md.
--- Unknown EXPECT_* prefixes are recorded in pins.unknown so the runner
--- can surface typos instead of silently dropping pins.
+-- Pin grammar and classification rules: run.lua's usage text is the
+-- documentation of record (there is no README). Unknown EXPECT_*
+-- prefixes are recorded in pins.unknown so the runner can surface
+-- typos instead of silently dropping pins.
 function parse_pins(content)
     local pins = {
         expect = {},

@@ -2,6 +2,7 @@ target
 libalm_out.so
 alm_out
 *.ll
+lock/.origin
 .alm_rt_trace.bin
 .alm_trace.bin
 __pycache__
