@@ -752,7 +752,10 @@ fn valid_slot_addr(addr: usize) -> bool {
 }
 
 unsafe fn set_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64, cell: C) {
-    debug_assert!(is_str_key(key), "skey store outside the reserved range");
+    debug_assert!(
+        is_str_key(key) || key == NIL_KEY,
+        "skey store outside the reserved range (tagged string key or the -1 nil park)"
+    );
     let tbl = unsafe { &mut *t };
     unsafe { overflow_map(tbl).insert(key, cell.to_lane()) };
 }
@@ -785,7 +788,10 @@ unsafe fn get_core<C: CellRepr>(t: *mut AlmTable, index: i64) -> C {
 }
 
 unsafe fn get_skey_core<C: CellRepr>(t: *mut AlmTable, key: i64) -> C {
-    debug_assert!(is_str_key(key), "skey read outside the reserved range");
+    debug_assert!(
+        is_str_key(key) || key == NIL_KEY,
+        "skey read outside the reserved range (tagged string key or the -1 nil park)"
+    );
     let tbl = unsafe { &mut *t };
     if !tbl.sparse_map.is_null()
         && let Some(&lane) = unsafe { (&*tbl.sparse_map).get(&key) }
@@ -1244,7 +1250,7 @@ pub unsafe extern "C" fn alm_str_intern(s: *const u8, len: usize) -> *const u8 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
     if s.is_null() {
-        return -1;
+        return NIL_KEY;
     }
     let key_ptr = unsafe { (s as *const i64).sub(1) };
     debug_assert!(key_ptr.addr() & 7 == 0, "alm_str_key prefix not 8-aligned");
@@ -1252,6 +1258,12 @@ pub unsafe extern "C" fn alm_str_key(s: *const u8) -> i64 {
 }
 
 pub const STR_KEY_TAG: i64 = i64::MIN;
+
+/// The nil park: alm_str_key(NULL) maps a nil key to -1 — the one
+/// non-skey occupant the skey lanes admit. Minted keys force the tag
+/// bits (top two `10`), and far integer keys park positive, so -1 is
+/// collision-free by construction.
+pub const NIL_KEY: i64 = -1;
 
 #[inline]
 pub fn is_str_key(index: i64) -> bool {

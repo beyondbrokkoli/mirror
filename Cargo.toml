@@ -19,3 +19,8 @@ path = "src/main.rs"
 opt-level = 3
 codegen-units = 1
 panic = "abort"
+# The rt alignment laws ride debug_assert! — keep them live in release so
+# every corpus run and `cargo test --release` leg validates them (an assert
+# trip aborts loud under panic=abort; the battery reports it as a run
+# failure). The alignment is pure; this keeps proving it.
+debug-assertions = true

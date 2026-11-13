@@ -439,15 +439,15 @@ it defaults to libalm_out.so (or alm_out for --exe).";
     std::fs::remove_file(&output_file).ok();
     std::fs::write(&ll_name, llvm_ir).expect("Failed to write LLVM IR");
 
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
+    // The runtime staticlib must come from the profile this compiler was
+    // built with — ALM_PROFILE (re-exported by build.rs from Cargo's
+    // PROFILE) names it exactly. A cfg!(debug_assertions) heuristic
+    // silently mislinks once debug-assertions ride the release profile:
+    // a release compiler reaching for a stale target/debug runtime.
     let runtime = format!(
         "{}/target/{}/libalm_rt.a",
         env!("CARGO_MANIFEST_DIR"),
-        profile
+        env!("ALM_PROFILE")
     );
     let async_dir = std::path::Path::new(&runtime)
         .parent()

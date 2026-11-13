@@ -80,6 +80,13 @@ fn build_async_core() {
 
 fn main() {
     println!("cargo:rerun-if-changed=trace_signals.txt");
+    // The profile name rides to the compiler as a compile-time constant:
+    // cfg!(debug_assertions) mislinks the runtime staticlib the moment
+    // debug-assertions ride the release profile.
+    println!(
+        "cargo:rustc-env=ALM_PROFILE={}",
+        env::var("PROFILE").unwrap_or_else(|_| "debug".into())
+    );
     emit_corpus_manifest();
     build_async_core();
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
