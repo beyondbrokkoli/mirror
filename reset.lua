@@ -89,7 +89,6 @@ for _, filename in ipairs(lockables) do
     local src = STAGING_DIR .. "/" .. ll_name
     local dest = LOCK_DIR .. "/" .. ll_name
     copy_file(src, dest)
-    print(string.format("\27[32m✓\27[0m locked %s", dest))
 end
 os.execute("rm -rf '" .. STAGING_DIR .. "'")
 
