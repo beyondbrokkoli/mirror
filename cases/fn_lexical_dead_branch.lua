@@ -1,4 +1,4 @@
--- EXPECT: 2
+-- EXPECT: 1
 -- EXPECT: 0
 local f = function() return 1 end
 local x = 0

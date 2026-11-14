@@ -794,16 +794,14 @@ impl Analyzer {
                     }
                     head = merged;
                 }
-                let latch_faces = face_projections(&self.walk.scopes);
                 self.loop_scope_entries.pop();
                 self.walk.scopes = head;
-                // The face law: fn and scalar-node writes ride program
-                // order past the latch — the old rider stacks were never
-                // reset between iterations and the merge never touched
-                // them, so the last body iteration's writes stand.
-                // (Prov is the exception: it is latched explicitly
-                // below, exactly as before.)
-                apply_face_projections(&mut self.walk.scopes, &latch_faces);
+                // The face flip (the judge's law, 2026-11-14): a body's
+                // fn and scalar-node writes die with the fixpoint — the
+                // head's faces stand past the latch, so a body (live or
+                // never-taken) cannot re-point a name's inline
+                // expansion. (Prov is the exception: it is latched
+                // explicitly below, exactly as before.)
                 // The latch's prov tagging: a name whose aliases moved
                 // across the loop loses its provenance. The face write
                 // lands on the binding (today: a prov rider insert).
@@ -840,15 +838,14 @@ impl Analyzer {
                     an.decide_scope_exit(rec, (stmt.id(), 0))
                 })?;
                 let then_exit = self.walk.scopes.clone();
-                let then_faces = face_projections(&self.walk.scopes);
                 self.walk.scopes = snapshot;
-                // The face law: fn and scalar-node writes ride program
-                // order across the arms — the old rider stacks were
-                // never snapshotted by this statement, so the then
-                // arm's writes stand for the else arm's reads and for
-                // the join. Prov is the exception: it was snapshotted
-                // and restored, and the bindings carry it back exactly.
-                apply_face_projections(&mut self.walk.scopes, &then_faces);
+                // The face flip (the judge's law, 2026-11-14): the arms
+                // run on the entry snapshot's faces — a branch's fn and
+                // scalar-node writes die with its arm (dead or taken),
+                // so no arm re-points a name's inline expansion for the
+                // other arm's reads or for the join. Prov is the
+                // exception: it was snapshotted and restored, and the
+                // bindings carry it back exactly.
                 self.with_scope(|an| {
                     an.walk_stmts(rec, else_body);
                     an.decide_scope_exit(rec, (stmt.id(), 1))
@@ -1120,39 +1117,6 @@ fn merge_table_scopes(into: &mut [Scope], a: &[Scope], b: &[Scope]) {
             }
             if let Some(x) = b_slot.get(name) {
                 val.shape.join(&x.shape);
-            }
-        }
-    }
-}
-
-/// The control-flow-transparent faces of one depth: the fn face and
-/// the scalar-node face per name — what the If/While overlays capture
-/// and reapply.
-type ArmFaces = BTreeMap<String, (Option<NodeId>, Option<usize>)>;
-
-/// The fn and scalar-node faces of a whole stack, projected out for the
-/// control-flow overlays below.
-fn face_projections(scopes: &[Scope]) -> Vec<ArmFaces> {
-    scopes
-        .iter()
-        .map(|scope| {
-            scope
-                .iter()
-                .map(|(name, b)| (name.clone(), (b.fn_ptr, b.scalar_node)))
-                .collect()
-        })
-        .collect()
-}
-
-/// Re-applies a face projection onto a stack. Only the fn and
-/// scalar-node faces move; shapes and prov stay whatever the target
-/// carries.
-fn apply_face_projections(scopes: &mut [Scope], faces: &[ArmFaces]) {
-    for (scope, faces) in scopes.iter_mut().zip(faces) {
-        for (name, (fn_ptr, node)) in faces {
-            if let Some(bind) = scope.get_mut(name) {
-                bind.fn_ptr = *fn_ptr;
-                bind.scalar_node = *node;
             }
         }
     }

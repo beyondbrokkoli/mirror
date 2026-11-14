@@ -1,4 +1,4 @@
--- EXPECT: 2
+-- EXPECT: 1
 local f = function() return 1 end
 local n = 0
 while n > 0 do
