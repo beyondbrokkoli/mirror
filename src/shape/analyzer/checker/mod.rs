@@ -55,6 +55,13 @@ enum ReturnCtx {
 struct Frame {
     types: BTreeMap<String, Ty>,
     fns: BTreeMap<String, Option<NodeId>>,
+    /// Names this frame declares as CAPTURE VIEWS: an expansion frame's
+    /// depth-0 capture entries. A capture view reads the owner binding
+    /// (the boundary root for depth 0) — caller shadows below the
+    /// expansion cannot re-point it, mirroring the lowerer's capture
+    /// slots. The entry dies with its frame; the owner's type never
+    /// moves (the monomorphic law keeps the two identical anyway).
+    captures: BTreeSet<String>,
 }
 
 /// The cdef grammar's scalar tier: kinds that map onto the existing
@@ -120,6 +127,11 @@ pub(super) struct CheckFacts {
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
     pub env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
+    /// Every fn literal's capture name -> its binding's walk-scope
+    /// depth, minted or not (the walk stamps it at definition). The
+    /// lowerer's direct-expansion capture slots key off this — a
+    /// never-minted fn has no env_face_depths to read.
+    pub fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
     pub builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,

@@ -263,7 +263,11 @@ impl Analyzer {
                 )));
             }
         };
-        let (_, bind) = self.resolve(rec, base)?;
+        // The type-shaped read: a severed module record (captured into
+        // a module fn's env by the creation-capture law) still answers
+        // as the table it is — resolve_severed_view, not the raw moved
+        // state.
+        let (_, bind) = self.resolve_severed_view(rec, base)?;
         let module = bind.ty == Ffi;
         if module || bind.ty == FfiLib {
             for a in args {

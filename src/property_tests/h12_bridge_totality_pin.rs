@@ -117,10 +117,17 @@ local w = gk()
         .env_face
         .as_ref()
         .expect("the call-through records its env face");
-    assert!(
-        face.is_empty(),
-        "a top-level fn literal captures nothing — the flat module \
-         resolves top-level names late: {face:?}"
+    assert_eq!(
+        face.len(),
+        1,
+        "the Finding B fix: a top-level fn literal captures its \
+         top-level names like any other — Add1's face rides 'base': \
+         {face:?}"
+    );
+    assert_eq!(
+        face.get("base"),
+        Some(&crate::shape::Ty::Int),
+        "the resolved face carries base's cell type"
     );
 
     let maker_call = match &ast[16] {

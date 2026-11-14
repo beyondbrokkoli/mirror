@@ -48,6 +48,14 @@ impl Checker {
                 }
             }
             Stmt::Assignment { name, expr, .. } => {
+                // A write to a captured name is judge-consistent since
+                // the Finding B fix: the lowerer routes definer writes
+                // to every minted cell of the binding and folds cell
+                // writes back into the definer's slot at expansion
+                // pop — the register and the cells are one storage at
+                // every observation point. The type story rides the
+                // monomorphic law: expected (the capture's entry)
+                // unifies with actual, so no view goes stale.
                 if let Expr::Function { .. } = expr {
                     let ty = self.bind_function(lat, name, expr);
                     if let Some(frame) = self

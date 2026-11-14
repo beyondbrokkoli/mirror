@@ -40,10 +40,36 @@ impl Checker {
             )));
         }
         let caps = self.ctx.fn_captures.get(&ptr).cloned().unwrap_or_default();
+        // The face resolution reads each capture at its RECORDED DEPTH:
+        // a depth-0 capture resolves from the root projection
+        // (var_type_depth0) — the boundary-root binding is the same
+        // object from every site, and a creation-site same-name shadow
+        // must never lend its type to the face the way an innermost
+        // read would (v2's mint-inside-shadow). Deeper captures resolve
+        // innermost-first at the creation site, exactly where the mint
+        // reads their registers. The loop keeps the first error
+        // verbatim.
+        let depths = self.ctx.fn_capture_depths.get(&ptr).cloned();
         let mut face: BTreeMap<String, Ty> = BTreeMap::new();
+        let mut face_err: Option<Diagnostic> = None;
         for cap in &caps {
-            let ty = self.var_type(lat, cap)?;
-            face.insert(cap.clone(), lat.resolve(&ty));
+            let resolved = if depths.as_ref().is_some_and(|m| m.get(cap) == Some(&0)) {
+                self.var_type_depth0(lat, cap)
+            } else {
+                self.var_type(lat, cap)
+            };
+            match resolved {
+                Ok(ty) => {
+                    face.insert(cap.clone(), lat.resolve(&ty));
+                }
+                Err(err) => {
+                    face_err = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = face_err {
+            return Err(err);
         }
         match self.env_faces.get(&ptr) {
             None => {
@@ -82,6 +108,11 @@ impl Checker {
                 }
             }
         }
+        // The mint no longer arms a box-identity seam: the lowerer's
+        // write-through discipline keeps every minted cell in sync with
+        // the definer's binding, so a creation is not a storage fork —
+        // it is the view the judge sees (one variable, shared by
+        // reference).
         self.shadow_pair().creation_envs.insert(expr.id(), ptr);
         Ok(Ty::Closure(ptr))
     }
@@ -101,7 +132,16 @@ impl Checker {
             return None;
         };
         let bind = self.snap.binds.get(n)?;
-        for s in bind.aliases.iter() {
+        // A severed binding (the creation-capture law moved a captured
+        // table into its env — reachable for depth-0 tables too since
+        // the Finding B fix lets top-level bindings be captured) keeps
+        // its site identity in the severed map, not in aliases. The
+        // field resolution reads both faces.
+        let mut sites: Vec<usize> = bind.aliases.iter().copied().collect();
+        if let Some(severed) = self.snap.severed.get(n) {
+            sites.extend(severed.iter().copied());
+        }
+        for s in sites.iter() {
             if !is_root(s)
                 && !is_ghost(s)
                 && let Some(ptr) = self.closure_fields.get(&(*s, field.to_string()))
@@ -116,7 +156,11 @@ impl Checker {
         if let Expr::Identifier { name: n, .. } = expr
             && let Some(bind) = self.snap.binds.get(n)
         {
-            return bind.aliases.iter().any(|s| {
+            let mut sites: Vec<usize> = bind.aliases.iter().copied().collect();
+            if let Some(severed) = self.snap.severed.get(n) {
+                sites.extend(severed.iter().copied());
+            }
+            return sites.iter().any(|s| {
                 !is_root(s) && !is_ghost(s) && self.closure_fields.keys().any(|(site, _)| site == s)
             });
         }

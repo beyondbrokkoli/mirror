@@ -17,11 +17,24 @@ impl Checker {
                  their call sites, so a call chain may not reach back into itself"
             )));
         }
+        // Direct-call capture visibility. A depth-0 capture always
+        // passes: the boundary-root scope sits at the base of every
+        // stack this checker and the lowerer ever hold, so the capture
+        // is present at ANY call site (the Finding B lexical fix — the
+        // expansion declares the capture as a view of the root below).
+        // A deeper capture must resolve in the caller's context: the
+        // direct surface has no env, so the expansion would read the
+        // caller's same-named binding, which is the captured binding
+        // only inside the definer's lexical continuation.
         if !call_through
             && let Some(caps) = self.ctx.fn_captures.get(&fn_ptr)
             && !caps.is_empty()
         {
+            let depths = self.ctx.fn_capture_depths.get(&fn_ptr);
             for cap in caps {
+                if depths.is_some_and(|m| m.get(cap) == Some(&0)) {
+                    continue;
+                }
                 if self.frames_resolve(cap).is_none()
                     && self.active_env_override(cap).is_none()
                     && self.active_env_face(cap).is_none()
@@ -139,6 +152,32 @@ impl Checker {
             let pty = lat.fresh();
             self.declare_var(lat, p.clone(), pty.clone())?;
             lat.unify(&pty, &aty)?;
+        }
+        // The direct surface's depth-0 captures become CAPTURE VIEWS in
+        // the expansion frame: declared from the root projection
+        // (var_type_depth0 — the mint's face types ride the env on the
+        // through-value surface instead), they shadow every caller
+        // frame's same-named binding for the body's reads, mirroring
+        // the lowerer's capture slots. A param wins (fresh storage —
+        // judge semantics), and any capture the body declares over
+        // shadows naturally. The entry dies with its frame; the
+        // monomorphic law keeps the owner's type identical, so no
+        // fold-back is owed.
+        if !call_through
+            && let Some(depths) = self.ctx.fn_capture_depths.get(&fn_ptr).cloned()
+        {
+            for (n, &d) in &depths {
+                if d != 0 || def.params.contains(n) {
+                    continue;
+                }
+                let ty = self.var_type_depth0(lat, n)?;
+                let frame = self.frames.last_mut().expect(
+                    "begin_scope just pushed the expansion's frame — \
+                     the capture declaration cannot outlive it",
+                );
+                frame.types.insert(n.clone(), ty);
+                frame.captures.insert(n.clone());
+            }
         }
         self.push_return_ctx(def.ret.clone());
         let saved_loop_depth = std::mem::replace(&mut self.loop_depth, 0);

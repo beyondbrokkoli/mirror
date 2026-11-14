@@ -206,6 +206,43 @@ impl<'a> IrLowerer<'a> {
                     }
                     if let Some(env) = call_env {
                         an.enter_env_ctx(env, fn_ptr)?;
+                    } else if let Some(depths) = an.shape.fn_capture_depths.get(&fn_ptr) {
+                        // The direct surface has no env — its depth-0
+                        // captures become capture-view slots instead:
+                        // the body's reads and writes redirect to the
+                        // root slot, so a caller shadow cannot re-point
+                        // them (the Finding B lexical fix's lowerer
+                        // half; the checker declares the same views in
+                        // its expansion frame). A param wins — fresh
+                        // storage; a body decl shadows the view
+                        // naturally, and the view dies with this
+                        // scope. Deeper captures keep the dynamic
+                        // innermost reads (the direct surface's
+                        // definer-continuation surface, unchanged).
+                        let views: Vec<(String, Local)> = depths
+                            .iter()
+                            .filter(|(n, d)| **d == 0 && !def.params.contains(n))
+                            .filter_map(|(n, _)| {
+                                an.scopes[0].get(n).cloned().map(|owner| {
+                                    (
+                                        n.clone(),
+                                        Local {
+                                            reg: owner.reg,
+                                            ty: owner.ty,
+                                            layout: owner.layout,
+                                            capture: Some(0),
+                                        },
+                                    )
+                                })
+                            })
+                            .collect();
+                        let scope = an.scopes.last_mut().expect(
+                            "in_block just pushed the expansion's scope — \
+                             the capture views cannot outlive it",
+                        );
+                        for (n, view) in views {
+                            scope.insert(n, view);
+                        }
                     }
                     for s in body {
                         an.lower_stmt(s)?;
@@ -254,7 +291,15 @@ impl<'a> IrLowerer<'a> {
                 }
                 self.instance_chain.pop();
                 if call_env.is_some() {
-                    self.env_ctxs.pop();
+                    // The box-is-binding fold-back: the expansion's
+                    // face writes live in the cells; the definer's
+                    // slot and any outer expansion's face-local
+                    // snapshots re-read them before the ctx goes.
+                    let ctx = self.env_ctxs.pop().expect(
+                        "enter_env_ctx pushed the expansion's ctx — \
+                         the pop folds back before the env is forgotten",
+                    );
+                    self.fold_back_env(&ctx)?;
                 }
                 Ok(TypedReg {
                     reg: result,

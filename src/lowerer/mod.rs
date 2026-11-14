@@ -57,6 +57,14 @@ struct Local {
     reg: AnyReg,
     ty: Ty,
     layout: LayoutVerdict,
+    /// A CAPTURE VIEW marker: the slot declares a depth-0 capture of a
+    /// direct-call expansion, and `0` (the owner's walk-scope index)
+    /// is where the real binding lives. `read_var`/`update_var`
+    /// redirect through it, so the view cannot go stale and a caller
+    /// shadow at the call site cannot re-point the body's reads or
+    /// writes — the Finding B lexical fix's lowerer half. Every other
+    /// slot is a plain binding: `None`.
+    capture: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -87,12 +95,26 @@ struct ActiveReserve {
     offset: Option<Reg<Int>>,
 }
 
+/// One boxed binding's shared cell: the cell register, its element
+/// type, and every env table that holds it (the drain plan's holders,
+/// in mint order).
+type BindingCell = (Reg<Ptr>, Ty, Vec<Reg<Ptr>>);
+
 pub struct IrLowerer<'a> {
     pub blocks: Vec<BasicBlock>,
     pub diagnostics: Vec<Diagnostic>,
     current_block: BlockId,
     free_reg: RegId,
     scopes: Vec<BTreeMap<String, Local>>,
+    /// Per-scope-push identity, index-aligned with `scopes`. The root
+    /// scope is permanently 0 — the depth-0 tier's binding identity is
+    /// computable from any lowering site. Every other scope push mints
+    /// a fresh id, so two expansions of one fn place their same-named
+    /// locals under DIFFERENT identities: two Make() invocations own
+    /// independent cells (the judge's escaping-closure semantics), and
+    /// no registry route can cross them.
+    scope_ids: Vec<usize>,
+    next_scope_id: usize,
     reserves: Vec<ActiveReserve>,
     handles: FreeHandles,
     shape: &'a ShapeFacts,
@@ -109,6 +131,24 @@ pub struct IrLowerer<'a> {
     env_memos: Vec<EnvMemo>,
     env_regs: Vec<Reg<Ptr>>,
     env_ctxs: Vec<EnvCtx>,
+    /// THE one box cell per captured binding, keyed by the binding's
+    /// slot identity (scope id, name) — the judge's one-box model:
+    /// "boxes once at declaration, every access goes through the one
+    /// cell". Every env minted over the binding stores THIS cell's
+    /// pointer (shared by Handle — no per-mint snapshot), so a write
+    /// through any env reaches every view and the definer alike. The
+    /// env list is the drain plan: at root exit each holder keeps the
+    /// cell until the LAST holder's `TableFreeExcept` frees it — the
+    /// runtime's child walk has no refcount, so the keeps mechanism
+    /// is the single-ownership proof.
+    binding_cells: BTreeMap<(usize, String), BindingCell>,
+    /// Per definer-expansion instance: the captured bindings' slot
+    /// identities its body minted cells for (name -> slot id). The
+    /// pop fold-back's proof of liveness — a call site inside the
+    /// definer's lowering finds the instance on the chain and the
+    /// slot alive; an escaped call finds neither and skips the dead
+    /// register.
+    instance_slots: BTreeMap<InstanceId, BTreeMap<String, usize>>,
     cur_stmt: Option<NodeId>,
 }
 
@@ -128,12 +168,23 @@ struct EnvMemo {
 struct EnvCtx {
     reg: Reg<Ptr>,
     faces: BTreeMap<String, Ty>,
+    /// The binding identity of every face: the capture's walk-scope
+    /// depth (Closure Finding A's map). `write_binding_cells` and the
+    /// pop fold-back route through it.
+    depths: BTreeMap<String, usize>,
+    /// The scopes index the face locals were declared at — the
+    /// expansion's own scope. A nested expansion's pop fold-back
+    /// refreshes these slots (the face locals are cell snapshots that
+    /// a nested write would leave stale).
+    scope_depth: usize,
 }
 impl Clone for EnvCtx {
     fn clone(&self) -> Self {
         EnvCtx {
             reg: self.reg,
             faces: self.faces.clone(),
+            depths: self.depths.clone(),
+            scope_depth: self.scope_depth,
         }
     }
 }

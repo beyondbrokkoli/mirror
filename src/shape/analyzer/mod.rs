@@ -917,6 +917,7 @@ impl Recorded {
             fn_defs: self.chk.fn_defs,
             env_faces: self.chk.env_faces,
             env_face_depths: self.chk.env_face_depths,
+            fn_capture_depths: self.chk.fn_capture_depths,
             closure_fields: self.chk.closure_fields,
             call_fns: self.chk.call_fns,
             ffi_verbs: self.chk.ffi_verbs,

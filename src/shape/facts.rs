@@ -242,6 +242,11 @@ pub struct ShapeFacts {
     /// different binding and may not absorb its predecessor's cell
     /// (Closure Finding A).
     pub env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
+    /// Every fn literal's capture name -> its binding's walk-scope
+    /// depth, minted or not (the walk stamps it at definition). The
+    /// direct-call surface's capture slots key off this — a fn never
+    /// value-read has no env_face_depths to consult.
+    pub fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,

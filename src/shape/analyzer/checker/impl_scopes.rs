@@ -4,6 +4,7 @@ impl Checker {
         self.frames.push(Frame {
             types: BTreeMap::new(),
             fns: BTreeMap::new(),
+            captures: BTreeSet::new(),
         });
     }
     fn end_scope(&mut self) {
@@ -12,12 +13,17 @@ impl Checker {
 
     fn declare_var(&mut self, lat: &UnknownStore, name: String, ty: Ty) -> Result<(), Diagnostic> {
         if let Some(frame) = self.frames.last_mut() {
-            if frame.types.contains_key(&name) {
+            // A capture view is not a binding — a body decl over it is
+            // the shadow the judge sees (v4: `local x` inside the
+            // expansion), not a duplicate. The view dies here; the
+            // fresh binding takes the slot.
+            if frame.types.contains_key(&name) && !frame.captures.contains(&name) {
                 return Err(Diagnostic::scope(format!(
                     "variable '{}' already declared in this scope",
                     name
                 )));
             }
+            frame.captures.remove(&name);
             frame.types.insert(name, ty);
             return Ok(());
         }
@@ -86,6 +92,27 @@ impl Checker {
         if let Some(ty) = self.active_env_face(name) {
             return Ok(ty);
         }
+        if let Some(ty) = self.top.get(name) {
+            return Ok(lat.resolve(ty));
+        }
+        let (view, seed_read) = self.view_type(lat, name, &self.snap);
+        if seed_read {
+            self.seed_read = true;
+        }
+        view.ok_or_else(|| {
+            Diagnostic::scope(format!("reference to undeclared variable '{}'", name))
+        })
+    }
+
+    /// The depth-0 tier of `var_type`: resolves straight from the root
+    /// projection (`top` / the walk snapshot), skipping every frame.
+    /// The boundary-root scope is the base of every stack the checker
+    /// and lowerer ever hold, so a depth-0 capture reads the SAME
+    /// binding from any expansion site — this is the type-level twin
+    /// of the lowerer's capture-slot redirect. A creation-site or
+    /// call-site same-name shadow must never lend its type to the
+    /// face (v2's mint-inside-shadow, t1's shadowed direct expansion).
+    fn var_type_depth0(&mut self, lat: &mut UnknownStore, name: &str) -> Result<Ty, Diagnostic> {
         if let Some(ty) = self.top.get(name) {
             return Ok(lat.resolve(ty));
         }

@@ -161,16 +161,30 @@ impl Analyzer {
         self.fn_scope_keys.insert(fn_ptr, key);
         let mut chain: BTreeMap<String, Option<NodeId>> = BTreeMap::new();
         let mut chain_depth: BTreeMap<String, usize> = BTreeMap::new();
-        for (depth, scope) in self.walk.scopes.iter().enumerate().skip(1) {
+        for (depth, scope) in self.walk.scopes.iter().enumerate() {
             for (n, b) in scope {
+                // Fn-bound depth-0 names stay OUT of the chain even
+                // though depth 0 is in it: a fn NAME is a variable —
+                // the judge re-points a closure when the top-level
+                // binding rebinds to a new literal (fn_key_late_
+                // binding: 1 then 2), and resolve_fn_binding's snap.fns
+                // fallback must see the CURRENT binding for that.
+                // Depth-0 VALUE bindings are the Finding B fix: the
+                // boundary-root scope sits at the base of every scope
+                // stack the lowerer ever lowers, so they are
+                // capturable from any expansion site — the lexical
+                // fix, not a global scope (the dialect still has
+                // none).
+                if depth == 0 && b.fn_ptr.is_some() {
+                    continue;
+                }
                 chain.insert(n.clone(), b.fn_ptr);
                 // The same inner-wins pass that picks the chain's
                 // binding picks its walk-scope index: the capture's
                 // binding identity is WHERE it was bound, not its
                 // string. Depths ride to the lowerer beside the face
                 // so a mint can tell two same-named captures apart
-                // (Closure Finding A) — Finding B's skip(1) is
-                // preserved verbatim.
+                // (Closure Finding A).
                 chain_depth.insert(n.clone(), depth);
             }
         }
@@ -178,6 +192,17 @@ impl Analyzer {
         let mut bound = BTreeSet::new();
         bound.extend(params.iter().cloned());
         let free = transitive_free_names(body, &mut bound);
+        // A capture is a free name whose chain entry is a plain value
+        // binding (`Some(&None)`); fn-bound names (Some(&Some(ptr)))
+        // resolve through resolve_fn_binding's definition-site chain +
+        // snap.fns and never ride the caller's frames (t8). With depth
+        // 0 in the chain, top-level bindings are captured like any
+        // other — Finding B's dynamic tier is gone. Boundary, named:
+        // a top-level binding declared AFTER this fn literal is not in
+        // scopes[0] at the recorded pass either, so it is neither
+        // capture nor fact — the forward-referenced tier still
+        // resolves dynamically at expansion time (Finding B's
+        // sibling).
         let captures: BTreeSet<String> = free
             .into_iter()
             .filter(|n| chain.get(n) == Some(&None))

@@ -1028,6 +1028,33 @@ impl Analyzer {
         self.walk.resolve(rec, name)
     }
 
+    /// The severed-read view: what a MOVED_ROOT binding still is. The
+    /// creation-capture law moves a captured table into its env;
+    /// pre-Finding-B a severed binding's home scope always popped with
+    /// its fn before anything read it again, but a depth-0 table
+    /// captured by any fn now outlives the severing, so a read must
+    /// see the record it still is — its site identity rides the
+    /// severed map, not the (moved-erased) aliases. RAW `resolve`
+    /// keeps returning the moved state: the move/adoption laws read
+    /// it verbatim, and only type-shaped reads (the module-call
+    /// surface) go through this view.
+    pub(super) fn resolve_severed_view(
+        &self,
+        rec: Gate,
+        name: &str,
+    ) -> Result<(usize, TableShape), ShapeError> {
+        let (depth, shape) = self.walk.resolve(rec, name)?;
+        if shape.aliases.contains(&MOVED_ROOT)
+            && let Some(sites) = self.holds.moved_severed.get(name)
+        {
+            let mut severed = shape;
+            severed.ty = Tbl(Box::new(Pending));
+            severed.aliases = sites.clone();
+            return Ok((depth, severed));
+        }
+        Ok((depth, shape))
+    }
+
     pub(super) fn resolve_aliases(
         &self,
         rec: Gate,

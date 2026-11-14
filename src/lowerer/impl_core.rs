@@ -6,6 +6,8 @@ impl<'a> IrLowerer<'a> {
             current_block: 0,
             free_reg: 0,
             scopes: vec![BTreeMap::new()],
+            scope_ids: vec![0],
+            next_scope_id: 1,
             reserves: Vec::new(),
             shape,
             cur_loc: None,
@@ -23,6 +25,8 @@ impl<'a> IrLowerer<'a> {
             env_memos: Vec::new(),
             env_regs: Vec::new(),
             env_ctxs: Vec::new(),
+            binding_cells: BTreeMap::new(),
+            instance_slots: BTreeMap::new(),
             cur_stmt: None,
         }
     }
@@ -67,10 +71,13 @@ impl<'a> IrLowerer<'a> {
 
     fn in_block<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push(BTreeMap::new());
+        self.scope_ids.push(self.next_scope_id);
+        self.next_scope_id += 1;
         self.ctrl_depth += 1;
         let r = f(self);
         self.ctrl_depth -= 1;
         self.scopes.pop();
+        self.scope_ids.pop();
         r
     }
 
@@ -83,8 +90,11 @@ impl<'a> IrLowerer<'a> {
 
     fn in_do<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push(BTreeMap::new());
+        self.scope_ids.push(self.next_scope_id);
+        self.next_scope_id += 1;
         let r = f(self);
         self.scopes.pop();
+        self.scope_ids.pop();
         r
     }
 
@@ -244,9 +254,35 @@ impl<'a> IrLowerer<'a> {
         for e in &arms {
             self.emit_arm_free(e)?;
         }
+        // The env drain with the shared-cell keeps plan: a box cell one
+        // box-is-binding binding shares across several of its envs is
+        // Handle-held by each of them, and the runtime's free-time
+        // child walk has no refcount — a naive per-env TableFree would
+        // free the shared cell once per holder. Envs drain in mint
+        // order, so a holder KEEPS every cell a later holder also
+        // holds, and the LAST holder's plain TableFree reclaims it:
+        // each cell frees exactly once, and the atexit leak check
+        // stays balanced.
         let envs = std::mem::take(&mut self.env_regs);
-        for env in envs {
-            self.emit(Instruction::TableFree { table: env });
+        for (i, env) in envs.iter().enumerate() {
+            let mut keeps: Vec<Reg<Ptr>> = Vec::new();
+            for (cell, _, holders) in self.binding_cells.values() {
+                let held_here = holders.iter().any(|e| e.id == env.id);
+                let held_later = holders
+                    .iter()
+                    .any(|e| envs[i + 1..].iter().any(|later| later.id == e.id));
+                if held_here && held_later {
+                    keeps.push(*cell);
+                }
+            }
+            if keeps.is_empty() {
+                self.emit(Instruction::TableFree { table: *env });
+            } else {
+                self.emit(Instruction::TableFreeExcept {
+                    table: *env,
+                    keeps,
+                });
+            }
         }
         Ok(())
     }
@@ -288,10 +324,15 @@ impl<'a> IrLowerer<'a> {
     fn declare_var(&mut self, name: String, reg: AnyReg, ty: Ty, layout: LayoutVerdict) {
         let reg = string_repr(&ty, reg);
         self.push_dbg_bind(&name, reg, None);
-        self.scopes
-            .last_mut()
-            .unwrap()
-            .insert(name, Local { reg, ty, layout });
+        self.scopes.last_mut().unwrap().insert(
+            name,
+            Local {
+                reg,
+                ty,
+                layout,
+                capture: None,
+            },
+        );
     }
 
     fn update_var(
@@ -302,21 +343,65 @@ impl<'a> IrLowerer<'a> {
         layout: LayoutVerdict,
     ) -> Result<(), LowerError> {
         let reg = string_repr(&ty, reg);
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(local) = scope.get_mut(name) {
-                local.reg = reg;
-                local.ty = ty;
-                local.layout = layout;
-                self.push_dbg_bind(name, reg, None);
-                return Ok(());
-            }
+        // The innermost match may be a capture view of a direct-call
+        // expansion — the write lands on the OWNER slot (the view's
+        // redirect), never on the marker itself: the view cannot hold
+        // a value, it only re-points reads to the binding's home.
+        let target = self
+            .scopes
+            .iter()
+            .rposition(|s| s.contains_key(name))
+            .ok_or_else(|| LowerError(Diagnostic::lower("Undeclared variable")))?;
+        let depth = self.scopes[target]
+            .get(name)
+            .and_then(|l| l.capture)
+            .unwrap_or(target);
+        self.update_var_at(name, depth, reg, ty, layout)
+    }
+
+    /// The slot-addressed write, mirroring `read_var_at`. A missing
+    /// slot is a legitimate fold-back target situation (a closure
+    /// escaped the scope that bound the definer's slot), not a
+    /// desync — it skips silently. A slot that turns out to be itself
+    /// a capture view redirects one more step, keeping the marker
+    /// slots permanently value-free.
+    fn update_var_at(
+        &mut self,
+        name: &str,
+        depth: usize,
+        reg: AnyReg,
+        ty: Ty,
+        layout: LayoutVerdict,
+    ) -> Result<(), LowerError> {
+        let Some(scope) = self.scopes.get_mut(depth) else {
+            return Ok(());
+        };
+        let Some(local) = scope.get_mut(name) else {
+            return Ok(());
+        };
+        if let Some(owner) = local.capture {
+            return self.update_var_at(name, owner, reg, ty, layout);
         }
-        Err(LowerError(Diagnostic::lower("Undeclared variable")))
+        let reg = string_repr(&ty, reg);
+        local.reg = reg;
+        local.ty = ty;
+        local.layout = layout;
+        self.push_dbg_bind(name, reg, None);
+        Ok(())
     }
 
     fn read_var(&self, name: &str) -> Result<Local, LowerError> {
         for scope in self.scopes.iter().rev() {
             if let Some(local) = scope.get(name) {
+                if let Some(depth) = local.capture {
+                    // A capture view: the read resolves at the owner
+                    // slot. The view's own reg is the declare-time
+                    // snapshot — stale after any redirected write, so
+                    // it is never returned.
+                    return self.scopes[depth].get(name).cloned().ok_or_else(|| {
+                        LowerError(Diagnostic::lower("Undeclared variable"))
+                    });
+                }
                 return Ok(local.clone());
             }
         }

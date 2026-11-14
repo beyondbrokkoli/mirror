@@ -14,6 +14,7 @@ impl<'a> IrLowerer<'a> {
                     self.shape.boundary_elem.clone().unwrap_or(Ty::Unknown(0)),
                 )),
                 layout: LayoutVerdict::default(),
+                capture: None,
             },
         );
         self.return_ctxs.push(ReturnCtx {

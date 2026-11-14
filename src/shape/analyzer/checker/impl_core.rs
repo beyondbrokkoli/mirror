@@ -227,6 +227,7 @@ impl Checker {
             instances,
             boundary_elem,
             diagnostics,
+            ctx,
             ..
         } = self;
         CheckFacts {
@@ -235,6 +236,7 @@ impl Checker {
             call_fns,
             env_faces,
             env_face_depths,
+            fn_capture_depths: ctx.fn_capture_depths,
             closure_fields,
             ffi_verbs,
             builtin_verbs,
