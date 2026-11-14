@@ -85,6 +85,75 @@ enum Prov {
     Call(NodeId),
 }
 
+impl WalkState {
+    /// The stack architecture's alignment law: `scopes` is the master
+    /// list every rider hangs off — `fn_scopes`, `prov`, and
+    /// `scalar_nodes` are index-aligned with it, one map per depth,
+    /// pushed and popped together (enter/exit_scope) and reset together
+    /// (both reset sites). A drift here is the orphan-ghost's incubator:
+    /// a rider written at depth d describing a binding that lives at
+    /// depth d' dies with the wrong scope. The release profile keeps
+    /// debug-assertions live, so every corpus leg proves this, not just
+    /// debug builds.
+    fn assert_parallel_stacks_aligned(&self) {
+        debug_assert_eq!(
+            self.scopes.len(),
+            self.fn_scopes.len(),
+            "the stacks drifted: fn_scopes is not index-aligned with scopes"
+        );
+        debug_assert_eq!(
+            self.scopes.len(),
+            self.prov.len(),
+            "the stacks drifted: prov is not index-aligned with scopes"
+        );
+        debug_assert_eq!(
+            self.scopes.len(),
+            self.scalar_nodes.len(),
+            "the stacks drifted: scalar_nodes is not index-aligned with scopes"
+        );
+    }
+
+    /// The riders' content law — the assert that would have caught the
+    /// Oct 17 ghost on its first pass: a rider entry at depth d
+    /// describes the binding its name has at that same depth. Every
+    /// rider key must be bound in `scopes[d]`, with one documented
+    /// exemption: a name bound nowhere at all (the undeclared-assignment
+    /// rejection writes its rider before rejecting). Run after each
+    /// recorded-pass statement, once every binder has run and every
+    /// scope the statement opened has closed.
+    fn assert_riders_bound(&self) {
+        self.assert_parallel_stacks_aligned();
+        let bound_nowhere = |name: &str| self.scopes.iter().all(|s| !s.contains_key(name));
+        for (depth, rider) in self.scalar_nodes.iter().enumerate() {
+            for name in rider.keys() {
+                debug_assert!(
+                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
+                    "the riders broke faith with the master stack: \
+                     scalar_nodes[{depth}] holds '{name}' but its binding does not live there"
+                );
+            }
+        }
+        for (depth, rider) in self.fn_scopes.iter().enumerate() {
+            for name in rider.keys() {
+                debug_assert!(
+                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
+                    "the riders broke faith with the master stack: \
+                     fn_scopes[{depth}] holds '{name}' but its binding does not live there"
+                );
+            }
+        }
+        for (depth, rider) in self.prov.iter().enumerate() {
+            for name in rider.keys() {
+                debug_assert!(
+                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
+                    "the riders broke faith with the master stack: \
+                     prov[{depth}] holds '{name}' but its binding does not live there"
+                );
+            }
+        }
+    }
+}
+
 struct LatticeState {
     sites: BTreeMap<NodeId, usize>,
     site_elem: Vec<Ty>,
@@ -410,6 +479,9 @@ pub fn analyze_with_base(
     };
 
     let mut prev_end: Vec<BTreeMap<String, TableShape>> = Vec::new();
+    let mut prev_fn_end: Vec<BTreeMap<String, Option<NodeId>>> = Vec::new();
+    let mut prev_prov_end: Vec<BTreeMap<String, Option<Prov>>> = Vec::new();
+    let mut prev_nodes_end: Vec<BTreeMap<String, usize>> = Vec::new();
     let mut dbg_pass: u32 = 0;
     loop {
         dbg_pass += 1;
@@ -419,12 +491,29 @@ pub fn analyze_with_base(
         a.walk.fn_scopes = vec![BTreeMap::new()];
         a.walk.prov = vec![BTreeMap::new()];
         a.walk.scalar_nodes = vec![BTreeMap::new()];
+        a.walk.assert_parallel_stacks_aligned();
         a.fn_def_sites.clear();
         a.fn_captures.clear();
         a.walk_stmts(None, ctx.ast);
+        // Stability must see every stack the walk maintains: comparing
+        // scopes alone is blind to a rider oscillating in fn_scopes,
+        // prov, or scalar_nodes — the loop would break on a master
+        // state that settled while its riders never did, and the
+        // recorded pass would inherit whatever face they wore that
+        // pass.
         let end = a.walk.scopes.clone();
-        let stable = end == prev_end && !a.walk.changed;
+        let fn_end = a.walk.fn_scopes.clone();
+        let prov_end = a.walk.prov.clone();
+        let nodes_end = a.walk.scalar_nodes.clone();
+        let stable = end == prev_end
+            && fn_end == prev_fn_end
+            && prov_end == prev_prov_end
+            && nodes_end == prev_nodes_end
+            && !a.walk.changed;
         prev_end = end;
+        prev_fn_end = fn_end;
+        prev_prov_end = prov_end;
+        prev_nodes_end = nodes_end;
         if stable {
             break;
         }
@@ -460,6 +549,7 @@ pub fn analyze_with_base(
     a.walk.fn_scopes = vec![BTreeMap::new()];
     a.walk.prov = vec![BTreeMap::new()];
     a.walk.scalar_nodes = vec![BTreeMap::new()];
+    a.walk.assert_parallel_stacks_aligned();
     a.pin_derived_exprs.clear();
     a.pin_justified_names.clear();
 
@@ -493,6 +583,7 @@ pub fn analyze_with_base(
         }
         chk.snapshot_post(&a.walk, &a.holds.moved_severed);
         last_post = Some(a.walk.scopes.clone());
+        a.walk.assert_riders_bound();
         if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
             signal!(trace::TRACE_GHOST_BAIL_CHECKER);
             a.ledger

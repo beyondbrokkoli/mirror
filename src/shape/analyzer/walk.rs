@@ -897,6 +897,7 @@ impl Analyzer {
     }
 
     pub(super) fn enter_scope(&mut self) {
+        self.walk.assert_parallel_stacks_aligned();
         self.walk.scopes.push(BTreeMap::new());
         self.walk.fn_scopes.push(BTreeMap::new());
         self.walk.prov.push(BTreeMap::new());
@@ -904,11 +905,23 @@ impl Analyzer {
     }
 
     pub(super) fn exit_scope(&mut self) {
+        self.walk.assert_parallel_stacks_aligned();
         if let Some(dying) = self.walk.scopes.last() {
             for name in dying.keys() {
-                self.holds.num_assigns.remove(name);
-                self.holds.nil_severed.remove(name);
-                self.holds.moved_severed.remove(name);
+                // The holds family is name-keyed and flat, so cleanup
+                // may not key off the dying scope alone: an inner block
+                // that shadowed an outer binding would otherwise drag
+                // the outer binding's records down with it. A record
+                // dies only when the master stack says the name is
+                // truly dead — no surviving depth binds it anymore.
+                let survived = self.walk.scopes[..self.walk.scopes.len() - 1]
+                    .iter()
+                    .any(|s| s.contains_key(name));
+                if !survived {
+                    self.holds.num_assigns.remove(name);
+                    self.holds.nil_severed.remove(name);
+                    self.holds.moved_severed.remove(name);
+                }
             }
         }
         self.walk.fn_scopes.pop();

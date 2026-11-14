@@ -164,9 +164,19 @@ impl Analyzer {
     }
 
     pub(super) fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
+        // A fn entry rides its name's binding depth, not wherever a
+        // stale entry happens to sit: scanning the binding scopes (which
+        // every binder — decl, param, assignment — writes at its home
+        // depth) so a nested assignment may not orphan the fn-ness in
+        // an inner map that dies with its scope, or park it at a stale
+        // rider depth the master stack never sanctioned. `scopes` and
+        // `fn_scopes` are index-aligned (enter/exit, resets); the
+        // fallback covers the name bound nowhere, which the
+        // undeclared-assignment path binds innermost right after this
+        // write.
         let depth = self
             .walk
-            .fn_scopes
+            .scopes
             .iter()
             .rposition(|s| s.contains_key(name))
             .unwrap_or(self.walk.fn_scopes.len() - 1);
