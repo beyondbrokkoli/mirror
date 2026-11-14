@@ -54,7 +54,8 @@ impl Analyzer {
         }
         let mut batch: Vec<Batch> = Vec::new();
         let mut fired_keeps: Vec<(String, Vec<String>)> = Vec::new();
-        for (name, shape) in &dying {
+        for (name, bind) in &dying {
+            let shape = &bind.shape;
             let roots: Vec<usize> = shape
                 .aliases
                 .iter()
@@ -150,7 +151,7 @@ impl Analyzer {
             .map(|b| {
                 b.housed
                     || b.ghosts.iter().any(|_g| {
-                        let shape = &dying[&b.name];
+                        let shape = &dying[&b.name].shape;
                         shape.lineage.keys().any(|o| {
                             !shape.aliases.contains(o)
                                 && ghost_origin_covered(&self.lattice, &covered, *o)

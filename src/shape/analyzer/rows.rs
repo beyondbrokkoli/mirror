@@ -31,7 +31,7 @@ pub(super) fn deepfree_children(
 }
 
 pub(super) fn origin_housed(
-    scopes: &[BTreeMap<String, TableShape>],
+    scopes: &[Scope],
     lattice: &LatticeState,
     own: &OwnershipState,
     reads: &ReadSideState,
@@ -44,10 +44,10 @@ pub(super) fn origin_housed(
             if d == skip_depth && n == skip_name {
                 continue;
             }
-            if ts.aliases.contains(&origin) {
+            if ts.shape.aliases.contains(&origin) {
                 return true;
             }
-            for &s in ts.aliases.iter().filter(|s| !is_root(s)) {
+            for &s in ts.shape.aliases.iter().filter(|s| !is_root(s)) {
                 if deepfree_children(lattice, own, reads, s).contains(&origin) {
                     return true;
                 }
@@ -69,7 +69,7 @@ pub(super) fn release_set(
 }
 
 pub(super) fn borrowers_of(
-    scopes: &[BTreeMap<String, TableShape>],
+    scopes: &[Scope],
     release: &BTreeSet<usize>,
     upto: usize,
     skip_depth: usize,
@@ -81,10 +81,10 @@ pub(super) fn borrowers_of(
             if d == skip_depth && n == skip_name {
                 continue;
             }
-            if value_kind(&ts.ty) {
+            if value_kind(&ts.shape.ty) {
                 continue;
             }
-            if ts.lineage.keys().any(|o| release.contains(o)) {
+            if ts.shape.lineage.keys().any(|o| release.contains(o)) {
                 out.push(n.clone());
             }
         }
@@ -313,6 +313,7 @@ impl Analyzer {
                 }
                 for &old in &new_ghosts {
                     if ts
+                        .shape
                         .aliases
                         .iter()
                         .any(|&g| is_ghost(&g) && self.same_row(old, g))
@@ -339,7 +340,7 @@ impl Analyzer {
                 if Some(n.as_str()) == skip {
                     continue;
                 }
-                for &og in ts.aliases.iter().filter(|s| is_ghost(s)) {
+                for &og in ts.shape.aliases.iter().filter(|s| is_ghost(s)) {
                     if self.same_row(g, og) {
                         return Err(ShapeError(Diagnostic::lifetime(format!(
                             "the row read is already owned by '{n}' — one \

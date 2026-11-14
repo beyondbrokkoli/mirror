@@ -14,33 +14,34 @@ pub(super) enum MixedPlan {
 
 impl Analyzer {
     pub(super) fn poison_moved(&mut self, depth: usize, name: &str) {
-        if let Some(bind) = self.walk.scopes[depth].get(name) {
-            let severed: BTreeSet<usize> = bind
-                .aliases
-                .iter()
-                .copied()
-                .filter(|s| !is_root(s) && !is_ghost(s))
-                .collect();
-            if !severed.is_empty() {
-                self.holds
-                    .moved_severed
-                    .entry(name.to_string())
-                    .or_default()
-                    .extend(severed);
-            }
+        // The shape face is severed and rewritten at the binding's home
+        // depth; the other faces are untouched — a move rebinds the
+        // shape, it does not un-declare (D2). Depths arrive from
+        // resolve, so the slot is the binding's home.
+        let Some(slot) = self.walk.scopes[depth].get_mut(name) else {
+            return;
+        };
+        let severed: BTreeSet<usize> = slot
+            .shape
+            .aliases
+            .iter()
+            .copied()
+            .filter(|s| !is_root(s) && !is_ghost(s))
+            .collect();
+        if !severed.is_empty() {
+            self.holds
+                .moved_severed
+                .entry(name.to_string())
+                .or_default()
+                .extend(severed);
         }
-        self.walk.scopes[depth].insert(
-            name.to_string(),
-            TableShape {
-                ty: Pending,
-                layout: LayoutVerdict::default(),
-                aliases: BTreeSet::from([MOVED_ROOT]),
-                lineage: BTreeMap::new(),
-            },
-        );
-        if let Some(scope) = self.walk.prov.get_mut(depth) {
-            scope.remove(name);
-        }
+        slot.shape = TableShape {
+            ty: Pending,
+            layout: LayoutVerdict::default(),
+            aliases: BTreeSet::from([MOVED_ROOT]),
+            lineage: BTreeMap::new(),
+        };
+        slot.prov = None;
     }
 
     pub(super) fn arm_defers(&self, name: &str, depth: usize, arm: &TableShape) -> bool {
@@ -110,11 +111,10 @@ impl Analyzer {
         };
         let Some(prov) = self
             .walk
-            .prov
+            .scopes
             .get(depth)
             .and_then(|s| s.get(name))
-            .copied()
-            .flatten()
+            .and_then(|b| b.prov)
         else {
             return fallback(self);
         };
@@ -253,18 +253,18 @@ impl Analyzer {
                         signal!(rec.on(), trace::TRACE_SHAPE_DROP);
                     }
                 }
-                self.walk.scopes[depth].insert(
-                    name.to_string(),
-                    TableShape {
-                        ty: Pending,
-                        layout: LayoutVerdict::default(),
-                        aliases: BTreeSet::from([NULL_ROOT]),
-                        lineage: BTreeMap::new(),
-                    },
-                );
-                if let Some(scope) = self.walk.prov.get_mut(depth) {
-                    scope.remove(name);
-                }
+                // D2: the drop rebinds the shape face and clears prov;
+                // fn_ptr / scalar_node stand.
+                let slot = self.walk.scopes[depth]
+                    .get_mut(name)
+                    .expect("just resolved");
+                slot.shape = TableShape {
+                    ty: Pending,
+                    layout: LayoutVerdict::default(),
+                    aliases: BTreeSet::from([NULL_ROOT]),
+                    lineage: BTreeMap::new(),
+                };
+                slot.prov = None;
                 return Ok(());
             }
             let has_ghost = mixed_ghost;
@@ -331,18 +331,18 @@ impl Analyzer {
                 signal!(rec.on(), trace::TRACE_SHAPE_DROP);
             }
         }
-        self.walk.scopes[depth].insert(
-            name.to_string(),
-            TableShape {
-                ty: Pending,
-                layout: LayoutVerdict::default(),
-                aliases: BTreeSet::from([NULL_ROOT]),
-                lineage: BTreeMap::new(),
-            },
-        );
-        if let Some(scope) = self.walk.prov.get_mut(depth) {
-            scope.remove(name);
-        }
+        // D2: same fused write as the mixed path — the shape face
+        // drops to NULL and prov clears; the other faces stand.
+        let slot = self.walk.scopes[depth]
+            .get_mut(name)
+            .expect("just resolved");
+        slot.shape = TableShape {
+            ty: Pending,
+            layout: LayoutVerdict::default(),
+            aliases: BTreeSet::from([NULL_ROOT]),
+            lineage: BTreeMap::new(),
+        };
+        slot.prov = None;
         Ok(())
     }
 

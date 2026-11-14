@@ -147,40 +147,7 @@ fn transitive_free_names(stmts: &[Stmt], bound: &mut BTreeSet<String>) -> BTreeS
 
 impl Analyzer {
     pub(super) fn resolve_fn(&self, name: &str) -> Option<NodeId> {
-        for scope in self.walk.fn_scopes.iter().rev() {
-            if let Some(entry) = scope.get(name) {
-                return *entry;
-            }
-        }
-        None
-    }
-
-    pub(super) fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
-        self.walk
-            .fn_scopes
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), ptr);
-    }
-
-    pub(super) fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
-        // A fn entry rides its name's binding depth, not wherever a
-        // stale entry happens to sit: scanning the binding scopes (which
-        // every binder — decl, param, assignment — writes at its home
-        // depth) so a nested assignment may not orphan the fn-ness in
-        // an inner map that dies with its scope, or park it at a stale
-        // rider depth the master stack never sanctioned. `scopes` and
-        // `fn_scopes` are index-aligned (enter/exit, resets); the
-        // fallback covers the name bound nowhere, which the
-        // undeclared-assignment path binds innermost right after this
-        // write.
-        let depth = self
-            .walk
-            .scopes
-            .iter()
-            .rposition(|s| s.contains_key(name))
-            .unwrap_or(self.walk.fn_scopes.len() - 1);
-        self.walk.fn_scopes[depth].insert(name.to_string(), ptr);
+        self.walk.resolve_fn(name)
     }
 
     pub(super) fn walk_fn_def(
@@ -193,9 +160,9 @@ impl Analyzer {
     ) -> Result<(), ShapeError> {
         self.fn_scope_keys.insert(fn_ptr, key);
         let mut chain: BTreeMap<String, Option<NodeId>> = BTreeMap::new();
-        for scope in self.walk.fn_scopes.iter().skip(1) {
-            for (n, p) in scope {
-                chain.insert(n.clone(), *p);
+        for scope in self.walk.scopes.iter().skip(1) {
+            for (n, b) in scope {
+                chain.insert(n.clone(), b.fn_ptr);
             }
         }
         self.fn_def_sites.insert(fn_ptr, chain.clone());
@@ -230,20 +197,19 @@ impl Analyzer {
                 // nonneg/lower-bound facts to a loop over the
                 // parameter — the entry facts would describe the
                 // caller's argument, not the literal (the F3 probe).
+                // One binding carries the whole face set: shape
+                // Pending, and no fn/node/prov face (the fn_scopes
+                // None-insert rides inside the Binding now).
                 an.holds.num_assigns.insert(p.clone(), vec![NumExpr::Other]);
                 scope.insert(
                     p.clone(),
-                    TableShape {
+                    Binding::new(TableShape {
                         ty: Pending,
                         layout: LayoutVerdict::default(),
                         aliases: BTreeSet::new(),
                         lineage: BTreeMap::new(),
-                    },
+                    }),
                 );
-            }
-            let fns = an.walk.fn_scopes.last_mut().unwrap();
-            for p in params {
-                fns.insert(p.clone(), None);
             }
             an.walk_stmts(rec, body);
             if let Err(err) = an.decide_scope_exit(rec, key) {

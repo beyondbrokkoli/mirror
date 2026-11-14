@@ -20,10 +20,24 @@ fn mint_instance() -> InstanceId {
 }
 
 fn snap_of(walk: &WalkState, severed: &BTreeMap<String, BTreeSet<usize>>) -> WalkSnap {
+    // D3: WalkSnap stays flat this phase — the depth-0 bindings
+    // project back to the three flat faces the checker's read sites
+    // consume (binds/scalars/fns). Fusing the checker's own snapshot
+    // is a separate session.
+    let mut binds = BTreeMap::new();
+    let mut scalars = BTreeMap::new();
+    let mut fns = BTreeMap::new();
+    for (name, bind) in &walk.scopes[0] {
+        binds.insert(name.clone(), bind.shape.clone());
+        if let Some(id) = bind.scalar_node {
+            scalars.insert(name.clone(), id);
+        }
+        fns.insert(name.clone(), bind.fn_ptr);
+    }
     WalkSnap {
-        binds: walk.scopes[0].clone(),
-        scalars: walk.scalar_nodes[0].clone(),
-        fns: walk.fn_scopes[0].clone(),
+        binds,
+        scalars,
+        fns,
         severed: severed
             .iter()
             .filter(|(name, _)| walk.scopes[0].contains_key(*name))

@@ -1085,7 +1085,7 @@ impl Analyzer {
                 .iter()
                 .rev()
                 .filter_map(|s| s.get(&table_name))
-                .flat_map(|ts| ts.aliases.iter().copied())
+                .flat_map(|b| b.shape.aliases.iter().copied())
                 .collect();
 
             for &site in &site_ids {
@@ -1121,7 +1121,9 @@ impl Analyzer {
                 .iter()
                 .rev()
                 .find_map(|s| s.get(name))
-                .is_some_and(|bind| matches!(bind.ty, Tbl(ref inner) if matches!(**inner, Tbl(_))))
+                .is_some_and(
+                    |bind| matches!(bind.shape.ty, Tbl(ref inner) if matches!(**inner, Tbl(_))),
+                )
         };
         let pre_header: Vec<String> = fills
             .iter()

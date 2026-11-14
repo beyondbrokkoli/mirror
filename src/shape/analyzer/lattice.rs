@@ -203,14 +203,14 @@ impl Analyzer {
         } = self;
         for scope in scopes.iter_mut() {
             for (nm, ts) in scope.iter_mut() {
-                if ts.aliases.contains(&site)
+                if ts.shape.aliases.contains(&site)
                     && !is_root(&site)
-                    && (ts.ty == Pending || matches!(ts.ty, Tbl(_)))
-                    && ts.ty != expected_var_ty
+                    && (ts.shape.ty == Pending || matches!(ts.shape.ty, Tbl(_)))
+                    && ts.shape.ty != expected_var_ty
                 {
                     crate::alm_dbgln!(
                         "[decide-rewrite] site {site}: '{nm}' {:?} -> {:?} (vt={:?})",
-                        ts.ty,
+                        ts.shape.ty,
                         expected_var_ty,
                         vt
                     );
@@ -219,8 +219,8 @@ impl Analyzer {
                     } else {
                         conv_fires.insert(trace::TRACE_DECIDE_UPDATE);
                     }
-                    ts.ty = expected_var_ty.clone();
-                    if ts.ty != Pending {
+                    ts.shape.ty = expected_var_ty.clone();
+                    if ts.shape.ty != Pending {
                         if rec.on() {
                             trace::compiler_trace_signal(trace::TRACE_DECIDE_UPDATE_CHANGED);
                         } else {

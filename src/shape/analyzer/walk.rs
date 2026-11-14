@@ -59,32 +59,50 @@ impl Analyzer {
             Stmt::LocalDecl { names, exprs, .. } => {
                 let mut sets = Vec::with_capacity(names.len());
                 let mut moved_srcs: Vec<(usize, String)> = Vec::new();
+                // The pre-statement faces this decl replaces, captured
+                // before the pre-binds overwrite the innermost entries:
+                // rebind_death must see the binding this statement
+                // replaces, not its own placeholder. A repeated target's
+                // later slot reads its twin's set instead — `written`
+                // below mirrors today's live innermost reads.
+                let olds: Vec<Option<TableShape>> = names
+                    .iter()
+                    .map(|name| {
+                        self.walk
+                            .scopes
+                            .last()
+                            .and_then(|s| s.get(name))
+                            .map(|b| b.shape.clone())
+                    })
+                    .collect();
                 for (name, expr) in names.iter().zip(exprs.iter()) {
+                    // D1: every face is born with its binding — one
+                    // pre-bind per target before any initializer walks.
                     // C: only a whole-value function literal is a fn
-                    // binding; every other RHS binds a plain name
-                    let ptr = match expr {
-                        Expr::Function { .. } => Some(expr.id()),
-                        Expr::Integer { .. }
-                        | Expr::Float { .. }
-                        | Expr::Boolean { .. }
-                        | Expr::String { .. }
-                        | Expr::Nil { .. }
-                        | Expr::TableCtor { .. }
-                        | Expr::Identifier { .. }
-                        | Expr::Index { .. }
-                        | Expr::BinaryOp { .. }
-                        | Expr::UnaryOp { .. }
-                        | Expr::SysAllocCount { .. }
-                        | Expr::SysExecCount { .. }
-                        | Expr::FfiModule { .. }
-                        | Expr::AsyncModule { .. }
-                        | Expr::Field { .. }
-                        | Expr::Call { .. } => None,
+                    // binding; every other RHS binds a plain name. The
+                    // placeholder's shape face carries DECL_PENDING, so
+                    // shape reads skip it and resolve outward exactly as
+                    // when the binding did not exist
+                    // (escape_self_capture), while the fn face rides the
+                    // binding and a self-call reaches the recursion law
+                    // as before.
+                    let ptr = if let Expr::Function { .. } = expr {
+                        Some(expr.id())
+                    } else {
+                        None
                     };
-                    self.declare_fn_binding(name, ptr);
+                    self.walk
+                        .scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.clone(), Binding::with_fn(decl_pending_shape(), ptr));
                 }
                 for name in &names[exprs.len()..] {
-                    self.declare_fn_binding(name, None);
+                    self.walk
+                        .scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.clone(), Binding::with_fn(decl_pending_shape(), None));
                 }
                 let note_move = |an: &mut Self,
                                  src: &str,
@@ -172,17 +190,32 @@ impl Analyzer {
                 }
 
                 let depth = self.walk.scopes.len() - 1;
+                let mut written: BTreeMap<String, TableShape> = BTreeMap::new();
                 for (idx, (name, set)) in names.iter().zip(sets).enumerate() {
-                    if let Some(old) = self.walk.scopes.last().and_then(|s| s.get(name)).cloned() {
+                    let old = written
+                        .get(name.as_str())
+                        .cloned()
+                        .or_else(|| olds[idx].clone());
+                    if let Some(old) = old {
                         self.rebind_death(rec, name, depth, stmt, &old, &set.aliases)?;
                     }
                     self.holds.nil_severed.remove(name);
                     self.holds.moved_severed.remove(name);
                     self.check_row_ownership(name, depth, &set, &moved_srcs)?;
                     let prov = self.prov_for_bind(exprs.get(idx), &set);
-                    let scope = self.walk.scopes.last_mut().unwrap();
-                    scope.insert(name.clone(), set);
-                    self.walk.prov[depth].insert(name.clone(), prov);
+                    let twin = set.clone();
+                    let slot = self
+                        .walk
+                        .scopes
+                        .last_mut()
+                        .unwrap()
+                        .get_mut(name)
+                        .expect("the pre-bind guarantees the target's slot");
+                    slot.shape = set;
+                    slot.prov = prov; // fn_ptr / scalar_node preserved —
+                    // a decl does not un-declare what
+                    // it pre-bound
+                    written.insert(name.clone(), twin);
                 }
                 for (d, src) in &moved_srcs {
                     self.poison_moved(*d, src);
@@ -201,11 +234,34 @@ impl Analyzer {
                 if !entry.contains(&shape) {
                     entry.push(shape);
                 }
+                // D1's twin window: the fn face is born before the body
+                // walk. A resolved target keeps its shape face — reads
+                // during the body walk see the old shape, exactly as
+                // when only the rider moved. A name bound nowhere
+                // pre-binds a DECL_PENDING placeholder so the fn face
+                // has a home; `pre_bound` routes the tail to the
+                // graduating write, the way today's undeclared-fn insert
+                // stood in for the rider.
+                let mut pre_bound = false;
                 if let Expr::Function { params, body, .. } = expr {
-                    self.assign_fn_binding(name, Some(expr.id()));
+                    match self.walk.binding_at_mut(name) {
+                        Some((_, target)) => target.fn_ptr = Some(expr.id()),
+                        None => {
+                            pre_bound = true;
+                            let depth = self.walk.scopes.len() - 1;
+                            self.walk.scopes[depth].insert(
+                                name.clone(),
+                                Binding::with_fn(decl_pending_shape(), Some(expr.id())),
+                            );
+                        }
+                    }
                     self.walk_fn_def(rec, expr.id(), params, body, (stmt.id(), 2))?;
                 } else {
-                    self.assign_fn_binding(name, None);
+                    // a non-fn RHS clears the fn face at the binding's
+                    // home depth
+                    if let Some((_, target)) = self.walk.binding_at_mut(name) {
+                        target.fn_ptr = None;
+                    }
                 }
                 if matches!(expr, Expr::Nil { .. }) {
                     signal!(rec.on(), trace::TRACE_STMT_ASSIGN_NIL);
@@ -313,18 +369,41 @@ impl Analyzer {
                     }
                 }
 
+                if pre_bound {
+                    // The pre-bind is the declaration: its placeholder
+                    // face graduates to the declared Pending face —
+                    // today's undeclared-fn insert, fused with the fn
+                    // face the pre-bind already wrote.
+                    signal!(rec.on(), trace::TRACE_BIND_SCALAR);
+                    let depth = self.walk.scopes.len() - 1;
+                    let slot = self.walk.scopes[depth]
+                        .get_mut(name)
+                        .expect("the pre-bind guarantees the slot");
+                    slot.shape = TableShape {
+                        ty: Pending,
+                        layout: LayoutVerdict::default(),
+                        aliases: BTreeSet::new(),
+                        lineage: BTreeMap::new(),
+                    };
+                    slot.prov = None;
+                    return Ok(());
+                }
                 let target = self.walk.scopes.iter().rposition(|s| s.contains_key(name));
                 if let Some(depth) = target {
                     signal!(rec.on(), trace::TRACE_STMT_ASSIGN_RESOLVED);
                     let old = self.walk.scopes[depth]
                         .get(name)
-                        .cloned()
-                        .expect("just checked");
+                        .expect("just checked")
+                        .shape
+                        .clone();
                     self.rebind_death(rec, name, depth, stmt, &old, &bind.aliases)?;
                     self.check_row_ownership(name, depth, &bind, &moved_srcs)?;
                     let prov = self.prov_for_bind(Some(expr), &bind);
-                    self.walk.scopes[depth].insert(name.clone(), bind);
-                    self.walk.prov[depth].insert(name.to_string(), prov);
+                    let slot = self.walk.scopes[depth].get_mut(name).expect("just checked");
+                    slot.shape = bind;
+                    slot.prov = prov; // fn_ptr / scalar_node preserved —
+                    // the faces this statement wrote
+                    // above stand
                     for (d, src) in &moved_srcs {
                         self.poison_moved(*d, src);
                     }
@@ -334,21 +413,6 @@ impl Analyzer {
                             entry.insert(src.clone());
                         }
                     }
-                    return Ok(());
-                }
-                if matches!(expr, Expr::Function { .. }) {
-                    signal!(rec.on(), trace::TRACE_BIND_SCALAR);
-                    let depth = self.walk.scopes.len() - 1;
-                    self.walk.scopes[depth].insert(
-                        name.clone(),
-                        TableShape {
-                            ty: Pending,
-                            layout: LayoutVerdict::default(),
-                            aliases: BTreeSet::new(),
-                            lineage: BTreeMap::new(),
-                        },
-                    );
-                    self.walk.prov[depth].insert(name.clone(), None);
                     return Ok(());
                 }
                 return Err(ShapeError(Diagnostic::scope(format!(
@@ -730,17 +794,31 @@ impl Analyzer {
                     }
                     head = merged;
                 }
+                let latch_faces = face_projections(&self.walk.scopes);
                 self.loop_scope_entries.pop();
                 self.walk.scopes = head;
+                // The face law: fn and scalar-node writes ride program
+                // order past the latch — the old rider stacks were never
+                // reset between iterations and the merge never touched
+                // them, so the last body iteration's writes stand.
+                // (Prov is the exception: it is latched explicitly
+                // below, exactly as before.)
+                apply_face_projections(&mut self.walk.scopes, &latch_faces);
+                // The latch's prov tagging: a name whose aliases moved
+                // across the loop loses its provenance. The face write
+                // lands on the binding (today: a prov rider insert).
                 for depth in 0..self.walk.scopes.len() {
                     let names: Vec<String> = self.walk.scopes[depth].keys().cloned().collect();
                     for name in names {
-                        let changed = entry
-                            .get(depth)
-                            .and_then(|s| s.get(&name))
-                            .is_some_and(|e| e.aliases != self.walk.scopes[depth][&name].aliases);
-                        if changed {
-                            self.walk.prov[depth].insert(name, None);
+                        let changed =
+                            entry
+                                .get(depth)
+                                .and_then(|s| s.get(&name))
+                                .is_some_and(|e| {
+                                    e.shape.aliases != self.walk.scopes[depth][&name].shape.aliases
+                                });
+                        if changed && let Some(bind) = self.walk.scopes[depth].get_mut(&name) {
+                            bind.prov = None;
                         }
                     }
                 }
@@ -757,20 +835,32 @@ impl Analyzer {
                 self.pin_bool_use(rec, condition, &cty);
                 self.check_uses(rec, condition)?;
                 let snapshot = self.walk.scopes.clone();
-                let prov_snapshot = self.walk.prov.clone();
                 self.with_scope(|an| {
                     an.walk_stmts(rec, then_body);
                     an.decide_scope_exit(rec, (stmt.id(), 0))
                 })?;
                 let then_exit = self.walk.scopes.clone();
+                let then_faces = face_projections(&self.walk.scopes);
                 self.walk.scopes = snapshot;
-                self.walk.prov = prov_snapshot.clone();
+                // The face law: fn and scalar-node writes ride program
+                // order across the arms — the old rider stacks were
+                // never snapshotted by this statement, so the then
+                // arm's writes stand for the else arm's reads and for
+                // the join. Prov is the exception: it was snapshotted
+                // and restored, and the bindings carry it back exactly.
+                apply_face_projections(&mut self.walk.scopes, &then_faces);
                 self.with_scope(|an| {
                     an.walk_stmts(rec, else_body);
                     an.decide_scope_exit(rec, (stmt.id(), 1))
                 })?;
                 let else_exit = self.walk.scopes.clone();
                 merge_table_scopes(&mut self.walk.scopes, &then_exit, &else_exit);
+                // The If join's prov tagging: a name whose aliases split
+                // across the arms takes If provenance when the merged
+                // aliases mix ghosts with real sites and no provenance
+                // stands. The writes land on the bindings — prov rides
+                // the snapshot/restore with its scope, so no separate
+                // prov snapshot exists anymore.
                 for depth in 0..self.walk.scopes.len() {
                     let names: Vec<String> = self.walk.scopes[depth].keys().cloned().collect();
                     for name in names {
@@ -780,21 +870,29 @@ impl Analyzer {
                         ) else {
                             continue;
                         };
-                        if tt.aliases == et.aliases {
+                        if tt.shape.aliases == et.shape.aliases {
                             continue;
                         }
                         let joined = &self.walk.scopes[depth][&name];
-                        let mixed = joined.aliases.iter().any(is_ghost)
-                            && joined.aliases.iter().any(|x| !is_root(x) && !is_ghost(x));
-                        let cur = self.walk.prov[depth].get(&name).copied().flatten();
+                        let mixed = joined.shape.aliases.iter().any(is_ghost)
+                            && joined
+                                .shape
+                                .aliases
+                                .iter()
+                                .any(|x| !is_root(x) && !is_ghost(x));
+                        let cur = self.walk.scopes[depth].get(&name).and_then(|b| b.prov);
                         let new_prov = if mixed && cur.is_none() {
-                            self.join_arm_shapes
-                                .insert((stmt.id(), name.clone()), (tt.clone(), et.clone()));
+                            self.join_arm_shapes.insert(
+                                (stmt.id(), name.clone()),
+                                (tt.shape.clone(), et.shape.clone()),
+                            );
                             Some(Prov::If(stmt.id()))
                         } else {
                             None
                         };
-                        self.walk.prov[depth].insert(name, new_prov);
+                        if let Some(bind) = self.walk.scopes[depth].get_mut(&name) {
+                            bind.prov = new_prov;
+                        }
                     }
                 }
             }
@@ -866,7 +964,7 @@ impl Analyzer {
                             let outer_owned: BTreeSet<usize> = self.walk.scopes[..entry]
                                 .iter()
                                 .flat_map(|scope| scope.values())
-                                .flat_map(|ts| ts.aliases.iter().copied())
+                                .flat_map(|b| b.shape.aliases.iter().copied())
                                 .filter(|s| !is_root(s))
                                 .collect();
                             aliases.retain(|s| is_root(s) || !outer_owned.contains(s));
@@ -897,15 +995,10 @@ impl Analyzer {
     }
 
     pub(super) fn enter_scope(&mut self) {
-        self.walk.assert_parallel_stacks_aligned();
-        self.walk.scopes.push(BTreeMap::new());
-        self.walk.fn_scopes.push(BTreeMap::new());
-        self.walk.prov.push(BTreeMap::new());
-        self.walk.scalar_nodes.push(BTreeMap::new());
+        self.walk.scopes.push(Scope::new());
     }
 
     pub(super) fn exit_scope(&mut self) {
-        self.walk.assert_parallel_stacks_aligned();
         if let Some(dying) = self.walk.scopes.last() {
             for name in dying.keys() {
                 // The holds family is name-keyed and flat, so cleanup
@@ -924,9 +1017,6 @@ impl Analyzer {
                 }
             }
         }
-        self.walk.fn_scopes.pop();
-        self.walk.prov.pop();
-        self.walk.scalar_nodes.pop();
         self.walk.scopes.pop();
     }
 
@@ -938,16 +1028,7 @@ impl Analyzer {
     }
 
     pub(super) fn resolve(&self, rec: Gate, name: &str) -> Result<(usize, TableShape), ShapeError> {
-        for (depth, scope) in self.walk.scopes.iter().enumerate().rev() {
-            if let Some(bind) = scope.get(name) {
-                signal!(rec.on(), trace::TRACE_RESOLVE_FOUND);
-                return Ok((depth, bind.clone()));
-            }
-        }
-        Err(ShapeError(Diagnostic::scope(format!(
-            "reference to undeclared variable '{}'",
-            name
-        ))))
+        self.walk.resolve(rec, name)
     }
 
     pub(super) fn resolve_aliases(
@@ -969,7 +1050,7 @@ impl Analyzer {
             Some(Expr::Identifier { name: src, .. }) => self
                 .resolve(None, src)
                 .ok()
-                .and_then(|(d, _)| self.walk.prov.get(d)?.get(src).copied().flatten()),
+                .and_then(|(d, _)| self.walk.prov_at(d, src)),
             // C: only a call's return or a resolved name lends provenance
             Some(
                 Expr::Integer { .. }
@@ -1022,6 +1103,57 @@ impl Analyzer {
             | Expr::Field { .. }
             | Expr::Function { .. }
             | Expr::Call { .. } => {}
+        }
+    }
+}
+
+/// The While-latch / If-join merge: joins `into`'s shape faces with the
+/// twin slots' shapes. The other faces stay `into`'s own — a merge
+/// never mints or moves a binding, it only refines shapes. Lives here
+/// now: its type is the walk's `Scope`, and its only callers are the
+/// two loop arms above.
+fn merge_table_scopes(into: &mut [Scope], a: &[Scope], b: &[Scope]) {
+    for ((into_slot, a_slot), b_slot) in into.iter_mut().zip(a).zip(b) {
+        for (name, val) in into_slot.iter_mut() {
+            if let Some(x) = a_slot.get(name) {
+                val.shape.join(&x.shape);
+            }
+            if let Some(x) = b_slot.get(name) {
+                val.shape.join(&x.shape);
+            }
+        }
+    }
+}
+
+/// The control-flow-transparent faces of one depth: the fn face and
+/// the scalar-node face per name — what the If/While overlays capture
+/// and reapply.
+type ArmFaces = BTreeMap<String, (Option<NodeId>, Option<usize>)>;
+
+/// The fn and scalar-node faces of a whole stack, projected out for the
+/// control-flow overlays below.
+fn face_projections(scopes: &[Scope]) -> Vec<ArmFaces> {
+    scopes
+        .iter()
+        .map(|scope| {
+            scope
+                .iter()
+                .map(|(name, b)| (name.clone(), (b.fn_ptr, b.scalar_node)))
+                .collect()
+        })
+        .collect()
+}
+
+/// Re-applies a face projection onto a stack. Only the fn and
+/// scalar-node faces move; shapes and prov stay whatever the target
+/// carries.
+fn apply_face_projections(scopes: &mut [Scope], faces: &[ArmFaces]) {
+    for (scope, faces) in scopes.iter_mut().zip(faces) {
+        for (name, (fn_ptr, node)) in faces {
+            if let Some(bind) = scope.get_mut(name) {
+                bind.fn_ptr = *fn_ptr;
+                bind.scalar_node = *node;
+            }
         }
     }
 }

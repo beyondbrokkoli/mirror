@@ -6,9 +6,16 @@ pub const BOUNDS_FAIL_THRESHOLD: i64 = i64::MAX / 8;
 pub const NULL_ROOT: usize = usize::MAX;
 pub const MOVED_ROOT: usize = usize::MAX - 1;
 pub const BOUNDARY_ROOT: usize = usize::MAX - 2;
+/// A pre-bound target's shape face is still pending: the binding exists
+/// — its fn face rides it through the initializer's body walk — but
+/// shape reads must treat the name as not yet declared and resolve
+/// outward, exactly as when the shape binding did not exist. The
+/// oracle's `resolve` skips it; `is_root` excludes it from every site
+/// filter, so no consumer mistakes the marker for a real alias.
+pub const DECL_PENDING: usize = usize::MAX - 3;
 
 pub fn is_root(s: &usize) -> bool {
-    *s == NULL_ROOT || *s == MOVED_ROOT || *s == BOUNDARY_ROOT
+    *s == NULL_ROOT || *s == MOVED_ROOT || *s == BOUNDARY_ROOT || *s == DECL_PENDING
 }
 
 pub const ROW_GHOST_FLOOR: usize = usize::MAX / 2;

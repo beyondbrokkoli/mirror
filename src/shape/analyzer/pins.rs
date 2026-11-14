@@ -37,11 +37,7 @@ impl Analyzer {
     }
 
     fn name_node(&self, name: &str) -> Option<usize> {
-        self.walk
-            .scalar_nodes
-            .iter()
-            .rev()
-            .find_map(|s| s.get(name).copied())
+        self.walk.scalar_node(name)
     }
 
     fn single_pending_head(&self, sites: impl Iterator<Item = usize>) -> Option<usize> {
@@ -291,38 +287,23 @@ impl Analyzer {
 
     pub(super) fn note_decl_scalar_node(&mut self, name: &str, rhs: &Expr) {
         let entry = self.node_view(rhs);
-        let scope = self.walk.scalar_nodes.last_mut().unwrap();
-        match entry {
-            Some(id) => {
-                scope.insert(name.to_string(), id);
-            }
-            None => {
-                scope.remove(name);
-            }
+        // The decl's pre-bind sits innermost — the node face lands on
+        // the binding it belongs to (today: an innermost rider write).
+        if let Some((_, bind)) = self.walk.binding_at_mut(name) {
+            bind.scalar_node = entry;
         }
     }
 
     pub(super) fn note_assign_scalar_node(&mut self, name: &str, rhs: &Expr) {
         let entry = self.node_view(rhs);
-        // A scalar node rides its name's binding depth, not wherever a
-        // stale entry happens to sit: scanning the binding scopes (which
-        // every binder — decl, param, assignment — writes at its home
-        // depth) so a nested assignment may not orphan the node in an
-        // inner map that dies with its scope. `scopes` and
-        // `scalar_nodes` are index-aligned (enter/exit, resets).
-        let depth = self
-            .walk
-            .scopes
-            .iter()
-            .rposition(|s| s.contains_key(name))
-            .unwrap_or(self.walk.scalar_nodes.len() - 1);
-        match entry {
-            Some(id) => {
-                self.walk.scalar_nodes[depth].insert(name.to_string(), id);
-            }
-            None => {
-                self.walk.scalar_nodes[depth].remove(name);
-            }
+        // A scalar node rides its name's binding depth: binding_at_mut
+        // IS the home scan (today: an rposition over the master scopes
+        // with an innermost fallback — the T2 ghost's second
+        // birthplace). A name bound nowhere finds no binding and no
+        // face is written, exactly as the old fallback's rider entry
+        // lived only to die with the undeclared rejection.
+        if let Some((_, bind)) = self.walk.binding_at_mut(name) {
+            bind.scalar_node = entry;
         }
     }
 }

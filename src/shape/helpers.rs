@@ -1,6 +1,4 @@
-use super::core::TableShape;
 use crate::ast::{BinOp, Expr, UnOp};
-use std::collections::BTreeMap;
 
 /// The compile-time value of a key expression in PHYSICAL space: the
 /// raw folded literal minus `index_base`. Every consumer that compares
@@ -134,22 +132,5 @@ pub fn guard_key_shape(key: &Expr, guard: &str, index_base: i64) -> Option<crate
         | Expr::Field { .. }
         | Expr::Function { .. }
         | Expr::Call { .. } => None,
-    }
-}
-
-pub fn merge_table_scopes(
-    into: &mut [BTreeMap<String, TableShape>],
-    a: &[BTreeMap<String, TableShape>],
-    b: &[BTreeMap<String, TableShape>],
-) {
-    for ((into_slot, a_slot), b_slot) in into.iter_mut().zip(a).zip(b) {
-        for (name, val) in into_slot.iter_mut() {
-            if let Some(x) = a_slot.get(name) {
-                val.join(x);
-            }
-            if let Some(x) = b_slot.get(name) {
-                val.join(x);
-            }
-        }
     }
 }

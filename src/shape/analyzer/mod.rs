@@ -4,12 +4,12 @@ use alm_rt::{signal, trace};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::core::{
-    BOUNDARY_ROOT, BOUNDS_FAIL_THRESHOLD, LayoutVerdict, MOVED_ROOT, NULL_ROOT, RowLineage,
-    SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
+    BOUNDARY_ROOT, BOUNDS_FAIL_THRESHOLD, DECL_PENDING, LayoutVerdict, MOVED_ROOT, NULL_ROOT,
+    RowLineage, SPARSE_THRESHOLD, TableShape, is_ghost, is_root,
 };
 use super::facts;
 use super::facts::{FastStoreElig, KeyShape, ReservePlan, ShapeFacts};
-use super::helpers::{const_key_value, extract_guard, guard_key_shape, merge_table_scopes};
+use super::helpers::{const_key_value, extract_guard, guard_key_shape};
 use super::ty::{Ty, arith_ty, contains_any, decided, join_ty, pinned_scalar, value_kind};
 pub(super) use crate::diag::Diagnostic;
 use Ty::{Any, Async, Bool, Conflict, Ffi, FfiLib, Flt, Int, Pending, Str, Tbl};
@@ -34,18 +34,87 @@ use rows::*;
 
 struct ShapeError(pub Diagnostic);
 
-fn boundary_root_scope() -> BTreeMap<String, TableShape> {
-    let mut scope = BTreeMap::new();
+fn boundary_root_scope() -> Scope {
+    let mut scope = Scope::new();
     scope.insert(
         "arg".to_string(),
-        TableShape {
+        Binding::new(TableShape {
             ty: Tbl(Box::new(Pending)),
             layout: LayoutVerdict::default(),
             aliases: BTreeSet::from([BOUNDARY_ROOT]),
             lineage: BTreeMap::new(),
-        },
+        }),
     );
     scope
+}
+
+/// The shape face of a pre-bound target: pending, and marked
+/// DECL_PENDING so shape reads skip the binding and resolve outward —
+/// the D1 window, carried by the type instead of by a missing map
+/// entry (see `WalkState::resolve`).
+fn decl_pending_shape() -> TableShape {
+    TableShape {
+        ty: Pending,
+        layout: LayoutVerdict::default(),
+        aliases: BTreeSet::from([DECL_PENDING]),
+        lineage: BTreeMap::new(),
+    }
+}
+
+/// Everything the walk knows about one name at one depth. A binding's
+/// faces are born, live, and die with the same map entry at the same
+/// depth — there is nowhere else for them to be. `TableShape` stays the
+/// currency everywhere else (fn_rets, join_arm_shapes, merge joins, the
+/// checker's snapshots); Binding is what the scope carries.
+#[derive(Clone, Debug, PartialEq)]
+struct Binding {
+    /// The shape face — the master's own payload (ty, layout, aliases,
+    /// lineage).
+    shape: TableShape,
+    /// The fn face — was `fn_scopes[d][name]`: Some(ptr) when the
+    /// binding holds a function literal, None when it does not. The old
+    /// key-presence bit had one exception (the boundary `arg` bound with
+    /// no fn entry — the p30 orphan precondition); here every binding
+    /// carries the face, and `arg`'s is simply None.
+    fn_ptr: Option<NodeId>,
+    /// The provenance face — was `prov[d][name]`.
+    prov: Option<Prov>,
+    /// The scalar-node face — was `scalar_nodes[d][name]`, where key
+    /// presence meant the node id and absence meant no node. Here a
+    /// plain Option: the note_* remove-on-no-node dance folds into an
+    /// assignment.
+    scalar_node: Option<usize>,
+}
+
+impl Binding {
+    /// The only way to mint a binding: all faces declared, none
+    /// implicit. Every construction site names its faces.
+    fn new(shape: TableShape) -> Self {
+        Binding {
+            shape,
+            fn_ptr: None,
+            prov: None,
+            scalar_node: None,
+        }
+    }
+
+    fn with_fn(shape: TableShape, fn_ptr: Option<NodeId>) -> Self {
+        Binding {
+            shape,
+            fn_ptr,
+            prov: None,
+            scalar_node: None,
+        }
+    }
+}
+
+/// One depth of the walk.
+type Scope = BTreeMap<String, Binding>;
+
+struct WalkState {
+    scopes: Vec<Scope>,
+    changed: bool,
+    conv_fires: BTreeSet<u8>,
 }
 
 struct Ledger {
@@ -70,87 +139,80 @@ impl GateOn for Option<Recording> {
     }
 }
 
-struct WalkState {
-    scopes: Vec<BTreeMap<String, TableShape>>,
-    fn_scopes: Vec<BTreeMap<String, Option<NodeId>>>,
-    changed: bool,
-    conv_fires: BTreeSet<u8>,
-    prov: Vec<BTreeMap<String, Option<Prov>>>,
-    scalar_nodes: Vec<BTreeMap<String, usize>>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Prov {
     If(NodeId),
     Call(NodeId),
 }
 
 impl WalkState {
-    /// The stack architecture's alignment law: `scopes` is the master
-    /// list every rider hangs off — `fn_scopes`, `prov`, and
-    /// `scalar_nodes` are index-aligned with it, one map per depth,
-    /// pushed and popped together (enter/exit_scope) and reset together
-    /// (both reset sites). A drift here is the orphan-ghost's incubator:
-    /// a rider written at depth d describing a binding that lives at
-    /// depth d' dies with the wrong scope. The release profile keeps
-    /// debug-assertions live, so every corpus leg proves this, not just
-    /// debug builds.
-    fn assert_parallel_stacks_aligned(&self) {
-        debug_assert_eq!(
-            self.scopes.len(),
-            self.fn_scopes.len(),
-            "the stacks drifted: fn_scopes is not index-aligned with scopes"
-        );
-        debug_assert_eq!(
-            self.scopes.len(),
-            self.prov.len(),
-            "the stacks drifted: prov is not index-aligned with scopes"
-        );
-        debug_assert_eq!(
-            self.scopes.len(),
-            self.scalar_nodes.len(),
-            "the stacks drifted: scalar_nodes is not index-aligned with scopes"
-        );
+    /// The Oracle — the single resolution path. The master stack is the
+    /// only place a binding lives; every face reads off the same
+    /// Binding at the same depth. The old `.iter().rev().find_map()`
+    /// scans (resolve over scopes, resolve_fn over fn_scopes, name_node
+    /// over scalar_nodes — each blind to binding depth in its own way)
+    /// collapse into these methods and their projectors.
+    fn binding_at(&self, name: &str) -> Option<(usize, &Binding)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.get(name).map(|bind| (depth, bind)))
     }
 
-    /// The riders' content law — the assert that would have caught the
-    /// Oct 17 ghost on its first pass: a rider entry at depth d
-    /// describes the binding its name has at that same depth. Every
-    /// rider key must be bound in `scopes[d]`, with one documented
-    /// exemption: a name bound nowhere at all (the undeclared-assignment
-    /// rejection writes its rider before rejecting). Run after each
-    /// recorded-pass statement, once every binder has run and every
-    /// scope the statement opened has closed.
-    fn assert_riders_bound(&self) {
-        self.assert_parallel_stacks_aligned();
-        let bound_nowhere = |name: &str| self.scopes.iter().all(|s| !s.contains_key(name));
-        for (depth, rider) in self.scalar_nodes.iter().enumerate() {
-            for name in rider.keys() {
-                debug_assert!(
-                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
-                    "the riders broke faith with the master stack: \
-                     scalar_nodes[{depth}] holds '{name}' but its binding does not live there"
-                );
+    /// Home-depth mutable access — the one write path for faces. There
+    /// is no rider stack to pick a depth from.
+    fn binding_at_mut(&mut self, name: &str) -> Option<(usize, &mut Binding)> {
+        self.scopes
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.get_mut(name).map(|bind| (depth, bind)))
+    }
+
+    /// The shape face, keeping the walk's trace contract: the only
+    /// resolution that fires TRACE_RESOLVE_FOUND and produces the
+    /// undeclared diagnostic. (Trace slots are observable — ALM_TRACE
+    /// output and golden-locked; the other projectors stay silent,
+    /// exactly as their scans did.) A DECL_PENDING binding is skipped:
+    /// its shape face is still pending, and a shape read answers as if
+    /// the binding were not there yet — the D1 window, carried by the
+    /// marker instead of by a missing map entry.
+    fn resolve(&self, rec: Gate, name: &str) -> Result<(usize, TableShape), ShapeError> {
+        for (depth, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(bind) = scope.get(name) {
+                if bind.shape.aliases.contains(&DECL_PENDING) {
+                    continue;
+                }
+                signal!(rec.on(), trace::TRACE_RESOLVE_FOUND);
+                return Ok((depth, bind.shape.clone()));
             }
         }
-        for (depth, rider) in self.fn_scopes.iter().enumerate() {
-            for name in rider.keys() {
-                debug_assert!(
-                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
-                    "the riders broke faith with the master stack: \
-                     fn_scopes[{depth}] holds '{name}' but its binding does not live there"
-                );
-            }
-        }
-        for (depth, rider) in self.prov.iter().enumerate() {
-            for name in rider.keys() {
-                debug_assert!(
-                    self.scopes[depth].contains_key(name) || bound_nowhere(name),
-                    "the riders broke faith with the master stack: \
-                     prov[{depth}] holds '{name}' but its binding does not live there"
-                );
-            }
-        }
+        Err(ShapeError(Diagnostic::scope(format!(
+            "reference to undeclared variable '{}'",
+            name
+        ))))
+    }
+
+    /// The fn face: the innermost binding's fn_ptr. An inner non-fn
+    /// binding shadows the outer fn (None wins) — exactly the old
+    /// fn_scopes rev-scan, minus the drift. The p30 law ("a fn entry
+    /// rides its name's binding depth") is no longer a written
+    /// agreement; it is the only thing that can happen.
+    fn resolve_fn(&self, name: &str) -> Option<NodeId> {
+        self.binding_at(name)?.1.fn_ptr
+    }
+
+    /// The scalar-node face — what name_node scanned for, blind to
+    /// binding depth. Reads the binding: the blind spot is unwritable.
+    fn scalar_node(&self, name: &str) -> Option<usize> {
+        self.binding_at(name)?.1.scalar_node
+    }
+
+    /// The provenance face at an explicit depth (join sites, rebind
+    /// writers).
+    fn prov_at(&self, depth: usize, name: &str) -> Option<Prov> {
+        self.scopes[depth].get(name)?.prov
     }
 }
 
@@ -384,11 +446,8 @@ pub fn analyze_with_base(
         pin_justified_names: BTreeSet::new(),
         walk: WalkState {
             scopes: vec![boundary_root_scope()],
-            fn_scopes: vec![BTreeMap::new()],
             changed: false,
             conv_fires: BTreeSet::new(),
-            prov: vec![BTreeMap::new()],
-            scalar_nodes: vec![BTreeMap::new()],
         },
         ledger: Ledger {
             diagnostics: Vec::new(),
@@ -478,42 +537,23 @@ pub fn analyze_with_base(
         loop_scope_entries: Vec::new(),
     };
 
-    let mut prev_end: Vec<BTreeMap<String, TableShape>> = Vec::new();
-    let mut prev_fn_end: Vec<BTreeMap<String, Option<NodeId>>> = Vec::new();
-    let mut prev_prov_end: Vec<BTreeMap<String, Option<Prov>>> = Vec::new();
-    let mut prev_nodes_end: Vec<BTreeMap<String, usize>> = Vec::new();
+    let mut prev_end: Vec<Scope> = Vec::new();
     let mut dbg_pass: u32 = 0;
     loop {
         dbg_pass += 1;
         crate::alm_dbgln!("[fixpoint] pass {dbg_pass}");
         a.walk.changed = false;
         a.walk.scopes = vec![boundary_root_scope()];
-        a.walk.fn_scopes = vec![BTreeMap::new()];
-        a.walk.prov = vec![BTreeMap::new()];
-        a.walk.scalar_nodes = vec![BTreeMap::new()];
-        a.walk.assert_parallel_stacks_aligned();
         a.fn_def_sites.clear();
         a.fn_captures.clear();
         a.walk_stmts(None, ctx.ast);
-        // Stability must see every stack the walk maintains: comparing
-        // scopes alone is blind to a rider oscillating in fn_scopes,
-        // prov, or scalar_nodes — the loop would break on a master
-        // state that settled while its riders never did, and the
-        // recorded pass would inherit whatever face they wore that
-        // pass.
+        // Stability sees the one stack the walk maintains: every face
+        // rides its binding, so a settled scope state cannot hide an
+        // oscillating rider — the old four-stack compare had to guard
+        // against exactly that, and has nothing left to guard.
         let end = a.walk.scopes.clone();
-        let fn_end = a.walk.fn_scopes.clone();
-        let prov_end = a.walk.prov.clone();
-        let nodes_end = a.walk.scalar_nodes.clone();
-        let stable = end == prev_end
-            && fn_end == prev_fn_end
-            && prov_end == prev_prov_end
-            && nodes_end == prev_nodes_end
-            && !a.walk.changed;
+        let stable = end == prev_end && !a.walk.changed;
         prev_end = end;
-        prev_fn_end = fn_end;
-        prev_prov_end = prov_end;
-        prev_nodes_end = nodes_end;
         if stable {
             break;
         }
@@ -526,9 +566,9 @@ pub fn analyze_with_base(
     let adopt_lines: BTreeMap<String, usize> = {
         let mut m = BTreeMap::new();
         for scope in a.walk.scopes.iter() {
-            for (name, shape) in scope {
+            for (name, bind) in scope {
                 let mut best: Option<usize> = None;
-                for s in shape.aliases.iter() {
+                for s in bind.shape.aliases.iter() {
                     if let Some(&l) = a.lattice.adopt_witness.get(s) {
                         best = Some(best.map_or(l, |b: usize| b.min(l)));
                     }
@@ -546,10 +586,6 @@ pub fn analyze_with_base(
 
     let rec: Gate = Some(Recording { _priv: () });
     a.walk.scopes = vec![boundary_root_scope()];
-    a.walk.fn_scopes = vec![BTreeMap::new()];
-    a.walk.prov = vec![BTreeMap::new()];
-    a.walk.scalar_nodes = vec![BTreeMap::new()];
-    a.walk.assert_parallel_stacks_aligned();
     a.pin_derived_exprs.clear();
     a.pin_justified_names.clear();
 
@@ -562,7 +598,7 @@ pub fn analyze_with_base(
         fn_captures: a.fn_captures.clone(),
     });
     let mut checker_ran = elems_diags.is_empty();
-    let mut last_post: Option<Vec<BTreeMap<String, TableShape>>> = None;
+    let mut last_post: Option<Vec<Scope>> = None;
     let mut walk_completed = true;
     for stmt in ctx.ast {
         if let Some(post) = &last_post {
@@ -583,7 +619,6 @@ pub fn analyze_with_base(
         }
         chk.snapshot_post(&a.walk, &a.holds.moved_severed);
         last_post = Some(a.walk.scopes.clone());
-        a.walk.assert_riders_bound();
         if checker_ran && let Err(msg) = chk.check_stmt(&mut a.lattice.unknowns, stmt) {
             signal!(trace::TRACE_GHOST_BAIL_CHECKER);
             a.ledger
@@ -629,8 +664,8 @@ pub fn analyze_with_base(
 
 #[cfg(debug_assertions)]
 fn recorded_reproduces_fixpoint(
-    recorded: &[BTreeMap<String, TableShape>],
-    fixpoint: &[BTreeMap<String, TableShape>],
+    recorded: &[Scope],
+    fixpoint: &[Scope],
     pin_justified: &BTreeSet<String>,
 ) -> Result<(), String> {
     if recorded.len() != fixpoint.len() {
@@ -647,24 +682,25 @@ fn recorded_reproduces_fixpoint(
                     "depth {depth}: '{name}' exists only in the recorded pass"
                 ));
             };
-            if rec == fix {
+            if rec.shape == fix.shape {
                 continue;
             }
-            let legal = rec.layout == fix.layout
-                && rec.aliases == fix.aliases
-                && rec.lineage == fix.lineage
-                && ty_refines(&rec.ty, &fix.ty);
+            let legal = rec.shape.layout == fix.shape.layout
+                && rec.shape.aliases == fix.shape.aliases
+                && rec.shape.lineage == fix.shape.lineage
+                && ty_refines(&rec.shape.ty, &fix.shape.ty);
             if !legal {
                 return Err(format!(
                     "depth {depth}: '{name}' is not a monotone refinement — \
-                     recorded {rec:?} vs fixpoint {fix:?}"
+                     recorded {:?} vs fixpoint {:?}",
+                    rec.shape, fix.shape
                 ));
             }
             if !pin_justified.contains(name) {
                 return Err(format!(
                     "depth {depth}: '{name}' refined to {:?} with no walk pin \
-                     accounting for it — recorded {rec:?} vs fixpoint {fix:?}",
-                    rec.ty,
+                     accounting for it — recorded {:?} vs fixpoint {:?}",
+                    rec.shape.ty, rec.shape, fix.shape,
                 ));
             }
         }
