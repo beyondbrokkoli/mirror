@@ -106,16 +106,23 @@ pub struct IrLowerer<'a> {
     break_ctxs: Vec<BreakCtx>,
     instance_chain: Vec<InstanceId>,
     event_cursor: BTreeMap<(InstanceId, NodeId), usize>,
-    env_memo: Option<EnvMemo>,
+    env_memos: Vec<EnvMemo>,
     env_regs: Vec<Reg<Ptr>>,
     env_ctxs: Vec<EnvCtx>,
     cur_stmt: Option<NodeId>,
 }
 
+/// One statement's minted env. `depths` is the binding identity of
+/// every cell the env holds: a capture's walk-scope index, not its
+/// string. A later creation read in the same statement shares this
+/// env only when every name the two faces agree on resolves to the
+/// same depth — same name, different depth is a different binding
+/// (the shadow), and it mints its own env (Closure Finding A).
 struct EnvMemo {
     stmt: NodeId,
     reg: Reg<Ptr>,
     stored: BTreeSet<String>,
+    depths: BTreeMap<String, usize>,
 }
 
 struct EnvCtx {

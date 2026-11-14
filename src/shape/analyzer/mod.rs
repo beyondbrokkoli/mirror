@@ -423,6 +423,7 @@ struct Analyzer {
     fn_scope_entries: Vec<usize>,
     fn_def_sites: BTreeMap<NodeId, BTreeMap<String, Option<NodeId>>>,
     fn_captures: BTreeMap<NodeId, BTreeSet<String>>,
+    fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     loop_scope_entries: Vec<usize>,
 }
 
@@ -534,6 +535,7 @@ pub fn analyze_with_base(
         fn_scope_entries: Vec::new(),
         fn_def_sites: BTreeMap::new(),
         fn_captures: BTreeMap::new(),
+        fn_capture_depths: BTreeMap::new(),
         loop_scope_entries: Vec::new(),
     };
 
@@ -546,6 +548,7 @@ pub fn analyze_with_base(
         a.walk.scopes = vec![boundary_root_scope()];
         a.fn_def_sites.clear();
         a.fn_captures.clear();
+        a.fn_capture_depths.clear();
         a.walk_stmts(None, ctx.ast);
         // Stability sees the one stack the walk maintains: every face
         // rides its binding, so a settled scope state cannot hide an
@@ -596,6 +599,7 @@ pub fn analyze_with_base(
         elems: static_elems.clone(),
         fn_def_sites: a.fn_def_sites.clone(),
         fn_captures: a.fn_captures.clone(),
+        fn_capture_depths: a.fn_capture_depths.clone(),
     });
     let mut checker_ran = elems_diags.is_empty();
     let mut last_post: Option<Vec<Scope>> = None;
@@ -912,6 +916,7 @@ impl Recorded {
             fn_touched: BTreeMap::new(),
             fn_defs: self.chk.fn_defs,
             env_faces: self.chk.env_faces,
+            env_face_depths: self.chk.env_face_depths,
             closure_fields: self.chk.closure_fields,
             call_fns: self.chk.call_fns,
             ffi_verbs: self.chk.ffi_verbs,

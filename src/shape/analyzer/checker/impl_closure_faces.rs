@@ -47,6 +47,20 @@ impl Checker {
         }
         match self.env_faces.get(&ptr) {
             None => {
+                // The face's binding depths ride beside it: captures
+                // are fixed body text, so the first creation site
+                // stamps what every site must agree on. The lowerer
+                // keys env sharing and cell stores on these — same
+                // name, different depth means two bindings, two envs
+                // (Closure Finding A).
+                self.env_face_depths.insert(
+                    ptr,
+                    self.ctx
+                        .fn_capture_depths
+                        .get(&ptr)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
                 self.env_faces.insert(ptr, face);
             }
             Some(prev) => {

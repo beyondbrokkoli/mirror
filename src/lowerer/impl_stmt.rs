@@ -5,7 +5,7 @@ impl<'a> IrLowerer<'a> {
             line: stmt.loc().line,
             col: stmt.loc().col,
         });
-        self.env_memo = None;
+        self.env_memos.clear();
         self.cur_stmt = Some(stmt.id());
         match stmt {
             Stmt::LocalDecl { names, exprs, .. } => {

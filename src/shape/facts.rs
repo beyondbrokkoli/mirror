@@ -236,6 +236,12 @@ pub struct ShapeFacts {
     pub fn_touched: BTreeMap<NodeId, BTreeSet<String>>,
     pub fn_defs: BTreeMap<NodeId, FnDef>,
     pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
+    /// Each face's capture name -> the walk-scope index its binding
+    /// lives at. The lowerer's binding identity for env sharing and
+    /// cell stores: a same-named capture at a different depth is a
+    /// different binding and may not absorb its predecessor's cell
+    /// (Closure Finding A).
+    pub env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,

@@ -20,7 +20,7 @@ impl<'a> IrLowerer<'a> {
             break_ctxs: Vec::new(),
             instance_chain: Vec::new(),
             event_cursor: BTreeMap::new(),
-            env_memo: None,
+            env_memos: Vec::new(),
             env_regs: Vec::new(),
             env_ctxs: Vec::new(),
             cur_stmt: None,
@@ -321,6 +321,33 @@ impl<'a> IrLowerer<'a> {
             }
         }
         Err(LowerError(Diagnostic::lower("Undeclared variable")))
+    }
+
+    /// A capture's binding, resolved at the walk-scope depth the
+    /// checker recorded for it — NOT at the innermost same-named
+    /// binding, which a shadow at the mint site would otherwise lend
+    /// to the wrong face. The depth is the binding identity shared by
+    /// the checker's walk stack and this stack; a miss is a structural
+    /// desync between the two, never a program error, so it dies loud.
+    fn read_var_at(&self, name: &str, depth: usize) -> Local {
+        let scope = self.scopes.get(depth).unwrap_or_else(|| {
+            panic!(
+                "capture '{name}' resolves to walk-scope {depth}, but \
+                 this scope stack holds only {} — the checker recorded \
+                 the capture on its walk stack and the lowerer's stack \
+                 drifted beneath it: a structural desync, not a \
+                 program error",
+                self.scopes.len()
+            );
+        });
+        scope.get(name).unwrap_or_else(|| {
+            panic!(
+                "capture '{name}' has no binding at its recorded \
+                 walk-scope {depth} — the checker's chain and this \
+                 scope stack disagree on where the name lives: a \
+                 structural desync, not a program error"
+            );
+        }).clone()
     }
 
     fn has_var(&self, name: &str) -> bool {

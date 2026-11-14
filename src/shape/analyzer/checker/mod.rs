@@ -111,6 +111,7 @@ pub(super) struct CheckCtx {
     pub elems: Vec<Ty>,
     pub fn_def_sites: BTreeMap<NodeId, BTreeMap<String, Option<NodeId>>>,
     pub fn_captures: BTreeMap<NodeId, BTreeSet<String>>,
+    pub fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
 }
 
 pub(super) struct CheckFacts {
@@ -118,6 +119,7 @@ pub(super) struct CheckFacts {
     pub fn_defs: BTreeMap<NodeId, FnDef>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
+    pub env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,
     pub builtin_verbs: BTreeMap<NodeId, BuiltinVerb>,
@@ -148,6 +150,7 @@ pub(super) struct Checker {
     fn_defs: BTreeMap<NodeId, FnDef>,
     call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     env_faces: BTreeMap<NodeId, BTreeMap<String, Ty>>,
+    env_face_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
     closure_fields: BTreeMap<(usize, String), NodeId>,
     expansion_envs: Vec<Option<BTreeMap<String, Ty>>>,
     env_overrides: Vec<BTreeMap<String, Ty>>,

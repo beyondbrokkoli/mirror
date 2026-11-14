@@ -160,9 +160,18 @@ impl Analyzer {
     ) -> Result<(), ShapeError> {
         self.fn_scope_keys.insert(fn_ptr, key);
         let mut chain: BTreeMap<String, Option<NodeId>> = BTreeMap::new();
-        for scope in self.walk.scopes.iter().skip(1) {
+        let mut chain_depth: BTreeMap<String, usize> = BTreeMap::new();
+        for (depth, scope) in self.walk.scopes.iter().enumerate().skip(1) {
             for (n, b) in scope {
                 chain.insert(n.clone(), b.fn_ptr);
+                // The same inner-wins pass that picks the chain's
+                // binding picks its walk-scope index: the capture's
+                // binding identity is WHERE it was bound, not its
+                // string. Depths ride to the lowerer beside the face
+                // so a mint can tell two same-named captures apart
+                // (Closure Finding A) — Finding B's skip(1) is
+                // preserved verbatim.
+                chain_depth.insert(n.clone(), depth);
             }
         }
         self.fn_def_sites.insert(fn_ptr, chain.clone());
@@ -173,7 +182,21 @@ impl Analyzer {
             .into_iter()
             .filter(|n| chain.get(n) == Some(&None))
             .collect();
+        let capture_depths: BTreeMap<String, usize> = captures
+            .iter()
+            .map(|n| {
+                (
+                    n.clone(),
+                    *chain_depth.get(n).expect(
+                        "a capture has no recorded walk-scope depth — \
+                         captures filter the chain itself, so every \
+                         capture's name carries a depth",
+                    ),
+                )
+            })
+            .collect();
         self.fn_captures.insert(fn_ptr, captures);
+        self.fn_capture_depths.insert(fn_ptr, capture_depths);
         self.lattice.unknowns.ensure_fn_ret(fn_ptr);
         collect_body_sites(body, &self.lattice.sites, &mut self.fn_body_sites);
         self.fn_params.insert(fn_ptr, params.to_vec());
