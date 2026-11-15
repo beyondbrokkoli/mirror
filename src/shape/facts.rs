@@ -247,6 +247,12 @@ pub struct ShapeFacts {
     /// direct-call surface's capture slots key off this — a fn never
     /// value-read has no env_face_depths to consult.
     pub fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
+    /// Every fn literal's body-scope walk depth: the index its body
+    /// scope occupies on the walk stack at the definition site. The
+    /// lowerer's box-on-declare gate adds its expansion-frame offset
+    /// to this, recovering the declare site's walk depth regardless
+    /// of the call site it lowers at.
+    pub fn_body_depths: BTreeMap<NodeId, usize>,
     pub closure_fields: BTreeMap<(usize, String), NodeId>,
     pub call_fns: BTreeMap<NodeId, BTreeSet<NodeId>>,
     pub ffi_verbs: BTreeMap<NodeId, FfiVerb>,

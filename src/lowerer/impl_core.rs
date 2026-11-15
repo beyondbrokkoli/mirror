@@ -27,7 +27,48 @@ impl<'a> IrLowerer<'a> {
             env_ctxs: Vec::new(),
             binding_cells: BTreeMap::new(),
             instance_slots: BTreeMap::new(),
+            fn_frames: Vec::new(),
+            captured: shape
+                .fn_capture_depths
+                .values()
+                .flat_map(|m| m.iter().map(|(n, &d)| (d, n.clone())))
+                .collect(),
+            scope_cells: vec![BTreeSet::new()],
             cur_stmt: None,
+        }
+    }
+
+    /// Free a dying scope's own cells that nothing holds. A cell with
+    /// env holders escapes (cap_escape_lifetime) — the root drain's
+    /// keeps plan frees it through the last holder. An unheld cell has
+    /// no reader after its scope dies: freeing here keeps the atexit
+    /// leak check balanced without any scope-exit-free hazard.
+    fn free_dead_scope_cells(&mut self, cells: &BTreeSet<RegId>) {
+        let dead: Vec<Reg<Ptr>> = cells
+            .iter()
+            .filter(|id| {
+                self.binding_cells
+                    .get(id)
+                    .is_some_and(|holders| holders.is_empty())
+            })
+            .map(|&id| Reg::<Ptr>::new(id))
+            .collect();
+        for cell in dead {
+            self.binding_cells.remove(&cell.id);
+            signal!(trace::TRACE_SCOPE_CELL_FREE);
+            self.emit(Instruction::TableFree { table: cell });
+        }
+    }
+
+    /// The declare site's walk depth: the current fn body's walk
+    /// depth plus the scope offset within the body. The walk and this
+    /// stack push one scope per body/do/arm in lockstep, so the
+    /// offset is exact on every surface — the box-on-declare gate's
+    /// key, call-site independent by construction.
+    fn cur_walk_depth(&self) -> usize {
+        match self.fn_frames.last() {
+            Some(&(base, walk_depth)) => walk_depth + (self.scopes.len() - 1 - base),
+            None => self.scopes.len() - 1,
         }
     }
 
@@ -73,9 +114,12 @@ impl<'a> IrLowerer<'a> {
         self.scopes.push(BTreeMap::new());
         self.scope_ids.push(self.next_scope_id);
         self.next_scope_id += 1;
+        self.scope_cells.push(BTreeSet::new());
         self.ctrl_depth += 1;
         let r = f(self);
         self.ctrl_depth -= 1;
+        let cells = self.scope_cells.pop().expect("index-aligned");
+        self.free_dead_scope_cells(&cells);
         self.scopes.pop();
         self.scope_ids.pop();
         r
@@ -92,7 +136,10 @@ impl<'a> IrLowerer<'a> {
         self.scopes.push(BTreeMap::new());
         self.scope_ids.push(self.next_scope_id);
         self.next_scope_id += 1;
+        self.scope_cells.push(BTreeSet::new());
         let r = f(self);
+        let cells = self.scope_cells.pop().expect("index-aligned");
+        self.free_dead_scope_cells(&cells);
         self.scopes.pop();
         self.scope_ids.pop();
         r
@@ -114,7 +161,7 @@ impl<'a> IrLowerer<'a> {
         Ok(())
     }
 
-    fn resolve_keeps(&self, keeps: &[Keep]) -> Result<Vec<Reg<Ptr>>, LowerError> {
+    fn resolve_keeps(&mut self, keeps: &[Keep]) -> Result<Vec<Reg<Ptr>>, LowerError> {
         let mut regs = Vec::new();
         for k in keeps {
             match k {
@@ -266,13 +313,13 @@ impl<'a> IrLowerer<'a> {
         let envs = std::mem::take(&mut self.env_regs);
         for (i, env) in envs.iter().enumerate() {
             let mut keeps: Vec<Reg<Ptr>> = Vec::new();
-            for (cell, _, holders) in self.binding_cells.values() {
+            for (&cell_id, holders) in self.binding_cells.iter() {
                 let held_here = holders.iter().any(|e| e.id == env.id);
                 let held_later = holders
                     .iter()
                     .any(|e| envs[i + 1..].iter().any(|later| later.id == e.id));
                 if held_here && held_later {
-                    keeps.push(*cell);
+                    keeps.push(Reg::new(cell_id));
                 }
             }
             if keeps.is_empty() {
@@ -283,6 +330,21 @@ impl<'a> IrLowerer<'a> {
                     keeps,
                 });
             }
+        }
+        // The unheld cells: boxes minted at declares no env ever took
+        // (a capture whose fn literal never became a value on every
+        // path that ran the declare). Nothing but the binding itself
+        // references them, and no scope pop freed them (the root
+        // scope never pops) — the drain frees each once.
+        let unheld: Vec<Reg<Ptr>> = self
+            .binding_cells
+            .iter()
+            .filter(|(_, holders)| holders.is_empty())
+            .map(|(&id, _)| Reg::<Ptr>::new(id))
+            .collect();
+        for cell in unheld {
+            self.binding_cells.remove(&cell.id);
+            self.emit(Instruction::TableFree { table: cell });
         }
         Ok(())
     }
@@ -321,18 +383,69 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
-    fn declare_var(&mut self, name: String, reg: AnyReg, ty: Ty, layout: LayoutVerdict) {
+    fn declare_var(
+        &mut self,
+        name: String,
+        reg: AnyReg,
+        ty: Ty,
+        layout: LayoutVerdict,
+    ) -> Result<(), LowerError> {
         let reg = string_repr(&ty, reg);
-        self.push_dbg_bind(&name, reg, None);
+        // Box-is-binding: a binding the walk says some fn captures
+        // gets its ONE cell at declaration — the judge's
+        // box-at-declaration model. The cell is the binding's only
+        // storage from here on: reads load, writes store, and no mint
+        // ever snapshots. A loop body's declare mints per iteration
+        // (the TableNew rides the body block) — exactly the judge's
+        // semantics. Table bindings stay out: `Tbl` faces alias by
+        // pointer, no box element rides them.
+        let boxed = !matches!(ty, Ty::Tbl(_))
+            && self.captured.contains(&(self.cur_walk_depth(), name.clone()));
+        let (bind_reg, cell) = if boxed {
+            let box_id = self.next_reg();
+            let box_reg = Reg::new(box_id);
+            self.emit(Instruction::TableNew {
+                target: box_reg,
+                elem: ty.clone(),
+                flags: 0,
+            });
+            let idx = self.next_reg();
+            self.emit(Instruction::LoadInt {
+                target: Reg::new(idx),
+                val: 0,
+            });
+            self.table_set(box_reg, TableKey::Int(Reg::new(idx)), reg, &ty)?;
+            self.binding_cells.insert(box_id, Vec::new());
+            self.scope_cells
+                .last_mut()
+                .expect("scopes and scope_cells stay index-aligned")
+                .insert(box_id);
+            let slot_id = self.scope_ids[self.scopes.len() - 1];
+            let inst = self
+                .instance_chain
+                .last()
+                .copied()
+                .unwrap_or(InstanceId::ROOT);
+            self.instance_slots
+                .entry(inst)
+                .or_default()
+                .insert(name.clone(), slot_id);
+            (AnyReg::Ptr(box_reg), Some(box_reg))
+        } else {
+            (reg, None)
+        };
+        self.push_dbg_bind(&name, bind_reg, None);
         self.scopes.last_mut().unwrap().insert(
             name,
             Local {
-                reg,
+                reg: bind_reg,
+                cell,
+                capture: None,
                 ty,
                 layout,
-                capture: None,
             },
         );
+        Ok(())
     }
 
     fn update_var(
@@ -343,10 +456,11 @@ impl<'a> IrLowerer<'a> {
         layout: LayoutVerdict,
     ) -> Result<(), LowerError> {
         let reg = string_repr(&ty, reg);
-        // The innermost match may be a capture view of a direct-call
-        // expansion — the write lands on the OWNER slot (the view's
-        // redirect), never on the marker itself: the view cannot hold
-        // a value, it only re-points reads to the binding's home.
+        // The innermost match may be a TABLE capture view of a
+        // direct-call expansion — the write lands on the OWNER slot
+        // (the view's redirect): the view cannot hold a value, it only
+        // re-points reads to the binding's home. Scalar views are
+        // cell-backed and route through the cell instead.
         let target = self
             .scopes
             .iter()
@@ -362,9 +476,7 @@ impl<'a> IrLowerer<'a> {
     /// The slot-addressed write, mirroring `read_var_at`. A missing
     /// slot is a legitimate fold-back target situation (a closure
     /// escaped the scope that bound the definer's slot), not a
-    /// desync — it skips silently. A slot that turns out to be itself
-    /// a capture view redirects one more step, keeping the marker
-    /// slots permanently value-free.
+    /// desync — it skips silently.
     fn update_var_at(
         &mut self,
         name: &str,
@@ -376,13 +488,33 @@ impl<'a> IrLowerer<'a> {
         let Some(scope) = self.scopes.get_mut(depth) else {
             return Ok(());
         };
-        let Some(local) = scope.get_mut(name) else {
+        let Some(local) = scope.get(name) else {
             return Ok(());
         };
-        if let Some(owner) = local.capture {
+        let cell = local.cell;
+        let redirect = local.capture;
+        let local_ty = local.ty.clone();
+        if let Some(cell) = cell {
+            let reg = string_repr(&local_ty, reg);
+            let idx = self.next_reg();
+            self.emit(Instruction::LoadInt {
+                target: Reg::new(idx),
+                val: 0,
+            });
+            self.table_set(cell, TableKey::Int(Reg::new(idx)), reg, &local_ty)?;
+            let local = self.scopes[depth].get_mut(name).expect("checked above");
+            // The cell's elem was fixed at the declare-time mint — the
+            // type is the storage's, not the write's. The layout joins
+            // for the reads ahead.
+            local.layout = layout;
+            return Ok(());
+        }
+        if let Some(owner) = redirect {
+            // A table capture view: the write lands on the owner slot.
             return self.update_var_at(name, owner, reg, ty, layout);
         }
         let reg = string_repr(&ty, reg);
+        let local = self.scopes[depth].get_mut(name).expect("checked above");
         local.reg = reg;
         local.ty = ty;
         local.layout = layout;
@@ -390,22 +522,71 @@ impl<'a> IrLowerer<'a> {
         Ok(())
     }
 
-    fn read_var(&self, name: &str) -> Result<Local, LowerError> {
+    /// The value read. A cell-backed binding loads its cell — the
+    /// returned register is freshly loaded, never a stale snapshot. A
+    /// table capture view resolves at its owner slot.
+    fn read_var(&mut self, name: &str) -> Result<Local, LowerError> {
+        let mut local = self.peek_var(name)?;
+        while let Some(owner) = local.capture {
+            local = self.scopes[owner].get(name).cloned().ok_or_else(|| {
+                LowerError(Diagnostic::lower("Undeclared variable"))
+            })?;
+        }
+        let reg = local.reg;
+        let cell = local.cell;
+        let ty = local.ty;
+        let layout = local.layout;
+        let mut local = Local {
+            reg,
+            cell: None,
+            capture: None,
+            ty,
+            layout,
+        };
+        if let Some(cell) = cell {
+            local.cell = Some(cell);
+            return Ok(self.load_cell_local(&local, cell));
+        }
+        Ok(local)
+    }
+
+    /// The metadata read: no emission, the scope entry as stored. For
+    /// a cell-backed binding `reg` is the box pointer — metadata
+    /// readers (layouts, keep plans, displaced-table frees) never
+    /// take it as a value. A table view redirects to its owner, the
+    /// same resolution `read_var` performs.
+    fn peek_var(&self, name: &str) -> Result<Local, LowerError> {
         for scope in self.scopes.iter().rev() {
             if let Some(local) = scope.get(name) {
-                if let Some(depth) = local.capture {
-                    // A capture view: the read resolves at the owner
-                    // slot. The view's own reg is the declare-time
-                    // snapshot — stale after any redirected write, so
-                    // it is never returned.
-                    return self.scopes[depth].get(name).cloned().ok_or_else(|| {
+                let mut local = local.clone();
+                while let Some(owner) = local.capture {
+                    local = self.scopes[owner].get(name).cloned().ok_or_else(|| {
                         LowerError(Diagnostic::lower("Undeclared variable"))
-                    });
+                    })?;
                 }
-                return Ok(local.clone());
+                return Ok(local);
             }
         }
         Err(LowerError(Diagnostic::lower("Undeclared variable")))
+    }
+
+    /// One cell load: `cell[0]` into a fresh value register, returned
+    /// as the read's Local.
+    fn load_cell_local(&mut self, local: &Local, cell: Reg<Ptr>) -> Local {
+        let idx = self.next_reg();
+        self.emit(Instruction::LoadInt {
+            target: Reg::new(idx),
+            val: 0,
+        });
+        let out = self.next_reg();
+        let v = self.table_get(out, cell, TableKey::Int(Reg::new(idx)), &local.ty);
+        Local {
+            reg: v,
+            cell: Some(cell),
+            capture: None,
+            ty: local.ty.clone(),
+            layout: local.layout,
+        }
     }
 
     /// A capture's binding, resolved at the walk-scope depth the
@@ -445,12 +626,12 @@ impl<'a> IrLowerer<'a> {
     }
 
     fn holds_value(&self, name: &str) -> bool {
-        self.read_var(name)
+        self.peek_var(name)
             .is_ok_and(|local| !matches!(local.ty, Ty::Unknown(_)))
     }
 
     fn null_moved(&mut self, src: &str) -> Result<(), LowerError> {
-        let local = self.read_var(src)?;
+        let local = self.peek_var(src)?;
         let null_reg = self.next_reg();
         self.emit(Instruction::LoadNull {
             target: Reg::new(null_reg),

@@ -200,40 +200,64 @@ impl<'a> IrLowerer<'a> {
                     exit: None,
                     args: Vec::new(),
                 });
+                // The expansion frame: the body scope will sit at this
+                // index; its walk depth is the def-site fact. Declares
+                // inside recover their walk depth from the pair — the
+                // box-on-declare gate is call-site independent.
+                let frame_base = self.scopes.len();
+                let frame_depth = *self.shape.fn_body_depths.get(&fn_ptr).expect(
+                    "an expanded fn has no recorded body-scope walk depth \
+                     — the walk stamps every fn literal it accepts: a \
+                     structural desync, not a program error",
+                );
+                self.fn_frames.push((frame_base, frame_depth));
                 self.in_block(|an| {
                     for (p, (tr, layout)) in def.params.iter().zip(arg_regs) {
-                        an.declare_var(p.clone(), tr.reg, tr.ty, layout);
+                        an.declare_var(p.clone(), tr.reg, tr.ty, layout)?;
                     }
                     if let Some(env) = call_env {
                         an.enter_env_ctx(env, fn_ptr)?;
                     } else if let Some(depths) = an.shape.fn_capture_depths.get(&fn_ptr) {
                         // The direct surface has no env — its depth-0
-                        // captures become capture-view slots instead:
-                        // the body's reads and writes redirect to the
-                        // root slot, so a caller shadow cannot re-point
-                        // them (the Finding B lexical fix's lowerer
-                        // half; the checker declares the same views in
-                        // its expansion frame). A param wins — fresh
-                        // storage; a body decl shadows the view
-                        // naturally, and the view dies with this
-                        // scope. Deeper captures keep the dynamic
-                        // innermost reads (the direct surface's
-                        // definer-continuation surface, unchanged).
+                        // captures become views of the root binding's
+                        // ONE cell: the body's reads and writes ride
+                        // the same storage the definer holds, so a
+                        // caller shadow cannot re-point them and no
+                        // snapshot can go stale (the Finding B lexical
+                        // fix, now with box-on-declare carrying it).
+                        // A param wins — fresh storage; a body decl
+                        // shadows the view naturally, and the view
+                        // dies with this scope. Deeper captures keep
+                        // the dynamic innermost reads (the direct
+                        // surface's definer-continuation surface,
+                        // unchanged).
                         let views: Vec<(String, Local)> = depths
                             .iter()
                             .filter(|(n, d)| **d == 0 && !def.params.contains(n))
                             .filter_map(|(n, _)| {
-                                an.scopes[0].get(n).cloned().map(|owner| {
-                                    (
-                                        n.clone(),
-                                        Local {
-                                            reg: owner.reg,
-                                            ty: owner.ty,
-                                            layout: owner.layout,
-                                            capture: Some(0),
-                                        },
-                                    )
-                                })
+                                let owner = an.scopes[0].get(n).cloned()?;
+                                // A scalar capture rides the owner's ONE
+                                // cell; a table capture has no box (Tbl
+                                // faces alias by pointer) and keeps the
+                                // redirect marker instead.
+                                let view = if let Some(cell) = owner.cell {
+                                    Local {
+                                        reg: owner.reg,
+                                        cell: Some(cell),
+                                        capture: None,
+                                        ty: owner.ty,
+                                        layout: owner.layout,
+                                    }
+                                } else {
+                                    Local {
+                                        reg: owner.reg,
+                                        cell: None,
+                                        capture: Some(0),
+                                        ty: owner.ty,
+                                        layout: owner.layout,
+                                    }
+                                };
+                                Some((n.clone(), view))
                             })
                             .collect();
                         let scope = an.scopes.last_mut().expect(
@@ -252,6 +276,7 @@ impl<'a> IrLowerer<'a> {
                         None => Ok(()),
                     }
                 })?;
+                self.fn_frames.pop();
                 let result = self.finalize_return_ctx()?.expect(
                     "an inline call produced no value — the minted body \
                      carries a valued return (the checker's R15 gate)",

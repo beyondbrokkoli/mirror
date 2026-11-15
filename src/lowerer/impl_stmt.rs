@@ -84,7 +84,7 @@ impl<'a> IrLowerer<'a> {
                 }
                 if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
-                        let displaced = self.read_var(n)?;
+                        let displaced = self.peek_var(n)?;
                         let table = ptr_of(displaced.reg)?;
                         let keep_regs = self.resolve_keeps(keeps)?;
                         if keep_regs.iter().any(|k| k.id == table.id) {
@@ -109,7 +109,7 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
                 for (name, (reg, ty, layout)) in names.iter().zip(bindings) {
-                    self.declare_var(name.clone(), reg, ty, layout);
+                    self.declare_var(name.clone(), reg, ty, layout)?;
                 }
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
@@ -119,11 +119,11 @@ impl<'a> IrLowerer<'a> {
                     let target_reg = self.next_reg();
                     let TypedReg { reg, ty } = self.lower_expr(expr, Some(target_reg))?;
                     let layout = self.lookup_layout_for(expr)?;
-                    self.declare_var(name.clone(), reg, ty, layout);
+                    self.declare_var(name.clone(), reg, ty, layout)?;
                     return Ok(());
                 }
                 if matches!(expr, Expr::Nil { .. }) {
-                    let local = self.read_var(name)?;
+                    let local = self.peek_var(name)?;
                     if self.shape.is_free(stmt) {
                         let table = ptr_of(local.reg)?;
                         let keep_regs = self
@@ -169,7 +169,7 @@ impl<'a> IrLowerer<'a> {
                 let layout = self.lookup_layout_for(expr)?;
                 if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
-                        let displaced = self.read_var(n)?;
+                        let displaced = self.peek_var(n)?;
                         let table = ptr_of(displaced.reg)?;
                         let keep_regs = self.resolve_keeps(keeps)?;
                         if keep_regs.iter().any(|k| k.id == table.id) {
@@ -194,13 +194,11 @@ impl<'a> IrLowerer<'a> {
                     }
                 }
                 self.update_var(name, actual_reg, ty, layout)?;
-                // Box-is-binding, definer side: a write to a boxed
-                // binding lands in every minted cell of it (the
-                // registry miss emits nothing). Inside an expansion the
-                // innermost target is the face local — no registry
-                // entry at that slot — and env_write_back routes the
-                // cell write below.
-                self.write_binding_cells(name, actual_reg)?;
+                // Box-is-binding, expansion side: inside an expansion
+                // the innermost target is the face local — a snapshot
+                // until stage 2 binds cells — and env_write_back
+                // routes the cell write. The definer-side cell store
+                // rode update_var itself.
                 self.env_write_back(name, actual_reg)?;
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
@@ -294,11 +292,21 @@ impl<'a> IrLowerer<'a> {
                 let mut mutated_vars = find_mutated_vars(body, self.shape);
                 mutated_vars.extend(find_moved_names(body, self.shape));
 
+                // Cell-backed bindings stay out of the phi machinery:
+                // memory is their merge — the cell carries the value
+                // across the header, the back edge, and the exits, and
+                // every read loads it fresh (the loop-carried phi
+                // pattern collapses for them by mem2reg's theorem).
                 let mut phi_order: Vec<(String, Local)> = mutated_vars
                     .iter()
-                    .filter(|name| self.holds_value(name))
+                    .filter(|name| {
+                        self.holds_value(name)
+                            && self
+                                .peek_var(name)
+                                .is_ok_and(|l| l.cell.is_none())
+                    })
                     .map(|name| {
-                        let local = self.read_var(name)?;
+                        let local = self.peek_var(name)?;
                         Ok((name.clone(), local))
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;
@@ -685,15 +693,23 @@ impl<'a> IrLowerer<'a> {
                 mutated.extend(find_mutated_vars(else_body, self.shape));
                 mutated.extend(find_moved_names(then_body, self.shape));
                 mutated.extend(find_moved_names(else_body, self.shape));
+                // Cell-backed bindings stay out of the join phi: the
+                // cell IS the merge — whichever arm stored last, the
+                // post-join read loads it (memory is the merge).
                 let mutated: Vec<String> = mutated
                     .into_iter()
-                    .filter(|name| self.holds_value(name))
+                    .filter(|name| {
+                        self.holds_value(name)
+                            && self
+                                .peek_var(name)
+                                .is_ok_and(|l| l.cell.is_none())
+                    })
                     .collect();
 
                 let mut phi_order: Vec<(String, RegId)> = mutated
                     .into_iter()
                     .map(|name| {
-                        let local = self.read_var(&name)?;
+                        let local = self.peek_var(&name)?;
                         Ok((name, local.reg.id()))
                     })
                     .collect::<Result<Vec<_>, LowerError>>()?;

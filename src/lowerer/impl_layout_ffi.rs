@@ -9,7 +9,7 @@ impl<'a> IrLowerer<'a> {
                     Ok(LayoutVerdict::default())
                 }
             }
-            Expr::Identifier { name, .. } => Ok(self.read_var(name)?.layout),
+            Expr::Identifier { name, .. } => Ok(self.peek_var(name)?.layout),
             Expr::Index { obj, .. } => self.lookup_layout_for(obj),
             _ => Ok(LayoutVerdict::default()),
         }

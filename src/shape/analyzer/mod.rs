@@ -424,6 +424,11 @@ struct Analyzer {
     fn_def_sites: BTreeMap<NodeId, BTreeMap<String, Option<NodeId>>>,
     fn_captures: BTreeMap<NodeId, BTreeSet<String>>,
     fn_capture_depths: BTreeMap<NodeId, BTreeMap<String, usize>>,
+    /// Each fn literal's body-scope walk depth: the index its body
+    /// scope occupies on the walk stack at the definition site. The
+    /// lowerer adds its expansion-frame offset to this to recover any
+    /// declare site's walk depth — the box-on-declare gate's key.
+    fn_body_depths: BTreeMap<NodeId, usize>,
     loop_scope_entries: Vec<usize>,
 }
 
@@ -536,6 +541,7 @@ pub fn analyze_with_base(
         fn_def_sites: BTreeMap::new(),
         fn_captures: BTreeMap::new(),
         fn_capture_depths: BTreeMap::new(),
+        fn_body_depths: BTreeMap::new(),
         loop_scope_entries: Vec::new(),
     };
 
@@ -740,6 +746,7 @@ struct Recorded {
     index_base: i64,
     ctor_lines: Vec<usize>,
     fn_scope_keys: BTreeMap<NodeId, (NodeId, u8)>,
+    fn_body_depths: BTreeMap<NodeId, usize>,
     join_tags: BTreeMap<NodeId, bool>,
     call_tags: BTreeMap<NodeId, Vec<bool>>,
     adopt_lines: BTreeMap<String, usize>,
@@ -765,6 +772,7 @@ impl Analyzer {
             index_base: self.index_base,
             ctor_lines: self.ctor_lines,
             fn_scope_keys: self.fn_scope_keys,
+            fn_body_depths: self.fn_body_depths,
             join_tags: self.join_tags,
             call_tags: self.call_tags,
             adopt_lines,
@@ -918,6 +926,7 @@ impl Recorded {
             env_faces: self.chk.env_faces,
             env_face_depths: self.chk.env_face_depths,
             fn_capture_depths: self.chk.fn_capture_depths,
+            fn_body_depths: self.fn_body_depths,
             closure_fields: self.chk.closure_fields,
             call_fns: self.chk.call_fns,
             ffi_verbs: self.chk.ffi_verbs,

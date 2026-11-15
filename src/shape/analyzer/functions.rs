@@ -222,6 +222,10 @@ impl Analyzer {
             .collect();
         self.fn_captures.insert(fn_ptr, captures);
         self.fn_capture_depths.insert(fn_ptr, capture_depths);
+        // The body scope `with_scope` is about to push lands at this
+        // walk-stack index — the fn's body-scope walk depth. The
+        // lowerer keys declare-site box minting off it.
+        self.fn_body_depths.insert(fn_ptr, self.walk.scopes.len());
         self.lattice.unknowns.ensure_fn_ret(fn_ptr);
         collect_body_sites(body, &self.lattice.sites, &mut self.fn_body_sites);
         self.fn_params.insert(fn_ptr, params.to_vec());

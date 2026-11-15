@@ -10,11 +10,12 @@ impl<'a> IrLowerer<'a> {
             "arg".to_string(),
             Local {
                 reg: AnyReg::Ptr(Reg::new(args_reg)),
+                cell: None,
+                capture: None,
                 ty: Ty::Tbl(Box::new(
                     self.shape.boundary_elem.clone().unwrap_or(Ty::Unknown(0)),
                 )),
                 layout: LayoutVerdict::default(),
-                capture: None,
             },
         );
         self.return_ctxs.push(ReturnCtx {

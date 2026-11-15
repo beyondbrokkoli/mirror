@@ -141,16 +141,26 @@ impl<'a> IrLowerer<'a> {
                     AnyReg::Ptr(reg),
                     &Ty::Str,
                 )?;
+            } else if let Some(cell) = local.cell {
+                // Box-is-binding: the binding minted its ONE cell at
+                // declaration — store the pointer, register this env
+                // as a holder for the root drain. No snapshot, no
+                // creation: the cell IS the binding.
+                if let Some(holders) = self.binding_cells.get_mut(&cell.id) {
+                    holders.push(env);
+                }
+                self.table_set(
+                    env,
+                    TableKey::Str(Reg::new(key)),
+                    AnyReg::Ptr(cell),
+                    &Ty::Str,
+                )?;
             } else {
-                // The binding's ONE box: a first mint creates it (a
-                // snapshot of the binding's register at that moment),
-                // every later mint over the same binding — same slot
-                // identity, same definer instance — stores the SAME
-                // cell pointer into its env. No snapshot copy: the
-                // cell IS the binding from the first mint on, which is
-                // why a write through any env reaches all of them
-                // (t2's post-return sibling sync) and why two Make()
-                // invocations never cross (different slot identities).
+                // A capture whose binding the walk never boxed (the
+                // misaligned surface: the mint resolves the recorded
+                // depth to a binding this stack did not declare). The
+                // legacy path — a fresh cell holding this register's
+                // value — keeps today's behavior.
                 let slot_id = self.scope_ids[depth];
                 // The definer expansion's instance owns this binding's
                 // slot identity — the fold-back's liveness proof.
@@ -163,37 +173,20 @@ impl<'a> IrLowerer<'a> {
                     .entry(inst)
                     .or_default()
                     .insert(name.clone(), slot_id);
-                let existing = self
-                    .binding_cells
-                    .get(&(slot_id, name.clone()))
-                    .map(|(cell, _, _)| *cell);
-                let box_reg = if let Some(cell) = existing {
-                    if let Some((_, _, holders)) =
-                        self.binding_cells.get_mut(&(slot_id, name.clone()))
-                    {
-                        holders.push(env);
-                    }
-                    cell
-                } else {
-                    let box_id = self.next_reg();
-                    let box_reg = Reg::new(box_id);
-                    self.emit(Instruction::TableNew {
-                        target: box_reg,
-                        elem: ty.clone(),
-                        flags: 0,
-                    });
-                    let idx = self.next_reg();
-                    self.emit(Instruction::LoadInt {
-                        target: Reg::new(idx),
-                        val: 0,
-                    });
-                    self.table_set(box_reg, TableKey::Int(Reg::new(idx)), local.reg, &ty)?;
-                    self.binding_cells.insert(
-                        (slot_id, name.clone()),
-                        (box_reg, ty.clone(), vec![env]),
-                    );
-                    box_reg
-                };
+                let box_id = self.next_reg();
+                let box_reg = Reg::new(box_id);
+                self.emit(Instruction::TableNew {
+                    target: box_reg,
+                    elem: ty.clone(),
+                    flags: 0,
+                });
+                let idx = self.next_reg();
+                self.emit(Instruction::LoadInt {
+                    target: Reg::new(idx),
+                    val: 0,
+                });
+                self.table_set(box_reg, TableKey::Int(Reg::new(idx)), local.reg, &ty)?;
+                self.binding_cells.insert(box_id, vec![env]);
                 self.table_set(
                     env,
                     TableKey::Str(Reg::new(key)),
@@ -226,7 +219,7 @@ impl<'a> IrLowerer<'a> {
                 TableKey::Str(Reg::new(key)),
             )));
             if matches!(ty, Ty::Tbl(_)) {
-                self.declare_var(name, AnyReg::Ptr(cell), ty, LayoutVerdict::Sparse);
+                self.declare_var(name, AnyReg::Ptr(cell), ty, LayoutVerdict::Sparse)?;
             } else {
                 let idx = self.next_reg();
                 self.emit(Instruction::LoadInt {
@@ -235,7 +228,7 @@ impl<'a> IrLowerer<'a> {
                 });
                 let out = self.next_reg();
                 let v = self.table_get(out, cell, TableKey::Int(Reg::new(idx)), &ty);
-                self.declare_var(name, v, ty, LayoutVerdict::default());
+                self.declare_var(name, v, ty, LayoutVerdict::default())?;
             }
         }
         let depths: BTreeMap<String, usize> = self
@@ -272,41 +265,6 @@ impl<'a> IrLowerer<'a> {
             return Ok(());
         }
         self.write_env_cell(ctx.reg, name, value, &ty)
-    }
-
-    /// Definer-side cell routing: a plain assignment whose target slot
-    /// (capture redirect honored) is a boxed binding writes the
-    /// binding's one shared cell — the register-facing half was
-    /// `update_var`. The registry miss — the binding was never
-    /// captured, or holds no scalar box — emits nothing.
-    fn write_binding_cells(&mut self, name: &str, value: AnyReg) -> Result<(), LowerError> {
-        let Some(target) = self.scopes.iter().rposition(|s| s.contains_key(name)) else {
-            return Ok(());
-        };
-        let depth = self.scopes[target]
-            .get(name)
-            .and_then(|l| l.capture)
-            .unwrap_or(target);
-        let slot_id = self.scope_ids[depth];
-        self.write_binding_cells_at(name, slot_id, value)
-    }
-
-    fn write_binding_cells_at(
-        &mut self,
-        name: &str,
-        slot_id: usize,
-        value: AnyReg,
-    ) -> Result<(), LowerError> {
-        let Some((cell, ty, _)) = self.binding_cells.get(&(slot_id, name.to_string())) else {
-            return Ok(());
-        };
-        let (cell, ty) = (*cell, ty.clone());
-        let idx = self.next_reg();
-        self.emit(Instruction::LoadInt {
-            target: Reg::new(idx),
-            val: 0,
-        });
-        self.table_set(cell, TableKey::Int(Reg::new(idx)), value, &ty)
     }
 
     /// One cell write through its env: `env[name]` → the box, `box[0]`

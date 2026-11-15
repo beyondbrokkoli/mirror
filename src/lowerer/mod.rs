@@ -55,16 +55,20 @@ struct ReturnCtx {
 #[derive(Clone)]
 struct Local {
     reg: AnyReg,
+    /// A CAPTURED binding's ONE cell, minted at declaration — the
+    /// judge's box-at-declaration model. `Some` means the cell IS the
+    /// binding's only storage: reads load `cell[0]`, writes store, and
+    /// `reg` is merely the box pointer (never a value). `None` is a
+    /// plain register binding — the fast path, zero overhead.
+    cell: Option<Reg<Ptr>>,
+    /// The TABLE capture view's redirect (scalars are cell-backed and
+    /// never carry it): a direct-surface view of a depth-0 table
+    /// capture re-points reads and writes at the owner slot — tables
+    /// alias by pointer, no box rides a `Tbl` face, so the view has no
+    /// cell of its own and the owner's register is the storage.
+    capture: Option<usize>,
     ty: Ty,
     layout: LayoutVerdict,
-    /// A CAPTURE VIEW marker: the slot declares a depth-0 capture of a
-    /// direct-call expansion, and `0` (the owner's walk-scope index)
-    /// is where the real binding lives. `read_var`/`update_var`
-    /// redirect through it, so the view cannot go stale and a caller
-    /// shadow at the call site cannot re-point the body's reads or
-    /// writes — the Finding B lexical fix's lowerer half. Every other
-    /// slot is a plain binding: `None`.
-    capture: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -95,10 +99,11 @@ struct ActiveReserve {
     offset: Option<Reg<Int>>,
 }
 
-/// One boxed binding's shared cell: the cell register, its element
-/// type, and every env table that holds it (the drain plan's holders,
-/// in mint order).
-type BindingCell = (Reg<Ptr>, Ty, Vec<Reg<Ptr>>);
+/// The boxed bindings' drain inventory, keyed by the cell's register
+/// id: every env table that holds the cell (the drain plan's holders,
+/// in mint order). Cell-keyed, not (slot, name)-keyed — two declares
+/// of one name in a scope are two bindings, two cells, two entries.
+type BindingCells = BTreeMap<RegId, Vec<Reg<Ptr>>>;
 
 pub struct IrLowerer<'a> {
     pub blocks: Vec<BasicBlock>,
@@ -131,17 +136,17 @@ pub struct IrLowerer<'a> {
     env_memos: Vec<EnvMemo>,
     env_regs: Vec<Reg<Ptr>>,
     env_ctxs: Vec<EnvCtx>,
-    /// THE one box cell per captured binding, keyed by the binding's
-    /// slot identity (scope id, name) — the judge's one-box model:
-    /// "boxes once at declaration, every access goes through the one
-    /// cell". Every env minted over the binding stores THIS cell's
-    /// pointer (shared by Handle — no per-mint snapshot), so a write
-    /// through any env reaches every view and the definer alike. The
-    /// env list is the drain plan: at root exit each holder keeps the
-    /// cell until the LAST holder's `TableFreeExcept` frees it — the
-    /// runtime's child walk has no refcount, so the keeps mechanism
-    /// is the single-ownership proof.
-    binding_cells: BTreeMap<(usize, String), BindingCell>,
+    /// THE one box cell per captured binding, minted at its
+    /// declaration — the judge's one-box model: "boxes once at
+    /// declaration, every access goes through the one cell". Every env
+    /// minted over the binding stores THIS cell's pointer (shared by
+    /// Handle — no per-mint snapshot), so a write through any env
+    /// reaches every view and the definer alike. The env lists are the
+    /// drain plan: at root exit each holder keeps the cell until the
+    /// LAST holder's `TableFreeExcept` frees it — the runtime's child
+    /// walk has no refcount, so the keeps mechanism is the
+    /// single-ownership proof.
+    binding_cells: BindingCells,
     /// Per definer-expansion instance: the captured bindings' slot
     /// identities its body minted cells for (name -> slot id). The
     /// pop fold-back's proof of liveness — a call site inside the
@@ -149,6 +154,21 @@ pub struct IrLowerer<'a> {
     /// slot alive; an escaped call finds neither and skips the dead
     /// register.
     instance_slots: BTreeMap<InstanceId, BTreeMap<String, usize>>,
+    /// The expansion frame stack: (body scope index, body walk depth)
+    /// per fn body currently lowering. The declare site's walk depth
+    /// — the box-on-declare gate's key — is the frame's depth plus the
+    /// scope offset within the body; the root frame is implicit
+    /// (index 0, depth 0).
+    fn_frames: Vec<(usize, usize)>,
+    /// The captured bindings' identities as (walk-scope depth, name):
+    /// the union of every fn literal's capture map. A declare whose
+    /// identity is here mints its box at declaration.
+    captured: BTreeSet<(usize, String)>,
+    /// Per scope, the cells its OWN declares minted (index-aligned
+    /// with `scopes`). Capture views hold borrowed cells — another
+    /// scope's — and never appear here, so a dying scope frees only
+    /// what it owns.
+    scope_cells: Vec<BTreeSet<RegId>>,
     cur_stmt: Option<NodeId>,
 }
 
