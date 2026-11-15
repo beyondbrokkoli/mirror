@@ -17,3 +17,5 @@ async/probe/probe_1lane
 async/probe/probe_backpressure
 async/probe/probe_recycle
 async/probe/probe_tenant
+closure_audit
+draft_fuzz.py

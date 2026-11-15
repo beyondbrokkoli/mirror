@@ -192,6 +192,30 @@ function compiler_panicked()
         or s:find("thread 'main' panicked", 1, true) ~= nil
 end
 
+-- The leak oracle: the runtime's atexit notice (trace slot 90, fired
+-- by async/alm_tenant.c's exit_report on every registered exec, with
+-- the rt.rs LOCAL_LEAK_HOOK as the fallback when registration
+-- failed). The notice prints on stderr and exits 0, and the battery
+-- twins whole stdout — so the runner gates positive runs on it
+-- explicitly. The line names the leaking module, which keeps the
+-- attribution honest in multi-script constellations: the lib lane
+-- runs inside the compiler process (module libalm_out.so), the exe
+-- lane in its own process (module alm_out), and a require-spliced
+-- module is amalgamated into the requirer's chunk (one module, one
+-- census). Panic lanes never gate on this: a death mid-flight may
+-- legitimately leave its tables, and alm_fatal's abort skips atexit
+-- outright.
+function leak_notice()
+    local lines = {}
+    for _, line in ipairs(split_lines(read_file(ERR))) do
+        if line:find("slot 90", 1, true) and line:find("leak at exit", 1, true) then
+            table.insert(lines, line)
+        end
+    end
+    if #lines == 0 then return nil end
+    return table.concat(lines, "; ")
+end
+
 -- Strip the compiler's own success banner from stdout so only the script's
 -- stdout lines remain (error reports go to stderr and never touch EXPECT pins).
 function script_stdout()

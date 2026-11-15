@@ -266,3 +266,4 @@
 191 REQUIRE_SPLICE pipeline a dotted require resolved against --module-root and spliced — the module chunk became a local function, its one cache call, and the requirer's binding; modules required later bind the same cache name, so top-level effects run exactly once (M3, the amalgamation milestone)
 
 192 SCOPE_CELL_FREE lowerer a dying scope frees a box cell nothing holds — box-on-declare mints at the declare; the root drain frees what an env holds, the scope pop frees what nothing escaped into
+193 SCOPE_CELL_FALLBACK_MINT lowerer a capture whose binding the walk never boxed mints the legacy snapshot box in store_env_cells — the byte-lane tys by gate design (the declare gate refuses to box them), a scalar only on depth drift; observability for the misaligned surface, not a law

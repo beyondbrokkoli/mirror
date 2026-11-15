@@ -11,6 +11,11 @@ Usage: lua run.lua [SUBSTR ...] [FLAGS]
   SUBSTR...  run only cases whose name contains any SUBSTR
   probe FILE diagnostic: one file through the same pipeline, archived
              under target/probe/ (skips the fmt/clippy/test legs)
+Leak gate    positive runs (lib lane and exe twins) also gate on the
+             runtime's slot-90 atexit notice (the zero-leak contract);
+             panic lanes skip it — a death mid-flight may leave its
+             tables. The notice rides stderr, which the stdout twins
+             never see.
 Flags (any position):
   --cases DIR   external corpus, lockless by design — no notices
   --no-lock     skip the lock comparison (repo corpus)
@@ -367,9 +372,14 @@ for _, name in ipairs(corpus.positive) do
                 if #pins.expect > 0 then
                     bad = expect_mismatch(script_stdout(), pins.expect)
                 end
+                local leak = leak_notice()
                 if bad then
                     report_fail("positive", name, "EXPECT mismatch — " .. bad)
-                else
+                end
+                if leak then
+                    report_fail("leak", name, leak)
+                end
+                if not bad and not leak then
                     pos_passed = pos_passed + 1
                 end
             end
@@ -385,9 +395,14 @@ for _, name in ipairs(corpus.positive) do
             if #pins.expect > 0 then
                 bad = expect_mismatch(script_stdout(), pins.expect)
             end
+            local leak = leak_notice()
             if bad then
                 report_fail("positive", name, "EXPECT mismatch — " .. bad)
-            else
+            end
+            if leak then
+                report_fail("leak", name, leak)
+            end
+            if not bad and not leak then
                 pos_passed = pos_passed + 1
             end
         end
@@ -567,9 +582,14 @@ if not NO_EXE then
                 if #pins.expect > 0 then
                     bad = expect_mismatch(script_stdout(), pins.expect)
                 end
+                local leak = leak_notice()
                 if bad then
                     report_fail("exe", name, "EXPECT mismatch (exe) — " .. bad)
-                else
+                end
+                if leak then
+                    report_fail("leak", name, leak)
+                end
+                if not bad and not leak then
                     exe_passed = exe_passed + 1
                 end
             end

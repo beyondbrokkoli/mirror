@@ -39,7 +39,15 @@ impl<'a> IrLowerer<'a> {
         }
         let env_id = self.next_reg();
         let env = Reg::new(env_id);
-        let flags = 0x01 | if faces.is_empty() { 0x00 } else { 0x80 };
+        // Every env mints with contains_tables. The bit is mint-fixed
+        // (alm_tbl_new reads it once; nothing updates it after), and
+        // free_tbl's child walk consults it — an env minted 0x01 that
+        // the statement's memo later hands cells to would compost
+        // nothing and strand them at exit (the empty-face-first
+        // receipt: leak_contract/p7). The walk over empty or zero
+        // lanes skips for free, so the unconditional bit costs nothing
+        // on vestigial envs.
+        let flags = 0x01 | 0x80;
         self.emit(Instruction::TableNew {
             target: env,
             elem: Ty::Str,
@@ -125,7 +133,14 @@ impl<'a> IrLowerer<'a> {
                 // misaligned surface: the mint resolves the recorded
                 // depth to a binding this stack did not declare). The
                 // legacy path — a fresh cell holding this register's
-                // value — keeps today's behavior.
+                // value — keeps today's behavior. Reachable by
+                // construction for the byte-lane tys (the declare
+                // gate refuses to box them, so a captured ffi handle
+                // lands here with cell: None); a scalar landing here
+                // would be depth drift, which read_var_at would have
+                // died on first. The signal keeps the surface
+                // observable instead of silently snapshotting.
+                signal!(trace::TRACE_SCOPE_CELL_FALLBACK_MINT);
                 let box_id = self.next_reg();
                 let box_reg = Reg::new(box_id);
                 self.emit(Instruction::TableNew {

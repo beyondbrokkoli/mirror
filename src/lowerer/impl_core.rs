@@ -56,6 +56,87 @@ impl<'a> IrLowerer<'a> {
         }
     }
 
+    /// The boundary return's drain. The root drain rides the
+    /// fall-through tail only, so a chunk leaving through a top-level
+    /// `return` carries its own: the envs minted so far — in mint
+    /// order, keeps scoped to THIS prefix, because a holder minted
+    /// after the return never exists on this path — and every cell no
+    /// minted env holds, which is the unheld cells plus the cells
+    /// whose only holder envs mint later. Compile state stays intact:
+    /// the tail drain still serves the fall-through path with the
+    /// full inventory, and each path frees its own execution exactly
+    /// once. V1 (creations are straight-line, transitively — the
+    /// leak_contract/p11/p12 receipts) keeps every register here
+    /// dominating this block.
+    fn emit_return_path_drain(&mut self) {
+        let envs = self.env_regs.clone();
+        for (i, env) in envs.iter().enumerate() {
+            let mut keeps: Vec<Reg<Ptr>> = Vec::new();
+            for (&cell_id, holders) in &self.binding_cells {
+                let held_here = holders.iter().any(|e| e.id == env.id);
+                let held_later_prefix = holders.iter().any(|e| {
+                    envs[i + 1..].iter().any(|later| later.id == e.id)
+                });
+                if held_here && held_later_prefix {
+                    keeps.push(Reg::new(cell_id));
+                }
+            }
+            if keeps.is_empty() {
+                self.emit(Instruction::TableFree { table: *env });
+            } else {
+                self.emit(Instruction::TableFreeExcept {
+                    table: *env,
+                    keeps,
+                });
+            }
+        }
+        let orphans: Vec<Reg<Ptr>> = self
+            .binding_cells
+            .iter()
+            .filter(|(_, holders)| {
+                holders.is_empty()
+                    || holders
+                        .iter()
+                        .all(|h| !envs.iter().any(|e| e.id == h.id))
+            })
+            .map(|(&id, _)| Reg::<Ptr>::new(id))
+            .collect();
+        for cell in orphans {
+            self.emit(Instruction::TableFree { table: cell });
+        }
+    }
+
+    /// The inline return's crossed-cell frees. The expansion's return
+    /// edge exits the body's scopes, whose pop's free_dead_scope_cells
+    /// emits into the dead continuation after the return terminated
+    /// the block (the leak_contract/p4a receipt). Every cell minted in
+    /// a crossed scope whose holders have not minted yet frees on THIS
+    /// edge: unheld cells, and cells whose only holder envs mint later
+    /// in the body — those envs never exist on this path. A cell held
+    /// by an already-minted env escapes with it and stays with the
+    /// root drain. Inventory is left to the pop, which still removes
+    /// it for the tail; the two emissions ride exclusive paths and
+    /// each execution frees exactly once.
+    fn emit_crossed_cell_frees(&mut self) {
+        let base = self.fn_frames.last().map(|&(base, _)| base).unwrap_or(0);
+        let crossed: Vec<RegId> = self.scope_cells[base..]
+            .iter()
+            .flat_map(|set| set.iter().copied())
+            .collect();
+        for cell_id in crossed {
+            let held_live = self.binding_cells.get(&cell_id).is_some_and(|holders| {
+                holders
+                    .iter()
+                    .any(|h| self.env_regs.iter().any(|e| e.id == h.id))
+            });
+            if !held_live {
+                self.emit(Instruction::TableFree {
+                    table: Reg::<Ptr>::new(cell_id),
+                });
+            }
+        }
+    }
+
     /// The declare site's walk depth: the current fn body's walk
     /// depth plus the scope offset within the body. The walk and this
     /// stack push one scope per body/do/arm in lockstep, so the

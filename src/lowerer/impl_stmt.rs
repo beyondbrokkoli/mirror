@@ -663,6 +663,20 @@ impl<'a> IrLowerer<'a> {
                 self.emit_frees(&frees)?;
                 self.emit_stmt_temp_frees(stmt);
                 self.null_moves_of(stmt)?;
+                if boundary {
+                    // The root drain rides the fall-through tail only;
+                    // this return leaves the chunk here, so it drains
+                    // what THIS path minted (leak_contract/p1, p8).
+                    self.emit_return_path_drain();
+                } else {
+                    // The expansion's return edge crosses the body's
+                    // scopes; the pop's cell frees ride the dead
+                    // continuation after the terminated block. Carry
+                    // the crossed cells here — the box-analog of
+                    // ret_path_frees, for the boxes the analyzer
+                    // cannot name (leak_contract/p4a).
+                    self.emit_crossed_cell_frees();
+                }
                 self.terminate(Terminator::Jump(exit));
                 self.current_block = self.new_block();
             }
