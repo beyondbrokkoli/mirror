@@ -161,18 +161,6 @@ impl<'a> IrLowerer<'a> {
                 // depth to a binding this stack did not declare). The
                 // legacy path — a fresh cell holding this register's
                 // value — keeps today's behavior.
-                let slot_id = self.scope_ids[depth];
-                // The definer expansion's instance owns this binding's
-                // slot identity — the fold-back's liveness proof.
-                let inst = self
-                    .instance_chain
-                    .last()
-                    .copied()
-                    .unwrap_or(InstanceId::ROOT);
-                self.instance_slots
-                    .entry(inst)
-                    .or_default()
-                    .insert(name.clone(), slot_id);
                 let box_id = self.next_reg();
                 let box_reg = Reg::new(box_id);
                 self.emit(Instruction::TableNew {
@@ -221,164 +209,20 @@ impl<'a> IrLowerer<'a> {
             if matches!(ty, Ty::Tbl(_)) {
                 self.declare_var(name, AnyReg::Ptr(cell), ty, LayoutVerdict::Sparse)?;
             } else {
-                let idx = self.next_reg();
-                self.emit(Instruction::LoadInt {
-                    target: Reg::new(idx),
-                    val: 0,
-                });
-                let out = self.next_reg();
-                let v = self.table_get(out, cell, TableKey::Int(Reg::new(idx)), &ty);
-                self.declare_var(name, v, ty, LayoutVerdict::default())?;
-            }
-        }
-        let depths: BTreeMap<String, usize> = self
-            .shape
-            .env_face_depths
-            .get(&ptr)
-            .cloned()
-            .unwrap_or_default();
-        let scope_depth = self.scopes.len() - 1;
-        self.env_ctxs.push(EnvCtx {
-            reg: env,
-            faces,
-            depths,
-            scope_depth,
-        });
-        Ok(())
-    }
-
-    /// Expansion-side write-back: an assignment to a face name inside
-    /// its own closure's expansion writes THE binding's one shared
-    /// cell through the callee's env (`env[name]` — runtime-exact,
-    /// escaped closures included). Every other env over the binding
-    /// holds the same cell pointer, so the sibling views and the
-    /// definer's fold-back all read the written value — no routing
-    /// table needed on this path.
-    fn env_write_back(&mut self, name: &str, value: AnyReg) -> Result<(), LowerError> {
-        let Some(ctx) = self.env_ctxs.last().cloned() else {
-            return Ok(());
-        };
-        let Some(ty) = ctx.faces.get(name).cloned() else {
-            return Ok(());
-        };
-        if matches!(ty, Ty::Tbl(_)) {
-            return Ok(());
-        }
-        self.write_env_cell(ctx.reg, name, value, &ty)
-    }
-
-    /// One cell write through its env: `env[name]` → the box, `box[0]`
-    /// ← value. Runtime-exact per env — no compile-time binding
-    /// identity needed.
-    fn write_env_cell(
-        &mut self,
-        env: Reg<Ptr>,
-        name: &str,
-        value: AnyReg,
-        ty: &Ty,
-    ) -> Result<(), LowerError> {
-        let key = self.next_reg();
-        self.emit(Instruction::StrKeyConst {
-            target: Reg::new(key),
-            val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
-        });
-        let cell_id = self.next_reg();
-        let cell = Reg::new(cell_id);
-        self.emit(Instruction::TableGet(<Ptr as CellRepr>::get(
-            cell,
-            env,
-            TableKey::Str(Reg::new(key)),
-        )));
-        let idx = self.next_reg();
-        self.emit(Instruction::LoadInt {
-            target: Reg::new(idx),
-            val: 0,
-        });
-        self.table_set(cell, TableKey::Int(Reg::new(idx)), value, ty)
-    }
-
-    /// One cell read through its env: `env[name]` → the box, `box[0]`
-    /// → value register.
-    fn read_env_cell(&mut self, env: Reg<Ptr>, name: &str, ty: &Ty) -> AnyReg {
-        let key = self.next_reg();
-        self.emit(Instruction::StrKeyConst {
-            target: Reg::new(key),
-            val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
-        });
-        let cell_id = self.next_reg();
-        let cell = Reg::new(cell_id);
-        self.emit(Instruction::TableGet(<Ptr as CellRepr>::get(
-            cell,
-            env,
-            TableKey::Str(Reg::new(key)),
-        )));
-        let idx = self.next_reg();
-        self.emit(Instruction::LoadInt {
-            target: Reg::new(idx),
-            val: 0,
-        });
-        let out = self.next_reg();
-        self.table_get(out, cell, TableKey::Int(Reg::new(idx)), ty)
-    }
-
-    /// The pop fold-back. The expansion's face writes live in THE
-    /// shared cell; the register-side views outside it re-read it.
-    /// The definer's slot is located through the mint-time record:
-    /// the definer expansion's instance holds the binding's slot id,
-    /// and the instance chain proves the slot is still the live one —
-    /// a call site outside the definer's lowering (an escaped
-    /// closure) finds no instance and skips, which is correct: the
-    /// dead register has no reader. Position must also equal the
-    /// face's recorded walk depth, so a nested instance's same-named
-    /// entry for a DIFFERENT binding never misfires. Outer expansions'
-    /// face-local snapshots re-read their own env's cell — the same
-    /// shared storage, so they are exact too.
-    fn fold_back_env(&mut self, ctx: &EnvCtx) -> Result<(), LowerError> {
-        for (name, ty) in &ctx.faces {
-            if matches!(ty, Ty::Tbl(_)) {
-                continue;
-            }
-            let v = self.read_env_cell(ctx.reg, name, ty);
-            if let Some(&d) = ctx.depths.get(name) {
-                // Depth 0: the boundary root is the base of every stack
-                // and outlives every expansion — the fold always lands.
-                // Deeper bindings are per-instance: the definer's slot
-                // is only live while its expansion is on the chain (t3's
-                // `b()` inside Make's body folds; a post-return call
-                // skips the dead register, which has no reader).
-                let mut target: Option<usize> = if d == 0 { Some(0) } else { None };
-                if target.is_none() {
-                    for inst in self.instance_chain.iter().rev() {
-                        let Some(&slot_id) =
-                            self.instance_slots.get(inst).and_then(|m| m.get(name))
-                        else {
-                            continue;
-                        };
-                        let Some(pos) = self.scope_ids.iter().position(|&id| id == slot_id)
-                        else {
-                            continue;
-                        };
-                        if pos == d {
-                            target = Some(pos);
-                            break;
-                        }
-                    }
-                }
-                if let Some(pos) = target {
-                    self.update_var_at(name, pos, v, ty.clone(), LayoutVerdict::default())?;
-                }
-            }
-            let outers: Vec<(usize, Reg<Ptr>, String)> = self
-                .env_ctxs
-                .iter()
-                .filter(|c| c.faces.contains_key(name))
-                .map(|c| (c.scope_depth, c.reg, name.clone()))
-                .collect();
-            for (d, ereg, n) in outers {
-                let v2 = self.read_env_cell(ereg, &n, ty);
-                self.update_var_at(&n, d, v2, ty.clone(), LayoutVerdict::default())?;
+                // Box-is-binding, expansion side: the face local binds
+                // THE cell — the same storage the definer holds — not
+                // a box[0] snapshot. g's view IS the cell; a nested
+                // direct call's write lands in it; the next read
+                // cannot be stale because no snapshot exists anywhere
+                // (Bug 1's surface dies by construction). The cell is
+                // borrowed — another scope's binding owns it — so the
+                // declare bypasses the captured gate and the scope's
+                // cell inventory on purpose.
+                self.declare_cell_view(name, cell, ty, LayoutVerdict::default());
             }
         }
         Ok(())
     }
+
+
 }

@@ -193,13 +193,11 @@ impl<'a> IrLowerer<'a> {
                         self.emit_arm_free(e)?;
                     }
                 }
+                // Box-is-binding: the write's one store is
+                // update_var — a cell-backed target (the definer's
+                // boxed binding or an expansion's face view) stores
+                // THE cell; a plain target writes the register.
                 self.update_var(name, actual_reg, ty, layout)?;
-                // Box-is-binding, expansion side: inside an expansion
-                // the innermost target is the face local — a snapshot
-                // until stage 2 binds cells — and env_write_back
-                // routes the cell write. The definer-side cell store
-                // rode update_var itself.
-                self.env_write_back(name, actual_reg)?;
                 self.null_moves_of(stmt)?;
                 self.emit_stmt_temp_frees(stmt);
             }
@@ -346,10 +344,8 @@ impl<'a> IrLowerer<'a> {
                 let mut reserve_offset_reg: Option<Reg<Int>> = None;
                 if let (Some((_, plan)), Some(bound_expr)) = (&plan, conv_bound) {
                     let saved_scopes = self.scopes.clone();
-                    let saved_scope_ids = self.scope_ids.clone();
                     let TypedReg { reg: b_any, .. } = self.lower_expr(bound_expr, None)?;
                     self.scopes = saved_scopes;
-                    self.scope_ids = saved_scope_ids;
                     let b_reg = int_of(b_any)?;
                     conv_bound_reg = Some(b_reg);
                     // Offset keys reach `bound + K_eff`; the sum is the
@@ -716,7 +712,6 @@ impl<'a> IrLowerer<'a> {
                 phi_order.sort_by(|(name_a, a), (name_b, b)| (a, name_a).cmp(&(b, name_b)));
 
                 let snapshot = self.scopes.clone();
-                let snapshot_ids = self.scope_ids.clone();
 
                 self.current_block = then_block;
                 self.in_block(|an| {
@@ -745,7 +740,6 @@ impl<'a> IrLowerer<'a> {
                 self.terminate(Terminator::Jump(join_block));
 
                 self.scopes = snapshot;
-                self.scope_ids = snapshot_ids;
                 self.current_block = else_block;
                 self.in_block(|an| {
                     for s in else_body {

@@ -315,17 +315,6 @@ impl<'a> IrLowerer<'a> {
                     self.call_tag_regs.insert(expr.id(), Reg::new(tag_reg));
                 }
                 self.instance_chain.pop();
-                if call_env.is_some() {
-                    // The box-is-binding fold-back: the expansion's
-                    // face writes live in the cells; the definer's
-                    // slot and any outer expansion's face-local
-                    // snapshots re-read them before the ctx goes.
-                    let ctx = self.env_ctxs.pop().expect(
-                        "enter_env_ctx pushed the expansion's ctx — \
-                         the pop folds back before the env is forgotten",
-                    );
-                    self.fold_back_env(&ctx)?;
-                }
                 Ok(TypedReg {
                     reg: result,
                     ty: call_ret,

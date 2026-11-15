@@ -111,15 +111,6 @@ pub struct IrLowerer<'a> {
     current_block: BlockId,
     free_reg: RegId,
     scopes: Vec<BTreeMap<String, Local>>,
-    /// Per-scope-push identity, index-aligned with `scopes`. The root
-    /// scope is permanently 0 — the depth-0 tier's binding identity is
-    /// computable from any lowering site. Every other scope push mints
-    /// a fresh id, so two expansions of one fn place their same-named
-    /// locals under DIFFERENT identities: two Make() invocations own
-    /// independent cells (the judge's escaping-closure semantics), and
-    /// no registry route can cross them.
-    scope_ids: Vec<usize>,
-    next_scope_id: usize,
     reserves: Vec<ActiveReserve>,
     handles: FreeHandles,
     shape: &'a ShapeFacts,
@@ -135,7 +126,6 @@ pub struct IrLowerer<'a> {
     event_cursor: BTreeMap<(InstanceId, NodeId), usize>,
     env_memos: Vec<EnvMemo>,
     env_regs: Vec<Reg<Ptr>>,
-    env_ctxs: Vec<EnvCtx>,
     /// THE one box cell per captured binding, minted at its
     /// declaration — the judge's one-box model: "boxes once at
     /// declaration, every access goes through the one cell". Every env
@@ -147,13 +137,6 @@ pub struct IrLowerer<'a> {
     /// walk has no refcount, so the keeps mechanism is the
     /// single-ownership proof.
     binding_cells: BindingCells,
-    /// Per definer-expansion instance: the captured bindings' slot
-    /// identities its body minted cells for (name -> slot id). The
-    /// pop fold-back's proof of liveness — a call site inside the
-    /// definer's lowering finds the instance on the chain and the
-    /// slot alive; an escaped call finds neither and skips the dead
-    /// register.
-    instance_slots: BTreeMap<InstanceId, BTreeMap<String, usize>>,
     /// The expansion frame stack: (body scope index, body walk depth)
     /// per fn body currently lowering. The declare site's walk depth
     /// — the box-on-declare gate's key — is the frame's depth plus the
@@ -183,30 +166,6 @@ struct EnvMemo {
     reg: Reg<Ptr>,
     stored: BTreeSet<String>,
     depths: BTreeMap<String, usize>,
-}
-
-struct EnvCtx {
-    reg: Reg<Ptr>,
-    faces: BTreeMap<String, Ty>,
-    /// The binding identity of every face: the capture's walk-scope
-    /// depth (Closure Finding A's map). `write_binding_cells` and the
-    /// pop fold-back route through it.
-    depths: BTreeMap<String, usize>,
-    /// The scopes index the face locals were declared at — the
-    /// expansion's own scope. A nested expansion's pop fold-back
-    /// refreshes these slots (the face locals are cell snapshots that
-    /// a nested write would leave stale).
-    scope_depth: usize,
-}
-impl Clone for EnvCtx {
-    fn clone(&self) -> Self {
-        EnvCtx {
-            reg: self.reg,
-            faces: self.faces.clone(),
-            depths: self.depths.clone(),
-            scope_depth: self.scope_depth,
-        }
-    }
 }
 
 include!("impl_core.rs");

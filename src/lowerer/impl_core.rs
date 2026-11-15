@@ -6,8 +6,6 @@ impl<'a> IrLowerer<'a> {
             current_block: 0,
             free_reg: 0,
             scopes: vec![BTreeMap::new()],
-            scope_ids: vec![0],
-            next_scope_id: 1,
             reserves: Vec::new(),
             shape,
             cur_loc: None,
@@ -24,9 +22,7 @@ impl<'a> IrLowerer<'a> {
             event_cursor: BTreeMap::new(),
             env_memos: Vec::new(),
             env_regs: Vec::new(),
-            env_ctxs: Vec::new(),
             binding_cells: BTreeMap::new(),
-            instance_slots: BTreeMap::new(),
             fn_frames: Vec::new(),
             captured: shape
                 .fn_capture_depths
@@ -112,8 +108,6 @@ impl<'a> IrLowerer<'a> {
 
     fn in_block<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push(BTreeMap::new());
-        self.scope_ids.push(self.next_scope_id);
-        self.next_scope_id += 1;
         self.scope_cells.push(BTreeSet::new());
         self.ctrl_depth += 1;
         let r = f(self);
@@ -121,7 +115,6 @@ impl<'a> IrLowerer<'a> {
         let cells = self.scope_cells.pop().expect("index-aligned");
         self.free_dead_scope_cells(&cells);
         self.scopes.pop();
-        self.scope_ids.pop();
         r
     }
 
@@ -134,14 +127,11 @@ impl<'a> IrLowerer<'a> {
 
     fn in_do<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push(BTreeMap::new());
-        self.scope_ids.push(self.next_scope_id);
-        self.next_scope_id += 1;
         self.scope_cells.push(BTreeSet::new());
         let r = f(self);
         let cells = self.scope_cells.pop().expect("index-aligned");
         self.free_dead_scope_cells(&cells);
         self.scopes.pop();
-        self.scope_ids.pop();
         r
     }
 
@@ -397,9 +387,13 @@ impl<'a> IrLowerer<'a> {
         // storage from here on: reads load, writes store, and no mint
         // ever snapshots. A loop body's declare mints per iteration
         // (the TableNew rides the body block) — exactly the judge's
-        // semantics. Table bindings stay out: `Tbl` faces alias by
-        // pointer, no box element rides them.
-        let boxed = !matches!(ty, Ty::Tbl(_))
+        // semantics. The gate mirrors the mint's boxable faces: the
+        // concrete scalars, Any, and Closure. `Tbl` faces alias by
+        // pointer (no box element rides them), and the byte-lane tys
+        // (Ffi/FfiLib/Async/Unknown) hold handles no env ever boxed —
+        // boxing one would store a Ptr value into a Byte lane, the
+        // repr law's exact mismatch.
+        let boxed = matches!(ty, Ty::Int | Ty::Flt | Ty::Bool | Ty::Str | Ty::Any | Ty::Closure(_))
             && self.captured.contains(&(self.cur_walk_depth(), name.clone()));
         let (bind_reg, cell) = if boxed {
             let box_id = self.next_reg();
@@ -420,16 +414,6 @@ impl<'a> IrLowerer<'a> {
                 .last_mut()
                 .expect("scopes and scope_cells stay index-aligned")
                 .insert(box_id);
-            let slot_id = self.scope_ids[self.scopes.len() - 1];
-            let inst = self
-                .instance_chain
-                .last()
-                .copied()
-                .unwrap_or(InstanceId::ROOT);
-            self.instance_slots
-                .entry(inst)
-                .or_default()
-                .insert(name.clone(), slot_id);
             (AnyReg::Ptr(box_reg), Some(box_reg))
         } else {
             (reg, None)
@@ -446,6 +430,25 @@ impl<'a> IrLowerer<'a> {
             },
         );
         Ok(())
+    }
+
+    /// A borrowed cell view: the expansion's face local binding THE
+    /// binding's one cell. Unlike `declare_var` this never gates on
+    /// the captured union (the view's binding was declared elsewhere)
+    /// and never enters `scope_cells` (another scope owns the cell —
+    /// a dying scope frees only what it minted).
+    fn declare_cell_view(&mut self, name: String, cell: Reg<Ptr>, ty: Ty, layout: LayoutVerdict) {
+        self.push_dbg_bind(&name, AnyReg::Ptr(cell), None);
+        self.scopes.last_mut().unwrap().insert(
+            name,
+            Local {
+                reg: AnyReg::Ptr(cell),
+                cell: Some(cell),
+                capture: None,
+                ty,
+                layout,
+            },
+        );
     }
 
     fn update_var(
