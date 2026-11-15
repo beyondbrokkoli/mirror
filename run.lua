@@ -16,6 +16,21 @@ Leak gate    positive runs (lib lane and exe twins) also gate on the
              panic lanes skip it — a death mid-flight may leave its
              tables. The notice rides stderr, which the stdout twins
              never see.
+XFAIL pin    -- XFAIL: <reason> marks a case whose gate failures are
+             expected today: the pin states the behavior that should
+             hold once the named law lands, and the envelope keeps
+             the case visible (dim lines, archived evidence) without
+             failing the run. When every gate comes back green, the
+             summary nags — flip the pin and relock. Runtime-
+             aspirational only: an xfail positive must compile today
+             (relock aborts otherwise); a guard that should reject a
+             compile rides the negative lane, where xfail means "the
+             guard does not fire yet".
+Failures     every gate failure prints one specific line and archives
+             the evidence (stdout, stderr, IR, lock diff, want/got)
+             under target/failures/<case>.<lane>/ — the console never
+             dumps diffs. Full reasons and the envelope census:
+             target/failures/index.txt (rewritten each run).
 Flags (any position):
   --cases DIR   external corpus, lockless by design — no notices
   --no-lock     skip the lock comparison (repo corpus)
@@ -44,7 +59,8 @@ Locks (lock/ is untracked — the .ll baselines are wordy):
                names the lock origin)
 
 Quiet when green: one summary line; failures and action-needed notices
-print as they happen; exit nonzero on any failure.]])
+print one line each as they happen; exit nonzero on any unexpected
+failure (xfail envelopes don't fail the run).]])
 end
 
 local ARGS = { ... }
@@ -125,40 +141,90 @@ local GREEN, RED, YELLOW = "\27[32m", "\27[31m", "\27[33m"
 local function c(code, s) return code .. s .. "\27[0m" end
 
 local failed, notices = {}, {}
-local function report_fail(section, name, reason)
-    table.insert(failed, { section = section, name = name })
-    print(string.format("  %s [%s] %s — %s", c(RED, "✗"), section, name, reason))
+-- The case context: the lane loops set it while a case's gates run and
+-- clear it after. report_fail consults it twice — an xfail case's gate
+-- failures route into its envelope (expected, dim, never fatal), and
+-- every run-born failure archives its evidence before the next case
+-- overwrites OUT/ERR. Classification failures (corpus) and post-run
+-- sweeps (missing/stray locks) run outside any case context.
+local current_case = nil
+local xfail_envelopes = {}  -- case name -> { {gate=, reason=}, ... }
+local function oneline(s, n)
+    local first = s:gsub("[\r\n].*", "")
+    if #first > (n or 200) then
+        first = first:sub(1, n or 200) .. "…"
+    end
+    return first
+end
+local function report_fail(section, name, reason, extras)
+    local dir = nil
+    if current_case and current_case.xfail then
+        local env = xfail_envelopes[name]
+        if not env then env = {}; xfail_envelopes[name] = env end
+        table.insert(env, { gate = section, reason = reason })
+        dir = archive_failure(name, section .. ".xfail", reason, extras)
+        print(string.format("  · [xfail] %s %s — %s — %s", section, name,
+            oneline(reason), dir))
+        return
+    end
+    if current_case or section == "corpus" then
+        dir = archive_failure(name, section, reason, extras)
+    end
+    table.insert(failed, { section = section, name = name, reason = reason, dir = dir })
+    local where = dir and (" — " .. dir) or ""
+    print(string.format("  %s [%s] %s — %s%s", c(RED, "✗"), section, name,
+        oneline(reason), where))
 end
 local function report_notice(text)
     table.insert(notices, text)
     print(string.format("  %s %s", c(YELLOW, "!"), text))
 end
 
-local function cap(s, n)
-    local lines = split_lines(s)
-    if #lines <= n then return s end
-    return table.concat(lines, "\n", 1, n)
-        .. string.format("\n       ... (%d more diff lines — full diff: %s vs %s)", #lines - n, DIFF_DIR, LOCK_DIR)
+-- Cargo-leg heads: the legs keep their full output in target/ files
+-- that persist across runs; the console shows the head and names the
+-- file, so a 200-line libtest dump never drowns the corpus failures
+-- behind it.
+local function leg_dump(path, n)
+    local lines = split_lines(read_file(path))
+    local head = {}
+    for i = 1, math.min(n or 15, #lines) do head[i] = lines[i] end
+    local s = table.concat(head, "\n")
+    if #lines > (n or 15) then
+        s = s .. string.format("\n       … (%d more lines — full output: %s)",
+            #lines - (n or 15), path)
+    end
+    return s
 end
 
 -- EXPECT pins: whole-stdout equality — lines in order, nothing extra.
 -- Only enforced when the case carries at least one EXPECT pin; a pinless
 -- positive case only checks for a clean compile and zero exit status.
+-- ALL differing lines are collected: the console shows the first three
+-- (one iterate-run per mismatch line is a volume tax), the archive's
+-- want.txt/got.txt hold both sides whole.
 local function expect_mismatch(out, pins)
     local got = split_lines(out)
+    local bad = {}
     for i = 1, math.max(#pins, #got) do
         local w, g = pins[i], got[i]
         if w == nil then
-            return string.format("line %d: unexpected extra output '%s' (want %d lines, got %d)",
-                i, g, #pins, #got)
+            table.insert(bad, string.format("line %d: unexpected extra output '%s' (want %d lines, got %d)",
+                i, g, #pins, #got))
         elseif g == nil then
-            return string.format("line %d: want '%s', got nothing (want %d lines, got %d)",
-                i, w, #pins, #got)
+            table.insert(bad, string.format("line %d: want '%s', got nothing (want %d lines, got %d)",
+                i, w, #pins, #got))
         elseif w ~= g then
-            return string.format("line %d: want '%s', got '%s'", i, w, g)
+            table.insert(bad, string.format("line %d: want '%s', got '%s'", i, w, g))
         end
     end
-    return nil
+    if #bad == 0 then return nil end
+    local shown = {}
+    for i = 1, math.min(3, #bad) do shown[i] = bad[i] end
+    local s = table.concat(shown, " | ")
+    if #bad > 3 then
+        s = s .. string.format(" | … (%d more)", #bad - 3)
+    end
+    return s, table.concat(pins, "\n"), table.concat(got, "\n")
 end
 
 os.execute("rm -rf '" .. DIFF_DIR .. "'")
@@ -206,8 +272,23 @@ local function diff_against_lock(name, is_exe)
         lock_identical = lock_identical + 1
         return nil
     end
-    lock_drifted = lock_drifted + 1
-    report_fail("lock", name, "BYTE DRIFT vs " .. LOCK_DIR .. " — relock only at a milestone:\n" .. cap(d, 60))
+    -- The console never dumps the diff: one line names the size and
+    -- the first hunk, the archive holds the whole unified diff plus
+    -- both normalized sides. An xfail case's drift rides its envelope
+    -- (the pin covers the case's whole gate set), so the observatory's
+    -- counter stays honest about UNexpected drift.
+    local first_hunk = d:match("(@@[^\n]*)")
+    local short = string.format(
+        "BYTE DRIFT vs %s: %d diff lines, first hunk %s — relock only at a milestone",
+        LOCK_DIR, select(2, d:gsub("\n", "")) + 1, first_hunk or "(no hunk)")
+    if not (current_case and current_case.xfail) then
+        lock_drifted = lock_drifted + 1
+    end
+    report_fail("lock", name, short, {
+        ["lock-diff.txt"] = d,
+        ["lock-from.txt"] = lockcode,
+        ["lock-to.txt"] = code,
+    })
     return nil
 end
 
@@ -215,7 +296,8 @@ end
 if mode ~= "probe" and not NO_FMT then
     local ok = exec_cmd("cargo fmt --check > /dev/null 2> " .. BERR)
     if not ok then
-        print(c(RED, "  ✗ cargo fmt --check failed (run `cargo fmt` and re-stage):") .. "\n" .. read_file(BERR))
+        print(c(RED, "  ✗ cargo fmt --check failed (run `cargo fmt` and re-stage):"))
+        print(leg_dump(BERR))
         os.exit(1)
     end
 end
@@ -223,7 +305,8 @@ end
 do
     local ok = exec_cmd("cargo build --release --quiet > /dev/null 2> " .. BERR)
     if not ok then
-        print(c(RED, "  ✗ cargo build failed:") .. "\n" .. read_file(BERR))
+        print(c(RED, "  ✗ cargo build failed:"))
+        print(leg_dump(BERR))
         os.exit(1)
     end
 end
@@ -281,10 +364,16 @@ if mode == "probe" then
     os.exit(0)
 end
 
+-- The failure archive: wiped after probe mode exits (a probe must not
+-- cost the previous run's evidence) and fresh for THIS run, like diff/.
+os.execute("rm -rf '" .. FAIL_DIR .. "'")
+os.execute("mkdir -p '" .. FAIL_DIR .. "'")
+
 if not NO_CLIPPY then
     local ok = exec_cmd("cargo clippy --release --quiet -- -D warnings > /dev/null 2> " .. BERR)
     if not ok then
-        print(c(RED, "  ✗ cargo clippy failed (-D warnings):") .. "\n" .. read_file(BERR))
+        print(c(RED, "  ✗ cargo clippy failed (-D warnings):"))
+        print(leg_dump(BERR))
         os.exit(1)
     end
 end
@@ -299,8 +388,9 @@ if not NO_TEST and #filters == 0 then
     local TEST_OUT = "target/test_out.txt"
     local ok = exec_cmd("cargo test --release --quiet > " .. TEST_OUT .. " 2> " .. BERR)
     if not ok then
-        print(c(RED, "  ✗ cargo test failed (full output: " .. TEST_OUT .. "):")
-            .. "\n" .. read_file(TEST_OUT) .. read_file(BERR))
+        print(c(RED, "  ✗ cargo test failed (full output: " .. TEST_OUT .. "):"))
+        print(leg_dump(TEST_OUT))
+        if read_file(BERR) ~= "" then print(leg_dump(BERR)) end
         os.exit(1)
     end
 end
@@ -314,8 +404,9 @@ if MIRI then
     local MIRI_OUT = "target/miri_out.txt"
     local ok = exec_cmd("cargo +nightly miri test --lib --quiet > " .. MIRI_OUT .. " 2> " .. BERR)
     if not ok then
-        print(c(RED, "  ✗ miri failed (full output: " .. MIRI_OUT .. "):")
-            .. "\n" .. read_file(MIRI_OUT) .. read_file(BERR))
+        print(c(RED, "  ✗ miri failed (full output: " .. MIRI_OUT .. "):"))
+        print(leg_dump(MIRI_OUT))
+        if read_file(BERR) ~= "" then print(leg_dump(BERR)) end
         os.exit(1)
     end
 end
@@ -353,6 +444,7 @@ end
 local pos_passed = 0
 for _, name in ipairs(corpus.positive) do
     local pins = corpus.pins[name]
+    current_case = { name = name, pins = pins, xfail = pins.xfail }
     -- --exe-flagged positives (the loading lane: ffi.load is
     -- --exe-only, M4's gate) compile the standalone executable and
     -- run it; callee-seam positives ride the lib lane as everything
@@ -368,13 +460,14 @@ for _, name in ipairs(corpus.positive) do
             if not run_ok then
                 report_fail("positive", name, "run failed: " .. first_error(ERR, run_to))
             else
-                local bad
+                local bad, want, got
                 if #pins.expect > 0 then
-                    bad = expect_mismatch(script_stdout(), pins.expect)
+                    bad, want, got = expect_mismatch(script_stdout(), pins.expect)
                 end
                 local leak = leak_notice()
                 if bad then
-                    report_fail("positive", name, "EXPECT mismatch — " .. bad)
+                    report_fail("positive", name, "EXPECT mismatch — " .. bad,
+                        { ["want.txt"] = want, ["got.txt"] = got })
                 end
                 if leak then
                     report_fail("leak", name, leak)
@@ -391,13 +484,14 @@ for _, name in ipairs(corpus.positive) do
             report_fail("positive", name, why .. ": " .. first_error(ERR, timed_out))
         else
             diff_against_lock(name, false)
-            local bad
+            local bad, want, got
             if #pins.expect > 0 then
-                bad = expect_mismatch(script_stdout(), pins.expect)
+                bad, want, got = expect_mismatch(script_stdout(), pins.expect)
             end
             local leak = leak_notice()
             if bad then
-                report_fail("positive", name, "EXPECT mismatch — " .. bad)
+                report_fail("positive", name, "EXPECT mismatch — " .. bad,
+                    { ["want.txt"] = want, ["got.txt"] = got })
             end
             if leak then
                 report_fail("leak", name, leak)
@@ -407,11 +501,13 @@ for _, name in ipairs(corpus.positive) do
             end
         end
     end
+    current_case = nil
 end
 
 local neg_passed = 0
 for _, name in ipairs(corpus.negative) do
     local pins = corpus.pins[name]
+    current_case = { name = name, pins = pins, xfail = pins.xfail }
     local is_exe = flags_exe(pins.flags)
     local _, timed_out
     local succeeded
@@ -443,11 +539,13 @@ for _, name in ipairs(corpus.negative) do
             neg_passed = neg_passed + 1
         end
     end
+    current_case = nil
 end
 
 local pan_passed = 0
 for _, name in ipairs(corpus.panic) do
     local pins = corpus.pins[name]
+    current_case = { name = name, pins = pins, xfail = pins.xfail }
     local is_exe = flags_exe(pins.flags)
     if is_exe then
         local comp_ok, comp_to = run_case_exe(CASES_DIR .. "/" .. name, pins.flags)
@@ -470,11 +568,12 @@ for _, name in ipairs(corpus.panic) do
                         break
                     end
                 end
+                local want, got
                 if not bad and #pins.expect > 0 then
-                    bad = expect_mismatch(script_stdout(), pins.expect)
+                    bad, want, got = expect_mismatch(script_stdout(), pins.expect)
                 end
                 if bad then
-                    report_fail("panic", name, bad)
+                    report_fail("panic", name, bad, { ["want.txt"] = want, ["got.txt"] = got })
                 else
                     pan_passed = pan_passed + 1
                 end
@@ -499,17 +598,19 @@ for _, name in ipairs(corpus.panic) do
                         break
                     end
                 end
+                local want, got
                 if not bad and #pins.expect > 0 then
-                    bad = expect_mismatch(script_stdout(), pins.expect)
+                    bad, want, got = expect_mismatch(script_stdout(), pins.expect)
                 end
                 if bad then
-                    report_fail("panic", name, bad)
+                    report_fail("panic", name, bad, { ["want.txt"] = want, ["got.txt"] = got })
                 else
                     pan_passed = pan_passed + 1
                 end
             end
         end
     end
+    current_case = nil
 end
 
 if lock_missing > 0 then
@@ -565,11 +666,12 @@ if not NO_EXE then
                         break
                     end
                 end
+                local want, got
                 if not bad and #pins.expect > 0 then
-                    bad = expect_mismatch(script_stdout(), pins.expect)
+                    bad, want, got = expect_mismatch(script_stdout(), pins.expect)
                 end
                 if bad then
-                    report_fail("exe", name, bad)
+                    report_fail("exe", name, bad, { ["want.txt"] = want, ["got.txt"] = got })
                 else
                     exe_passed = exe_passed + 1
                 end
@@ -578,13 +680,14 @@ if not NO_EXE then
             if not ok then
                 report_fail("exe", name, "executable exited nonzero: " .. first_error(ERR, run_to))
             else
-                local bad
+                local bad, want, got
                 if #pins.expect > 0 then
-                    bad = expect_mismatch(script_stdout(), pins.expect)
+                    bad, want, got = expect_mismatch(script_stdout(), pins.expect)
                 end
                 local leak = leak_notice()
                 if bad then
-                    report_fail("exe", name, "EXPECT mismatch (exe) — " .. bad)
+                    report_fail("exe", name, "EXPECT mismatch (exe) — " .. bad,
+                        { ["want.txt"] = want, ["got.txt"] = got })
                 end
                 if leak then
                     report_fail("leak", name, leak)
@@ -595,8 +698,16 @@ if not NO_EXE then
             end
         end
     end
-    for _, name in ipairs(corpus.positive) do exe_twin(name, false) end
-    for _, name in ipairs(corpus.panic) do exe_twin(name, true) end
+    for _, name in ipairs(corpus.positive) do
+        current_case = { name = name, pins = corpus.pins[name], xfail = corpus.pins[name].xfail }
+        exe_twin(name, false)
+        current_case = nil
+    end
+    for _, name in ipairs(corpus.panic) do
+        current_case = { name = name, pins = corpus.pins[name], xfail = corpus.pins[name].xfail }
+        exe_twin(name, true)
+        current_case = nil
+    end
 end
 
 if #filters == 0 and not CASES_OVERRIDE and not NO_LOCK then
@@ -614,14 +725,74 @@ end
 
 clean_artifacts()
 
+-- XPASS: an xfail pin whose whole gate envelope came back empty — the
+-- law the pin was waiting for has landed. Evaluated after every lane
+-- ran, so a lib-pass + exe-fail split cannot false-positive. Gentle:
+-- the nag names the flip, the run stays green, the exit code is
+-- untouched.
+local xpass = {}
+for _, list in ipairs({ corpus.positive, corpus.negative, corpus.panic }) do
+    for _, name in ipairs(list) do
+        local pins = corpus.pins[name]
+        if pins.xfail and not xfail_envelopes[name] then
+            table.insert(xpass, { name = name, reason = pins.xfail })
+        end
+    end
+end
+local xfail_n = 0
+for _ in pairs(xfail_envelopes) do xfail_n = xfail_n + 1 end
+
+-- The run's failure census, written before the verdicts: full,
+-- untruncated reasons plus the envelope contents — the console shows
+-- one line per event, this file holds the whole story.
+if #failed > 0 or xfail_n > 0 or #xpass > 0 then
+    local idx = io.open(FAIL_DIR .. "/index.txt", "w")
+    if idx then
+        for _, f in ipairs(failed) do
+            idx:write(string.format("FAIL  [%s] %s\n  %s\n%s\n\n", f.section, f.name,
+                oneline(f.reason, 400), f.dir and ("  evidence: " .. f.dir) or ""))
+        end
+        for name, env in pairs(xfail_envelopes) do
+            idx:write(string.format("XFAIL %s\n  pin: %s\n", name,
+                oneline(corpus.pins[name].xfail, 400)))
+            for _, e in ipairs(env) do
+                idx:write(string.format("  gate %s: %s\n", e.gate, oneline(e.reason, 400)))
+            end
+            idx:write("\n")
+        end
+        for _, x in ipairs(xpass) do
+            idx:write(string.format("XPASS %s\n  pin: %s — flip and relock\n\n", x.name, x.reason))
+        end
+        idx:close()
+    end
+end
+
+if #xpass > 0 then
+    print(c(YELLOW, string.format("  ! XPASS — %d xfail pin%s retired-ready — flip the pin and relock:",
+        #xpass, #xpass == 1 and "" or "s")))
+    for _, x in ipairs(xpass) do
+        print(string.format("      %s — pin was: %s", x.name, oneline(x.reason)))
+    end
+end
+
 if #failed > 0 then
     print(c(RED, string.format("FAILURES : %d", #failed)))
-    for _, f in ipairs(failed) do print(string.format("   [%s] %s", f.section, f.name)) end
+    for _, f in ipairs(failed) do
+        if f.dir then
+            print(string.format("   [%s] %s — %s", f.section, f.name, f.dir))
+        else
+            print(string.format("   [%s] %s", f.section, f.name))
+        end
+    end
     os.exit(1)
 end
 if #filters > 0 then
-    print(c(YELLOW, string.format("  GREEN (filtered %d/%d by '%s') — a full zero-arg run is still owed",
-        matched, total, table.concat(filters, "' '"))))
+    local extra = {}
+    if xfail_n > 0 then table.insert(extra, string.format("xfail %d", xfail_n)) end
+    if #xpass > 0 then table.insert(extra, string.format("%d xpass flip-ready", #xpass)) end
+    print(c(YELLOW, string.format("  GREEN (filtered %d/%d by '%s') — a full zero-arg run is still owed%s",
+        matched, total, table.concat(filters, "' '"),
+        (#extra > 0) and (" · " .. table.concat(extra, " · ")) or "")))
     os.exit(0)
 end
 local parts = { string.format("%d+%d+%d", pos_passed, neg_passed, pan_passed) }
@@ -661,4 +832,6 @@ if MIRI then table.insert(hygiene, "miri") end
 if not NO_FMT then table.insert(hygiene, "fmt") end
 if not NO_CLIPPY then table.insert(hygiene, "clippy") end
 if #hygiene > 0 then table.insert(parts, table.concat(hygiene, "+") .. " clean") end
+if xfail_n > 0 then table.insert(parts, string.format("xfail %d (enveloped)", xfail_n)) end
+if #xpass > 0 then table.insert(parts, string.format("%d xpass flip-ready", #xpass)) end
 print(c(GREEN, "  ALL GREEN — " .. table.concat(parts, " · ")))

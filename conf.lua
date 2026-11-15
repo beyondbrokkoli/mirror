@@ -7,6 +7,7 @@ BERR = "target/build_err.txt"
 CASES_DIR = "cases"
 LOCK_DIR = "lock"
 DIFF_DIR = "diff"
+FAIL_DIR = "target/failures"
 
 os.execute("mkdir -p target")
 
@@ -68,8 +69,12 @@ end
 
 -- Pin grammar and classification rules: run.lua's usage text is the
 -- documentation of record (there is no README). Unknown EXPECT_*
--- prefixes are recorded in pins.unknown so the runner can surface
--- typos instead of silently dropping pins.
+-- prefixes AND unknown ALLCAPS-colon metadata keys are recorded in
+-- pins.unknown so the runner can surface typos instead of silently
+-- dropping pins (before the tripwire, `-- XFIAL:` loaded as prose).
+-- XFAIL is a status pin, not an expectation: its reason names the law
+-- the case is waiting for; run.lua routes the case's gate failures
+-- into an expected-failure envelope while the pin stands.
 function parse_pins(content)
     local pins = {
         expect = {},
@@ -91,15 +96,32 @@ function parse_pins(content)
                 table.insert(pins.unknown, prefix)
             end
         else
-            local args = line:match("^%s*%-%-%s*ARGS:%s*(.+)$")
-            if args then
-                if pins.args then table.insert(pins.dup_meta, "ARGS") end
-                pins.args = args
-            end
-            local flags = line:match("^%s*%-%-%s*FLAGS:%s*(.+)$")
-            if flags then
-                if pins.flags then table.insert(pins.dup_meta, "FLAGS") end
-                pins.flags = flags
+            local key, rest = line:match("^%s*%-%-%s*([A-Z][A-Z_]*):%s*(.*)$")
+            if key then
+                if key == "ARGS" then
+                    if rest == "" then
+                        table.insert(pins.unknown, "ARGS (no value)")
+                    else
+                        if pins.args then table.insert(pins.dup_meta, "ARGS") end
+                        pins.args = rest
+                    end
+                elseif key == "FLAGS" then
+                    if rest == "" then
+                        table.insert(pins.unknown, "FLAGS (no value)")
+                    else
+                        if pins.flags then table.insert(pins.dup_meta, "FLAGS") end
+                        pins.flags = rest
+                    end
+                elseif key == "XFAIL" then
+                    if rest == "" then
+                        table.insert(pins.unknown, "XFAIL (no reason)")
+                    else
+                        if pins.xfail then table.insert(pins.dup_meta, "XFAIL") end
+                        pins.xfail = rest
+                    end
+                else
+                    table.insert(pins.unknown, key)
+                end
             end
         end
     end
@@ -279,4 +301,42 @@ function captured_ir_exe()
     local code = read_file("alm_out.ll")
     if code ~= "" then return normalize_ir(code) end
     return nil
+end
+
+-- The failure archive: every gate failure lands here with the full,
+-- untruncated evidence, so the console can stay at one line per
+-- failure (the diff dump it replaces was never persisted at all).
+-- Layout: target/failures/<stem>.<section>/ — reason.txt is appended
+-- (a case may fire several gates in one lane), out.txt / err.txt copy
+-- the run's own streams before the next case overwrites them, ir.ll
+-- is the captured normalized IR when the case compiled, and extras
+-- holds caller-provided blobs (lock-diff.txt, want.txt, ...). The
+-- FAIL_DIR root is wiped at run start like diff/, so an archive
+-- always describes THIS run. OUT/ERR are only meaningful while a
+-- case is current — the runner archives reason-only outside case
+-- context (classification, missing/stray locks).
+function archive_failure(name, section, reason, extras)
+    local stem = name:gsub("%.lua$", "")
+    local dir = FAIL_DIR .. "/" .. stem .. "." .. section
+    os.execute("mkdir -p '" .. dir .. "'")
+    local f = io.open(dir .. "/reason.txt", "a")
+    if f then
+        f:write(string.format("== %s | %s | %s ==\n%s\n\n",
+            os.date("%Y-%m-%d %H:%M:%S"), section, name, reason))
+        f:close()
+    end
+    copy_file(OUT, dir .. "/out.txt")
+    copy_file(ERR, dir .. "/err.txt")
+    local ir = captured_ir() or captured_ir_exe()
+    if ir then
+        f = io.open(dir .. "/ir.ll", "w")
+        if f then f:write(ir) f:close() end
+    end
+    if extras then
+        for dst, content in pairs(extras) do
+            f = io.open(dir .. "/" .. dst, "w")
+            if f then f:write(content) f:close() end
+        end
+    end
+    return dir
 end
