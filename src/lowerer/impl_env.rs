@@ -87,47 +87,12 @@ impl<'a> IrLowerer<'a> {
                 ),
             };
             let local = self.read_var_at(&name, depth);
-            // Closure face-Ty law (the parked creation-read-site item):
-            // the face's Ty was stamped at the creation-read site — the
-            // innermost same-named binding THERE — while this store
-            // reads the binding at the recorded walk-scope depth. A
-            // same-name shadow of a different concrete type between the
-            // two depths stamps the shadow's repr into the box and
-            // stores the outer binding's register into it; the repr law
-            // would panic mid-store. Die here instead, with the law
-            // named. Table faces stay out (they alias by pointer, no
-            // box element rides them), as does anything not fully
-            // concrete — Unknown/Pending disagreements are the
-            // constraint lattice's business, not a repr split.
-            let face_repr = match &ty {
-                Ty::Int | Ty::Flt | Ty::Bool | Ty::Str => Some(ty.clone()),
-                _ => None,
-            };
-            let local_repr = match &local.ty {
-                Ty::Int | Ty::Flt | Ty::Bool | Ty::Str => Some(local.ty.clone()),
-                _ => None,
-            };
-            if let (Some(face), Some(stored)) = (&face_repr, &local_repr)
-                && face != stored
-            {
-                // The same vocabulary the checker's diagnostics use.
-                let name_of = |t: &Ty| match t {
-                    Ty::Int => "Integer",
-                    Ty::Flt => "Float",
-                    Ty::Bool => "Boolean",
-                    Ty::Str => "String",
-                    _ => "?",
-                };
-                return Err(LowerError(Diagnostic::lower(format!(
-                    "capture '{name}' stamps a {} face but its binding \
-                     at the recorded walk-scope depth holds a {} — a \
-                     same-name shadow between the creation-read site and \
-                     the binding depth split the face (Closure face-Ty: \
-                     the face must ride the binding depth)",
-                    name_of(face),
-                    name_of(stored)
-                ))));
-            }
+            // (The Closure face-Ty law retired with §4's unification:
+            // the face's Ty is stamped depth-aware now — the checker's
+            // var_type_at_depth and this store's read_var_at read the
+            // SAME binding by construction — so a split between the
+            // face's type and the binding's type is no longer
+            // writable.)
             let key = self.next_reg();
             self.emit(Instruction::StrKeyConst {
                 target: Reg::new(key),

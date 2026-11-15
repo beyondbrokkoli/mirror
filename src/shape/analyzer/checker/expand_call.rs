@@ -153,24 +153,31 @@ impl Checker {
             self.declare_var(lat, p.clone(), pty.clone())?;
             lat.unify(&pty, &aty)?;
         }
-        // The direct surface's depth-0 captures become CAPTURE VIEWS in
-        // the expansion frame: declared from the root projection
-        // (var_type_depth0 — the mint's face types ride the env on the
-        // through-value surface instead), they shadow every caller
-        // frame's same-named binding for the body's reads, mirroring
-        // the lowerer's capture slots. A param wins (fresh storage —
-        // judge semantics), and any capture the body declares over
-        // shadows naturally. The entry dies with its frame; the
-        // monomorphic law keeps the owner's type identical, so no
-        // fold-back is owed.
+        // The direct surface's captures become CAPTURE VIEWS in the
+        // expansion frame — for ALL depths now (the d == 0 filter
+        // retires): declared at their recorded walk depth
+        // (var_type_at_depth — the mint's face types ride the env on
+        // the through-value surface instead), they shadow every
+        // caller frame's same-named binding for the body's reads,
+        // mirroring the lowerer's capture views. A param wins (fresh
+        // storage — judge semantics), and any capture the body
+        // declares over shadows naturally. A capture whose binding
+        // this stack did not reconstruct (no entry at its recorded
+        // depth) keeps the dynamic innermost reads — the definer's
+        // continuation is not on this surface. The entry dies with
+        // its frame; the monomorphic law keeps the owner's type
+        // identical, so no fold-back is owed.
         if !call_through
             && let Some(depths) = self.ctx.fn_capture_depths.get(&fn_ptr).cloned()
         {
             for (n, &d) in &depths {
-                if d != 0 || def.params.contains(n) {
+                if def.params.contains(n) {
                     continue;
                 }
-                let ty = self.var_type_depth0(lat, n)?;
+                let ty = match self.var_type_at_depth(lat, n, d) {
+                    Ok(ty) => ty,
+                    Err(_) => continue,
+                };
                 let frame = self.frames.last_mut().expect(
                     "begin_scope just pushed the expansion's frame — \
                      the capture declaration cannot outlive it",

@@ -40,23 +40,23 @@ impl Checker {
             )));
         }
         let caps = self.ctx.fn_captures.get(&ptr).cloned().unwrap_or_default();
-        // The face resolution reads each capture at its RECORDED DEPTH:
-        // a depth-0 capture resolves from the root projection
-        // (var_type_depth0) — the boundary-root binding is the same
+        // The face resolution reads each capture at its RECORDED DEPTH
+        // (var_type_at_depth) — the boundary-root binding is the same
         // object from every site, and a creation-site same-name shadow
         // must never lend its type to the face the way an innermost
-        // read would (v2's mint-inside-shadow). Deeper captures resolve
-        // innermost-first at the creation site, exactly where the mint
-        // reads their registers. The loop keeps the first error
-        // verbatim.
+        // read would (v2's mint-inside-shadow, Bug 4's Str shadow
+        // false-reject). Deeper captures resolve positionally on the
+        // definer's continuation — the same standing invariant the
+        // mint's read_var_at trusts — so the face's type and the
+        // lowerer's cell store read the SAME binding by construction.
+        // The loop keeps the first error verbatim.
         let depths = self.ctx.fn_capture_depths.get(&ptr).cloned();
         let mut face: BTreeMap<String, Ty> = BTreeMap::new();
         let mut face_err: Option<Diagnostic> = None;
         for cap in &caps {
-            let resolved = if depths.as_ref().is_some_and(|m| m.get(cap) == Some(&0)) {
-                self.var_type_depth0(lat, cap)
-            } else {
-                self.var_type(lat, cap)
+            let resolved = match depths.as_ref().and_then(|m| m.get(cap)) {
+                Some(&d) => self.var_type_at_depth(lat, cap, d),
+                None => self.var_type(lat, cap),
             };
             match resolved {
                 Ok(ty) => {

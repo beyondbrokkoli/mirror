@@ -125,6 +125,34 @@ impl Checker {
         })
     }
 
+    /// The binding at its recorded WALK depth — the face and capture
+    /// view resolution for ALL depths, closing the checker/lowerer
+    /// split (Bug 4's surface): the face's type and the lowerer's
+    /// `read_var_at` now read the same binding by construction. The
+    /// frames stack mirrors the walk scopes minus the root (root
+    /// decls live in `top`, not a frame), so walk depth d >= 1 reads
+    /// `frames[d - 1]` positionally — the same standing invariant the
+    /// mint's `read_var_at` already trusts on the definer's
+    /// continuation. A miss keeps the dynamic read: a surface that
+    /// did not reconstruct the definer's chain still resolves
+    /// innermost, exactly as today.
+    fn var_type_at_depth(
+        &mut self,
+        lat: &mut UnknownStore,
+        name: &str,
+        depth: usize,
+    ) -> Result<Ty, Diagnostic> {
+        if depth == 0 {
+            return self.var_type_depth0(lat, name);
+        }
+        if let Some(frame) = self.frames.get(depth - 1)
+            && let Some(ty) = frame.types.get(name)
+        {
+            return Ok(lat.resolve(ty));
+        }
+        self.var_type(lat, name)
+    }
+
     fn var_type_callable(&mut self, lat: &mut UnknownStore, name: &str) -> Option<Ty> {
         if let Some(ty) = self.frames_resolve(name) {
             return Some(lat.resolve(&ty));

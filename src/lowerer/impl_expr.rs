@@ -218,28 +218,30 @@ impl<'a> IrLowerer<'a> {
                     if let Some(env) = call_env {
                         an.enter_env_ctx(env, fn_ptr)?;
                     } else if let Some(depths) = an.shape.fn_capture_depths.get(&fn_ptr) {
-                        // The direct surface has no env — its depth-0
-                        // captures become views of the root binding's
-                        // ONE cell: the body's reads and writes ride
-                        // the same storage the definer holds, so a
-                        // caller shadow cannot re-point them and no
-                        // snapshot can go stale (the Finding B lexical
-                        // fix, now with box-on-declare carrying it).
-                        // A param wins — fresh storage; a body decl
-                        // shadows the view naturally, and the view
-                        // dies with this scope. Deeper captures keep
-                        // the dynamic innermost reads (the direct
-                        // surface's definer-continuation surface,
-                        // unchanged).
+                        // The direct surface has no env — its captures
+                        // become views of the owner binding's ONE cell
+                        // at their recorded walk depth, ALL depths now
+                        // (the d == 0 filter retires): the body's
+                        // reads and writes ride the same storage the
+                        // definer holds, so a caller shadow cannot
+                        // re-point them and no snapshot can go stale
+                        // (Bugs 1 and 2's surfaces die by
+                        // construction). The view resolves
+                        // positionally — the definer's continuation,
+                        // the same standing invariant the mint's
+                        // read_var_at trusts; a capture whose binding
+                        // this stack did not reconstruct keeps the
+                        // dynamic innermost reads. A param wins —
+                        // fresh storage; a body decl shadows the view
+                        // naturally, and the view dies with this
+                        // scope. A table capture has no box (Tbl
+                        // faces alias by pointer) and keeps the
+                        // redirect marker instead.
                         let views: Vec<(String, Local)> = depths
                             .iter()
-                            .filter(|(n, d)| **d == 0 && !def.params.contains(n))
-                            .filter_map(|(n, _)| {
-                                let owner = an.scopes[0].get(n).cloned()?;
-                                // A scalar capture rides the owner's ONE
-                                // cell; a table capture has no box (Tbl
-                                // faces alias by pointer) and keeps the
-                                // redirect marker instead.
+                            .filter(|(n, _)| !def.params.contains(n))
+                            .filter_map(|(n, d)| {
+                                let owner = an.scopes.get(*d)?.get(n).cloned()?;
                                 let view = if let Some(cell) = owner.cell {
                                     Local {
                                         reg: owner.reg,
@@ -252,7 +254,7 @@ impl<'a> IrLowerer<'a> {
                                     Local {
                                         reg: owner.reg,
                                         cell: None,
-                                        capture: Some(0),
+                                        capture: Some(*d),
                                         ty: owner.ty,
                                         layout: owner.layout,
                                     }
