@@ -1,8 +1,13 @@
 -- ARGS: alpha beta
 -- EXPECT: 3
--- EXPECT: 70000
--- EXPECT: 200001
+-- EXPECT: 69999
+-- EXPECT: 0
 -- EXPECT: 2
+-- XFAIL: judge_divergence_audit/reserve-border — #t reports the
+-- reserve (the raw bound, sparse keys included); the judge reports
+-- the border (69999 on the contiguous fill, 0 on the lone sparse
+-- key). Line 4 (#arg) already matches the judge. Flip with the
+-- # border law.
 local t = {1, 2, 3}
 print(#t)
 local i = 3

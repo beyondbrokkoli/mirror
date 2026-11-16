@@ -1,10 +1,13 @@
 -- FLAGS: --index-base=1
 -- EXPECT: 0
--- EXPECT: 0
+-- EXPECT: 5
 -- EXPECT: 1
--- EXPECT: 10	0
+-- EXPECT: 10	5
 -- EXPECT: 2
--- EXPECT: 1	2	0
+-- EXPECT: 1	2	5
+-- XFAIL: judge_divergence_audit/zero-key — the [0] entries map onto
+-- physical -1 and the no-op drops them; the judge answers 5 at every
+-- zero key below (t[0], u[0], v[0]). Flip with zero_key_noop.
 -- A literal [0] key under base 1 mints CtorKey::Const(-1) at the
 -- parse choke point -- the first negative Const in the compiler's
 -- history (at base 0 a bare Expr::Integer is never negative; negative

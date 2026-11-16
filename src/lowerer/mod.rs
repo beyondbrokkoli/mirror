@@ -81,6 +81,10 @@ struct BreakCtx {
     exit_block: BlockId,
     phi_vars: Vec<String>,
     breaks: Vec<(BlockId, Vec<Local>)>,
+    /// The scope_cells stack depth at loop-body entry: every scope at
+    /// or above this base is crossed by any break out of the loop —
+    /// the break edge's crossed-cell free range (leak_contract/p13).
+    scope_base: usize,
 }
 
 struct FreeHandles {

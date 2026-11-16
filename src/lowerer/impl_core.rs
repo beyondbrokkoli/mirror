@@ -119,6 +119,31 @@ impl<'a> IrLowerer<'a> {
     /// each execution frees exactly once.
     fn emit_crossed_cell_frees(&mut self) {
         let base = self.fn_frames.last().map(|&(base, _)| base).unwrap_or(0);
+        self.emit_cell_frees_from(base, None);
+    }
+
+    /// The break edge's crossed-cell frees: the same walk the return
+    /// edge takes, scoped from the loop body's scope_cells base — a
+    /// break only exits ITS loop, so enclosing scopes' cells stay
+    /// (leak_contract/p13). Every crossed cell minted in the body
+    /// dominates the break edge by construction: the only scopes still
+    /// open on the break's compile path are the body's own, and a
+    /// sibling arm's cells were popped with their scope before the
+    /// break could sit after them. V1 (creations are straight-line,
+    /// transitively) keeps no env mint inside a loop body, so the
+    /// crossed cells are unheld at the edge — the pop's back-edge free
+    /// covers every non-breaking trip, and this edge covers the trip
+    /// that leaves.
+    fn emit_break_edge_cell_frees(&mut self, base: usize) {
+        self.emit_cell_frees_from(base, Some(trace::TRACE_BREAK_EDGE_CELL_FREE));
+    }
+
+    /// The shared crossed-cell walk from a scope_cells base: unheld
+    /// cells free on THIS edge, cells held by a minted env escape with
+    /// it. The return edge passes the fn frame's base (no signal, the
+    /// p4a behavior byte-stable), the break edge the loop body's and
+    /// its own slot.
+    fn emit_cell_frees_from(&mut self, base: usize, slot: Option<u8>) {
         let crossed: Vec<RegId> = self.scope_cells[base..]
             .iter()
             .flat_map(|set| set.iter().copied())
@@ -130,6 +155,9 @@ impl<'a> IrLowerer<'a> {
                     .any(|h| self.env_regs.iter().any(|e| e.id == h.id))
             });
             if !held_live {
+                if let Some(slot) = slot {
+                    signal!(slot);
+                }
                 self.emit(Instruction::TableFree {
                     table: Reg::<Ptr>::new(cell_id),
                 });

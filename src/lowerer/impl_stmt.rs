@@ -440,6 +440,7 @@ impl<'a> IrLowerer<'a> {
                     exit_block,
                     phi_vars: phis.iter().map(|(v, _, _)| v.clone()).collect(),
                     breaks: Vec::new(),
+                    scope_base: self.scope_cells.len(),
                 });
                 self.current_block = body_block;
                 self.in_block(|an| {
@@ -551,6 +552,19 @@ impl<'a> IrLowerer<'a> {
                     .unwrap_or_default();
                 self.emit_frees(&frees)?;
                 self.emit_stmt_temp_frees(stmt);
+                let scope_base = self
+                    .break_ctxs
+                    .last()
+                    .expect("checked above")
+                    .scope_base;
+                // The break edge crosses the loop body's scopes; the
+                // pop's cell frees ride the back edge after the jump.
+                // Carry the crossed cells here — the box-analog of the
+                // break_path_frees, for the boxes the analyzer cannot
+                // name (leak_contract/p13). Path-exclusive with the
+                // pop: the breaking trip leaves before the back edge,
+                // so each execution frees exactly once.
+                self.emit_break_edge_cell_frees(scope_base);
                 let ctx = self.break_ctxs.last_mut().expect("checked above");
                 let exit_block = ctx.exit_block;
                 ctx.breaks.push((self.current_block, snap));

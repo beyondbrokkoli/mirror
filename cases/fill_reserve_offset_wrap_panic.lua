@@ -1,4 +1,8 @@
--- EXPECT_PANIC: reserve overflow
+-- EXPECT: 13	0	4	8
+-- XFAIL: judge_divergence_audit/reserve-panic — the pre-header's
+-- checked bound + K_eff sum overflows i64 and aborts before the
+-- first store; the judge allocates lazily and answers 13 0 4 8.
+-- Flip with the reserve-panic law.
 -- A fill loop whose bound + K_eff overflows i64. The pre-header
 -- widening is the runtime's checked sum, so the loud fatal fires
 -- before the first fast store — a silent skip would leave the span

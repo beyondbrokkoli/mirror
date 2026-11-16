@@ -1,4 +1,9 @@
--- EXPECT_PANIC: table allocation
+-- EXPECT: 8
+-- XFAIL: judge_divergence_audit/reserve-panic — the pre-header
+-- materializes the reserve from the raw bound, so an unfillable
+-- bound aborts before the first store; the judge allocates lazily
+-- and prints 8. Flip when reserves stop materializing eagerly from
+-- the bound.
 -- The no-offset sibling: the reserve is the raw bound, and a
 -- maxinteger bound is unallocatable — the allocator's checked layout
 -- math aborts loudly. Pinning the current law: pre-header

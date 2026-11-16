@@ -3,7 +3,10 @@
 -- EXPECT: TABLE 19 (Phase Q) FAR CELL	123456789
 -- EXPECT: TABLE 20 (Phase R) CHECKSUM	26086400000
 -- EXPECT: TABLE 21 (Phase U) CHECKSUM	402380000
--- EXPECT: TABLE 22 (Phase Z) CHECKSUM	6004799503073280
+-- EXPECT: TABLE 22 (Phase Z) CHECKSUM	6.0047995030733e+15
+-- XFAIL: judge_divergence_audit/print-format — the checksum prints
+-- as the exact integer; the judge formats numbers %.14g and spells
+-- it 6.0047995030733e+15. Flip when print adopts the judge's %.14g.
 local pn_board = {}
 local pn_sq = 0
 while pn_sq < 4096 do

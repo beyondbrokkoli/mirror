@@ -1,4 +1,9 @@
--- EXPECT_PANIC: alm runtime error: AlmTable esize
+-- EXPECT: 0	7
+-- XFAIL: judge_divergence_audit/row-displace — the latched ghost's
+-- housing is displaced mid-tuple and the first store fatals on the
+-- corrupted header; the judge's GC keeps the old row alive and
+-- prints 0 7. Flip when the row-housing lane lands (a compile-time
+-- rejection or a named clean-fatal — the ROADMAP's parked lane).
 -- WIP pin for the row-displacement gap (found in T1, older than it):
 -- the first target's obj latches a[0]'s row as a ghost, then the
 -- second target's store displaces that row in its cell, and the

@@ -1,9 +1,12 @@
 -- EXPECT: 41	42
--- EXPECT: 0	7
+-- EXPECT: nil	7
 -- EXPECT: 9900
 -- EXPECT: 99	0
 -- EXPECT: 5
 -- EXPECT: 3
+-- XFAIL: judge_divergence_audit/absent-nil — t[5] was never written;
+-- the dialect answers 0, the judge answers nil. Flip with the
+-- nil-as-value lane.
 
 local t = {}
 t[0] = 41
