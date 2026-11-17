@@ -4,13 +4,20 @@ impl Checker {
         self.frames.push(Frame {
             types: BTreeMap::new(),
             fns: BTreeMap::new(),
+            born: BTreeSet::new(),
             captures: BTreeSet::new(),
         });
     }
     fn end_scope(&mut self) {
-        // the dying frame's fn faces: anything it carried that no
-        // surviving frame carries is buried — the omni layer names
-        // it and checks whether the master snapshot re-supplies
+        // the dying frame's fn faces: the burial law reads each one
+        // against where its BINDING lives. A face born at this frame
+        // (`born`) dies with it — the scope's own grave, never an
+        // orphan. A face whose binding outlives the frame is a shadow
+        // death: the outer home must still carry the name — the
+        // rescue tiers in resolve_fn_binding's order (the inline
+        // chain is the definition-site truth, then the rider's root
+        // home, then the master snapshot). A shadow with no rescue
+        // anywhere is the orphan the law trips on.
         if omni::enabled()
             && let Some(dying) = self.frames.last()
         {
@@ -18,9 +25,31 @@ impl Checker {
                 let survived = self.frames[..self.frames.len() - 1]
                     .iter()
                     .any(|f| f.fns.contains_key(name));
-                if !survived {
-                    omni::checker_burial(name, *ptr, self.snap.fns.contains_key(name));
+                if survived || ptr.is_none() {
+                    continue;
                 }
+                let born_here = dying.born.contains(name);
+                // the rescue tiers in resolve_fn_binding's order —
+                // frames already answered via `survived`; the chain is
+                // the definition-site truth, then the rider's root
+                // home, then the master snapshot
+                let chain_rescue = self
+                    .inline_stack
+                    .last()
+                    .and_then(|cur| self.ctx.fn_def_sites.get(cur))
+                    .and_then(|chain| chain.get(name).copied().flatten())
+                    .is_some();
+                let root_rescue = self.root_fns.contains_key(name);
+                let snap_rescue = self.snap.fns.contains_key(name);
+                let rescue = chain_rescue || root_rescue || snap_rescue;
+                let rescuer = if chain_rescue {
+                    "inline-chain"
+                } else if root_rescue {
+                    "root-home"
+                } else {
+                    "master-snapshot"
+                };
+                omni::checker_burial(name, *ptr, born_here, rescue, rescuer);
             }
         }
         self.frames.pop();

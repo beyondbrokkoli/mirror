@@ -28,7 +28,12 @@
 //!   binding a fn face it carried when the scope opened, unless a
 //!   write inside that scope moved the face. This is the p30 pre-fix
 //!   bug shape ("exit_scope buried it"), still live as a law the
-//!   master stack must keep proving.
+//!   master stack must keep proving. The checker-side twin reads the
+//!   birthplace: a face DECLARED at the dying frame dies with it —
+//!   the scope's own grave, never an orphan — while a face whose
+//!   binding outlived the frame must be re-supplied by a surviving
+//!   home (inline chain → root home → master snapshot) or the law
+//!   trips.
 //! - ROOT-DRAG (soft, xfail-pinned): a fn-body collection that moves
 //!   a depth-0 binding's fn face — the defcollection travels back in
 //!   time (fn_defcollection_order: the first print answers 2 before
@@ -38,8 +43,12 @@
 //!   dragged state (the root home answers first), so the runtime
 //!   divergence the pin named is retired.
 //! - CHAIN-FREEZE (hard): a defcollection chain must not freeze a
-//!   depth-0 fn-bound name in (functions.rs excludes them exactly so
-//!   resolve_fn_binding's snapshot fallback sees the CURRENT binding).
+//!   root fn FACE in — a chain entry that IS a depth-0 fn-bound
+//!   binding's own face would answer past a rebind of that binding
+//!   (functions.rs excludes them exactly so resolve_fn_binding's
+//!   snapshot fallback sees the CURRENT binding; the trip is face
+//!   identity, not name presence — a deeper shadow of the same name
+//!   is a different binding and its face rides the chain by right).
 //!
 //! Everything rides the env gate `ALM_OMNI`; default builds compile
 //! the calls down to an enabled() check and emit nothing, so the
@@ -440,12 +449,25 @@ pub(super) fn collection_begin(
         return;
     }
     with(|o| {
-        // CHAIN-FREEZE: a root fn-bound name must be OUT of the
-        // chain; a Some entry for one freezes a face that is
-        // supposed to stay live
+        // CHAIN-FREEZE: the chain must not freeze a ROOT face in — a
+        // Some entry for an excluded root fn name that IS the root
+        // binding's own face would answer past a rebind of the root
+        // binding (fn_key_late_binding: 1 then 2). A deeper shadow of
+        // the same name is a DIFFERENT binding — inner wins, the
+        // definition-site truth the chain exists to carry — and its
+        // face dies with its scope, never masquerading as the root
+        // face. So the trip is face identity, not name presence.
         let frozen_in: Vec<&String> = excluded_root_fns
             .iter()
-            .filter(|n| chain.get(*n).copied().flatten().is_some())
+            .filter(|n| {
+                match (
+                    chain.get(*n).copied().flatten(),
+                    root_faces.get(*n).copied().flatten(),
+                ) {
+                    (Some(frozen), Some(root)) => frozen == root,
+                    _ => false,
+                }
+            })
             .collect();
         if !frozen_in.is_empty() {
             o.chain_trips += 1;
@@ -572,11 +594,21 @@ pub(super) fn checker_fn_write(name: &str, home: FnHome, ptr: Option<NodeId>, vi
     });
 }
 
-/// A checker frame died carrying fn faces. `masked` says the master
-/// snapshot still supplies the face — today's rescue; unmasked, the
-/// rider's face died with it and nothing re-supplies (the orphan,
-/// checker-side).
-pub(super) fn checker_burial(name: &str, ptr: Option<NodeId>, masked: bool) {
+/// A checker frame died carrying fn faces. The law reads the
+/// birthplace (`born_here` — the binding was minted at the dying
+/// frame, so the death is the scope's own grave) against the rescue
+/// (`rescue` — a surviving home still carries the name: the inline
+/// chain's definition-site truth, the rider's root home, or the
+/// master snapshot). A shadow death with a rescue is the outer
+/// binding living on; a face with neither birthplace nor rescue is
+/// the orphan — a binding outlived its home and nothing re-supplies.
+pub(super) fn checker_burial(
+    name: &str,
+    ptr: Option<NodeId>,
+    born_here: bool,
+    rescue: bool,
+    rescuer: &str,
+) {
     if !enabled() {
         return;
     }
@@ -587,13 +619,30 @@ pub(super) fn checker_burial(name: &str, ptr: Option<NodeId>, masked: bool) {
                 o.ctx(),
                 name,
                 face(ptr),
-                if masked {
-                    "masked: the master snapshot re-supplies it".to_string()
-                } else {
-                    "UNMASKED: nothing re-supplies — the checker-side orphan".to_string()
+                match (born_here, rescue) {
+                    (true, true) => {
+                        format!(
+                            "the face was born in this frame and dies with it; the \
+                             outer binding still answers (the {} re-supplies)",
+                            rescuer
+                        )
+                    }
+                    (true, false) => {
+                        "the face was born in this frame and dies with it — the \
+                         scope owns its grave, nothing re-supplies and nothing owes one"
+                            .to_string()
+                    }
+                    (false, true) => {
+                        format!("masked: the {} re-supplies the binding", rescuer)
+                    }
+                    (false, false) => {
+                        "UNMASKED: the binding outlived this frame and nothing \
+                         re-supplies — the checker-side orphan"
+                            .to_string()
+                    }
                 },
             ));
-            if !masked {
+            if !born_here && !rescue {
                 o.orphan_trips += 1;
                 trace::compiler_trace_signal(trace::TRACE_OMNI_ORPHAN_BURIAL);
             }

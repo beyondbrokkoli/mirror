@@ -56,6 +56,17 @@ enum ReturnCtx {
 struct Frame {
     types: BTreeMap<String, Ty>,
     fns: BTreeMap<String, Option<NodeId>>,
+    /// The fn names DECLARED at this frame — the binding's birthplace.
+    /// `declare_fn_binding` mints a fresh binding at the innermost
+    /// frame (or the root home), so a face in `fns` whose name is here
+    /// was BORN with this frame and dies with it: the scope's own
+    /// grave, not an orphan. An `assign_fn_binding` write never adds a
+    /// name — it rebinds where the binding already lives — so every
+    /// `fns` entry's name is in the `born` set of the frame it was
+    /// minted at. A dying frame carrying a face NOT in its `born` set
+    /// would mean a write landed somewhere its binding does not live —
+    /// the burial law's trip shape.
+    born: BTreeSet<String>,
     /// Names this frame declares as CAPTURE VIEWS: an expansion frame's
     /// depth-0 capture entries. A capture view reads the owner binding
     /// (the boundary root for depth 0) — caller shadows below the

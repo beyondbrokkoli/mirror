@@ -93,6 +93,11 @@ impl Checker {
     fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         if let Some(frame) = self.frames.last_mut() {
             frame.fns.insert(name.to_string(), ptr);
+            // the binding is BORN at this frame — the burial law reads
+            // the birthplace to tell a scope-correct death (a body or
+            // block local dying with its frame) from an orphan (a face
+            // outliving the binding's home)
+            frame.born.insert(name.to_string());
             omni::checker_fn_write(name, omni::FnHome::Frame(self.frames.len() - 1), ptr, "declare");
         } else {
             // no frame home: the face takes the rider's ROOT home —
