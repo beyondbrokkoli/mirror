@@ -1,6 +1,10 @@
 -- EXPECT: 0
 -- EXPECT: 20
--- EXPECT: 5
+-- EXPECT: 6
+-- The count rode 5 before the p9 reversal (2026-11-18): boxing the
+-- captured `t` adds one live allocation at the count print — the box
+-- cell holds the parent past the scope, and its drain rides the root
+-- exit, after this print. 1 box + 1 closure value + 1 parent + 3 rows.
 -- Closure over reserved state (battery pin of
 -- probes/p25_closure_over_reserved_rows.lua): a returned function
 -- value captures a table whose rows were allocated inside a fill loop,

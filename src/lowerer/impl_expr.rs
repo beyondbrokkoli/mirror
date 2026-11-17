@@ -234,9 +234,10 @@ impl<'a> IrLowerer<'a> {
                         // dynamic innermost reads. A param wins —
                         // fresh storage; a body decl shadows the view
                         // naturally, and the view dies with this
-                        // scope. A table capture has no box (Tbl
-                        // faces alias by pointer) and keeps the
-                        // redirect marker instead.
+                        // scope. Every captured face binds its cell
+                        // (the p9 reversal boxed `Tbl` too); a
+                        // non-boxed owner keeps the redirect marker
+                        // instead.
                         let views: Vec<(String, Local)> = depths
                             .iter()
                             .filter(|(n, _)| !def.params.contains(n))

@@ -85,6 +85,14 @@ impl<'a> IrLowerer<'a> {
                 if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
                         let displaced = self.peek_var(n)?;
+                        // Box-is-binding: a cell-backed binding's displaced
+                        // value lives in the cell's lane — the rebind's Row
+                        // store reclaims it (keeps=&[], sound by the
+                        // single-ownership law). Freeing the carrier here
+                        // would free the CELL.
+                        if displaced.cell.is_some() {
+                            continue;
+                        }
                         let table = ptr_of(displaced.reg)?;
                         let keep_regs = self.resolve_keeps(keeps)?;
                         if keep_regs.iter().any(|k| k.id == table.id) {
@@ -124,7 +132,12 @@ impl<'a> IrLowerer<'a> {
                 }
                 if matches!(expr, Expr::Nil { .. }) {
                     let local = self.peek_var(name)?;
-                    if self.shape.is_free(stmt) {
+                    // Box-is-binding: a cell-backed binding's release
+                    // rides the cell write below — the Row store of the
+                    // null lane reclaims the displaced table. The
+                    // planned site free would free the CELL.
+                    let table_free = self.shape.is_free(stmt) && local.cell.is_none();
+                    if table_free {
                         let table = ptr_of(local.reg)?;
                         let keep_regs = self
                             .shape
@@ -170,6 +183,12 @@ impl<'a> IrLowerer<'a> {
                 if let Some(names) = self.shape.rebind_frees.get(&stmt.id()) {
                     for (n, keeps) in names {
                         let displaced = self.peek_var(n)?;
+                        // Box-is-binding: same cell veto as the decl's
+                        // rebind loop — the displaced value rides the
+                        // cell's lane; the Row store reclaims it.
+                        if displaced.cell.is_some() {
+                            continue;
+                        }
                         let table = ptr_of(displaced.reg)?;
                         let keep_regs = self.resolve_keeps(keeps)?;
                         if keep_regs.iter().any(|k| k.id == table.id) {

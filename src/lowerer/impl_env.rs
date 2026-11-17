@@ -106,19 +106,12 @@ impl<'a> IrLowerer<'a> {
                 target: Reg::new(key),
                 val: alm_rt::rt::str_key_of_bytes(name.as_bytes()),
             });
-            if matches!(ty, Ty::Tbl(_)) {
-                let reg = ptr_of(local.reg)?;
-                self.table_set(
-                    env,
-                    TableKey::Str(Reg::new(key)),
-                    AnyReg::Ptr(reg),
-                    &Ty::Str,
-                )?;
-            } else if let Some(cell) = local.cell {
-                // Box-is-binding: the binding minted its ONE cell at
-                // declaration — store the pointer, register this env
-                // as a holder for the root drain. No snapshot, no
-                // creation: the cell IS the binding.
+            // Box-is-binding: every boxed face — scalars and, since the
+            // p9 reversal, `Tbl` alike — stores THE cell pointer and
+            // registers this env as a holder for the root drain. No
+            // snapshot, no mint-time alias: the cell IS the binding,
+            // so a defining-scope rebind reaches every holder.
+            if let Some(cell) = local.cell {
                 if let Some(holders) = self.binding_cells.get_mut(&cell.id) {
                     holders.push(env);
                 }
@@ -143,6 +136,14 @@ impl<'a> IrLowerer<'a> {
                 signal!(trace::TRACE_SCOPE_CELL_FALLBACK_MINT);
                 let box_id = self.next_reg();
                 let box_reg = Reg::new(box_id);
+                // The snapshot box never owns the child: the binding
+                // keeps its own storage (cell: None) and its death
+                // frees the value — a contains_tables bit here would
+                // walk the snapshot's lane at box death and free the
+                // very table the binding frees (a Tbl face landing
+                // here is depth drift, and drift must stay balanced,
+                // not double-free). The env still drains the box
+                // itself: the box is the env's lane child.
                 self.emit(Instruction::TableNew {
                     target: box_reg,
                     elem: ty.clone(),
@@ -186,20 +187,15 @@ impl<'a> IrLowerer<'a> {
                 env,
                 TableKey::Str(Reg::new(key)),
             )));
-            if matches!(ty, Ty::Tbl(_)) {
-                self.declare_var(name, AnyReg::Ptr(cell), ty, LayoutVerdict::Sparse)?;
-            } else {
-                // Box-is-binding, expansion side: the face local binds
-                // THE cell — the same storage the definer holds — not
-                // a box[0] snapshot. g's view IS the cell; a nested
-                // direct call's write lands in it; the next read
-                // cannot be stale because no snapshot exists anywhere
-                // (Bug 1's surface dies by construction). The cell is
-                // borrowed — another scope's binding owns it — so the
-                // declare bypasses the captured gate and the scope's
-                // cell inventory on purpose.
-                self.declare_cell_view(name, cell, ty, LayoutVerdict::default());
-            }
+            // Box-is-binding, expansion side: every face binds THE cell
+            // — the same storage the definer holds — not a box[0]
+            // snapshot. g's view IS the cell; a nested direct call's
+            // write lands in it; the next read cannot be stale because
+            // no snapshot exists anywhere (Bug 1's surface dies by
+            // construction). The cell is borrowed — another scope's
+            // binding owns it — so the declare bypasses the captured
+            // gate and the scope's cell inventory on purpose.
+            self.declare_cell_view(name, cell, ty, LayoutVerdict::default());
         }
         Ok(())
     }

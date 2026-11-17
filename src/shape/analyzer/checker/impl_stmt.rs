@@ -84,16 +84,11 @@ impl Checker {
                         .env_overrides
                         .last()
                         .is_some_and(|o| o.contains_key(name));
-                if env_hit
-                    && !matches!(expected, Ty::Unknown(_))
-                    && matches!(expected, Ty::Tbl(_))
-                {
-                    return Err(Diagnostic::ty(format!(
-                        "'{name}' is a captured table — it cannot be \
-                         rebound inside its closure (mutate its cells, or rebind in \
-                         the defining scope)"
-                    )));
-                }
+                // (The p5 rejection retired with the p9 reversal: a
+                // captured table's binding is cell-backed now, so a
+                // closure-side rebind routes through the cell and every
+                // holder sees it — the judge's semantics, not a
+                // dialect-only law.)
                 if matches!(expr, Expr::Nil { .. }) {
                     if !matches!(expected, Ty::Tbl(_) | Ty::Unknown(_)) {
                         return Err(Diagnostic::ty(format!(

@@ -298,6 +298,11 @@ impl<'a> IrLowerer<'a> {
              in an arm-free's extent lowers before the join",
         );
         let carrier = self.read_var(&e.carrier)?;
+        // Box-is-binding: the same cell veto emit_frees carries — the
+        // cell's death owns the value, on every arm's path alike.
+        if carrier.cell.is_some() {
+            return Ok(());
+        }
         let table = ptr_of(carrier.reg)?;
         let keep_regs = self.resolve_keeps(&e.keeps)?;
         if keep_regs.iter().any(|k| k.id == table.id) {
@@ -348,6 +353,15 @@ impl<'a> IrLowerer<'a> {
                      (the Extraction Law)",
                     f.carrier
                 );
+            }
+            // Box-is-binding: a cell-backed binding's value lives in
+            // the cell's lane — the cell's death (the scope pop, the
+            // drain, the last holder's walk) frees it exactly once. A
+            // value free here would free the loaded copy while the
+            // cell's lane still names it, and the cell's death walk
+            // would reclaim freed memory.
+            if carrier.cell.is_some() {
+                continue;
             }
             let table = ptr_of(carrier.reg)?;
             signal!(trace::TRACE_DO_EXIT_FREE_PHI);
@@ -497,20 +511,28 @@ impl<'a> IrLowerer<'a> {
         // ever snapshots. A loop body's declare mints per iteration
         // (the TableNew rides the body block) — exactly the judge's
         // semantics. The gate mirrors the mint's boxable faces: the
-        // concrete scalars, Any, and Closure. `Tbl` faces alias by
-        // pointer (no box element rides them), and the byte-lane tys
-        // (Ffi/FfiLib/Async/Unknown) hold handles no env ever boxed —
-        // boxing one would store a Ptr value into a Byte lane, the
-        // repr law's exact mismatch.
-        let boxed = matches!(ty, Ty::Int | Ty::Flt | Ty::Bool | Ty::Str | Ty::Any | Ty::Closure(_))
-            && self.captured.contains(&(self.cur_walk_depth(), name.clone()));
+        // concrete scalars, Any, Closure, and (since the p9 reversal)
+        // `Tbl` — a captured table's cell IS its binding, so a
+        // defining-scope rebind after a creation read reaches every
+        // surface (the judge's 2 twice). The cell mints with
+        // contains_tables: its lanes hold the owned table, and the
+        // cell's death walk frees it exactly once (flat tables, single
+        // ownership — the Row stores own their displaced children).
+        // The byte-lane tys (Ffi/FfiLib/Async/Unknown) stay unboxed:
+        // they hold handles no env ever boxed — boxing one would store
+        // a Ptr value into a Byte lane, the repr law's exact mismatch.
+        let boxed = matches!(
+            ty,
+            Ty::Int | Ty::Flt | Ty::Bool | Ty::Str | Ty::Any | Ty::Closure(_) | Ty::Tbl(_)
+        ) && self.captured.contains(&(self.cur_walk_depth(), name.clone()));
         let (bind_reg, cell) = if boxed {
             let box_id = self.next_reg();
             let box_reg = Reg::new(box_id);
+            let flags = if matches!(ty, Ty::Tbl(_)) { 0x80 } else { 0 };
             self.emit(Instruction::TableNew {
                 target: box_reg,
                 elem: ty.clone(),
-                flags: 0,
+                flags,
             });
             let idx = self.next_reg();
             self.emit(Instruction::LoadInt {
@@ -744,6 +766,14 @@ impl<'a> IrLowerer<'a> {
 
     fn null_moved(&mut self, src: &str) -> Result<(), LowerError> {
         let local = self.peek_var(src)?;
+        // Box-is-binding: a cell-backed binding has no separate slot
+        // for a move to vacate — the creation-capture "move into the
+        // env" moved nothing (the env holds THE cell), and the
+        // nulling Row store would reclaim the very value the cell
+        // owns. The cell keeps the value; nothing is moved-from.
+        if local.cell.is_some() {
+            return Ok(());
+        }
         let null_reg = self.next_reg();
         self.emit(Instruction::LoadNull {
             target: Reg::new(null_reg),

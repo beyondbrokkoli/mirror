@@ -1,5 +1,9 @@
 -- EXPECT: 4
--- EXPECT: 1
+-- EXPECT: 2
+-- The count pin rode 1 before the p9 reversal (2026-11-18): boxing
+-- the captured `t` adds one live allocation at the count print —
+-- box + t table — because the box's drain rides the root exit, after
+-- this print.
 -- The F3 law, probed 2026-11-11 (the worklist's unprobed third
 -- variant): a function parameter used to inherit an outer same-named
 -- literal's recorded shapes — walk_fn_def never entered params into
