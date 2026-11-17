@@ -8,6 +8,21 @@ impl Checker {
         });
     }
     fn end_scope(&mut self) {
+        // the dying frame's fn faces: anything it carried that no
+        // surviving frame carries is buried — the omni layer names
+        // it and checks whether the master snapshot re-supplies
+        if omni::enabled()
+            && let Some(dying) = self.frames.last()
+        {
+            for (name, ptr) in &dying.fns {
+                let survived = self.frames[..self.frames.len() - 1]
+                    .iter()
+                    .any(|f| f.fns.contains_key(name));
+                if !survived {
+                    omni::checker_burial(name, *ptr, self.snap.fns.contains_key(name));
+                }
+            }
+        }
         self.frames.pop();
     }
 

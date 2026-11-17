@@ -92,28 +92,92 @@ impl Checker {
     fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         if let Some(frame) = self.frames.last_mut() {
             frame.fns.insert(name.to_string(), ptr);
+            omni::checker_fn_write(name, Some(self.frames.len() - 1), ptr, "declare");
+        } else {
+            // no frame home: the top level's face drops — the master
+            // snapshot carries it instead (the omni layer names this
+            // the "unreal global scope" receipt)
+            omni::checker_fn_write(name, None, ptr, "declare");
         }
     }
 
     fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         let Some(depth) = self.frames.iter().rposition(|f| f.fns.contains_key(name)) else {
+            omni::checker_fn_write(name, None, ptr, "assign — no home depth, dropped");
             return;
         };
         self.frames[depth].fns.insert(name.to_string(), ptr);
+        omni::checker_fn_write(name, Some(depth), ptr, "assign");
     }
 
     fn resolve_fn_binding(&self, name: &str) -> Option<Option<NodeId>> {
         let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
-        self.frames[base..]
+        // The three tiers in their original or_else order — the tier
+        // that ANSWERS is the diagnosis the omni layer rides on: a
+        // top-level name answering through the master snapshot means
+        // the rider frames had no home for it (and the master's face
+        // is whatever the defcollection last left there).
+        let mut tier = omni::Tier::Frames;
+        let mut answer = self
+            .frames[base..]
             .iter()
             .rev()
-            .find_map(|f| f.fns.get(name).copied())
-            .or_else(|| {
-                self.inline_stack
-                    .last()
-                    .and_then(|&cur| self.ctx.fn_def_sites.get(&cur)?.get(name).copied())
-            })
-            .or_else(|| self.snap.fns.get(name).copied())
+            .find_map(|f| f.fns.get(name).copied());
+        if answer.is_none() {
+            tier = omni::Tier::InlineChain;
+            answer = self.inline_stack.last().and_then(|cur| {
+                self.ctx
+                    .fn_def_sites
+                    .get(cur)
+                    .and_then(|chain| chain.get(name))
+                    .copied()
+            });
+        }
+        if answer.is_none() {
+            tier = omni::Tier::MasterSnap;
+            answer = self.snap.fns.get(name).copied();
+        }
+        if omni::enabled() {
+            omni::resolve_fn(
+                name,
+                tier,
+                answer,
+                &self.omni_frames_digest(base),
+            );
+        }
+        answer
+    }
+
+    /// The rider frames' fn-face inventory, compact — the resolve
+    /// event's "why did the tier answer" digest. An empty digest at
+    /// top level is the "unreal global scope" receipt: the checker
+    /// has no root frame, so the master snapshot answers.
+    fn omni_frames_digest(&self, base: usize) -> String {
+        let mut s = String::new();
+        for (i, frame) in self.frames[base..].iter().enumerate() {
+            if frame.fns.is_empty() {
+                continue;
+            }
+            s.push_str(if s.is_empty() { "[" } else { " | " });
+            s.push_str(&format!("d{}{{", base + i));
+            let mut first = true;
+            for (n, ptr) in &frame.fns {
+                if !first {
+                    s.push_str(", ");
+                }
+                first = false;
+                s.push_str(&match ptr {
+                    Some(p) => format!("{n}=fn#{}", p.0),
+                    None => format!("{n}=—"),
+                });
+            }
+            s.push('}');
+        }
+        if s.is_empty() {
+            "∅ (no rider frame carries a fn face)".to_string()
+        } else {
+            s + "]"
+        }
     }
 
     fn resolves_to_fn(&self, name: &str) -> bool {

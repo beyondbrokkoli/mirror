@@ -50,6 +50,7 @@ impl Analyzer {
     }
 
     pub(super) fn walk_stmt(&mut self, rec: Gate, stmt: &Stmt) -> Result<(), ShapeError> {
+        omni::note_stmt(stmt.loc().line as usize);
         self.sever_creation_captures(rec, stmt);
         self.walk_stmt_inner(rec, stmt)
     }
@@ -96,6 +97,13 @@ impl Analyzer {
                         .last_mut()
                         .unwrap()
                         .insert(name.clone(), Binding::with_fn(decl_pending_shape(), ptr));
+                    omni::fn_face_write(
+                        name,
+                        self.walk.scopes.len() - 1,
+                        self.walk.scopes.len() - 1,
+                        ptr,
+                        "decl-pre-bind",
+                    );
                 }
                 for name in &names[exprs.len()..] {
                     self.walk
@@ -245,7 +253,16 @@ impl Analyzer {
                 let mut pre_bound = false;
                 if let Expr::Function { params, body, .. } = expr {
                     match self.walk.binding_at_mut(name) {
-                        Some((_, target)) => target.fn_ptr = Some(expr.id()),
+                        Some((home, target)) => {
+                            target.fn_ptr = Some(expr.id());
+                            omni::fn_face_write(
+                                name,
+                                home,
+                                self.walk.scopes.len() - 1,
+                                Some(expr.id()),
+                                "assignment",
+                            );
+                        }
                         None => {
                             pre_bound = true;
                             let depth = self.walk.scopes.len() - 1;
@@ -253,14 +270,28 @@ impl Analyzer {
                                 name.clone(),
                                 Binding::with_fn(decl_pending_shape(), Some(expr.id())),
                             );
+                            omni::fn_face_write(
+                                name,
+                                depth,
+                                depth,
+                                Some(expr.id()),
+                                "pre-bind-placeholder",
+                            );
                         }
                     }
                     self.walk_fn_def(rec, expr.id(), params, body, (stmt.id(), 2))?;
                 } else {
                     // a non-fn RHS clears the fn face at the binding's
                     // home depth
-                    if let Some((_, target)) = self.walk.binding_at_mut(name) {
+                    if let Some((home, target)) = self.walk.binding_at_mut(name) {
                         target.fn_ptr = None;
+                        omni::fn_face_write(
+                            name,
+                            home,
+                            self.walk.scopes.len() - 1,
+                            None,
+                            "assignment-clear",
+                        );
                     }
                 }
                 if matches!(expr, Expr::Nil { .. }) {
@@ -992,6 +1023,10 @@ impl Analyzer {
     }
 
     pub(super) fn enter_scope(&mut self) {
+        omni::scope_push(
+            self.walk.scopes.len(),
+            &omni::root_faces_of(&self.walk.scopes),
+        );
         self.walk.scopes.push(Scope::new());
     }
 
@@ -1015,6 +1050,10 @@ impl Analyzer {
             }
         }
         self.walk.scopes.pop();
+        omni::scope_pop(
+            self.walk.scopes.len(),
+            &omni::root_faces_of(&self.walk.scopes),
+        );
     }
 
     pub(super) fn with_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {

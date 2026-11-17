@@ -268,3 +268,9 @@
 192 SCOPE_CELL_FREE lowerer a dying scope frees a box cell nothing holds — box-on-declare mints at the declare; the root drain frees what an env holds, the scope pop frees what nothing escaped into
 193 SCOPE_CELL_FALLBACK_MINT lowerer a capture whose binding the walk never boxed mints the legacy snapshot box in store_env_cells — the byte-lane tys by gate design (the declare gate refuses to box them), a scalar only on depth drift; observability for the misaligned surface, not a law
 194 BREAK_EDGE_CELL_FREE lowerer a break edge frees a crossed scope's unheld box cell — the per-trip mint's one free used to ride the back-edge pop only (leak_contract/p13), stranding the breaking trip's allocation; the break edge now carries the same crossed-cell frees the return edge does (impl_core emit_cell_frees_from), path-exclusive with the pop's back-edge free
+
+195 OMNI_FN_WRITE analyzer a fn face was written on the master stack — the p30 write path's observability: name, home depth, writer depth (ALM_OMNI only; silent by default)
+196 OMNI_ROOT_DRAG analyzer a fn-body collection dragged a root (depth-0) binding's face at collection time — the defcollection time-travel receipt (fn_defcollection family; xfail-pinned divergence, soft trip) (ALM_OMNI only)
+197 OMNI_ORPHAN_BURIAL analyzer a scope pop buried a fn face a surviving binding used to carry, with no write recorded in its lifetime — the p30 pre-fix bug shape, hard trip (ALM_OMNI only)
+198 OMNI_RESOLVE analyzer a fn resolution answered through a watched tier (rider frames / inline chain / master snapshot) — the tier digest rides the omni log (ALM_OMNI only)
+199 OMNI_CHAIN_FREEZE analyzer the defcollection chain froze a root fn face in or out — the chain's depth-0 coherence tripwire (ALM_OMNI only)

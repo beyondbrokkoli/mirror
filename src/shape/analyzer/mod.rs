@@ -22,6 +22,7 @@ mod fast_lane;
 mod functions;
 mod infer;
 mod lattice;
+mod omni;
 mod pins;
 mod rebind;
 mod rows;
@@ -547,9 +548,11 @@ pub fn analyze_with_base(
 
     let mut prev_end: Vec<Scope> = Vec::new();
     let mut dbg_pass: u32 = 0;
+    omni::begin_analysis();
     loop {
         dbg_pass += 1;
         crate::alm_dbgln!("[fixpoint] pass {dbg_pass}");
+        omni::begin_pass(dbg_pass, "fixpoint");
         a.walk.changed = false;
         a.walk.scopes = vec![boundary_root_scope()];
         a.fn_def_sites.clear();
@@ -562,7 +565,8 @@ pub fn analyze_with_base(
         // against exactly that, and has nothing left to guard.
         let end = a.walk.scopes.clone();
         let stable = end == prev_end && !a.walk.changed;
-        prev_end = end;
+        prev_end = end.clone();
+        omni::dump_scopes(&format!("end of fixpoint pass {dbg_pass}"), &end);
         if stable {
             break;
         }
@@ -597,6 +601,7 @@ pub fn analyze_with_base(
     a.walk.scopes = vec![boundary_root_scope()];
     a.pin_derived_exprs.clear();
     a.pin_justified_names.clear();
+    omni::begin_pass(0, "interleave");
 
     let mut chk = checker::Checker::new(checker::CheckCtx {
         index_base: a.index_base,
@@ -663,6 +668,7 @@ pub fn analyze_with_base(
     }
     a.plan_stmt_temp_frees(ctx.ast);
     a.mint_fast_lane(ctx.ast);
+    omni::finish();
 
     let mut facts = a
         .into_recorded(adopt_lines, static_elems, elems_diags, chk_facts)

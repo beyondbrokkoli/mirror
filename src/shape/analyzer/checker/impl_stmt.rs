@@ -7,6 +7,7 @@ impl Checker {
     ) -> Result<(), Diagnostic> {
         self.cur_stmt = Some(stmt.id());
         self.cur_stmt_line = Some(stmt.loc().line as usize);
+        omni::note_stmt(stmt.loc().line as usize);
         if self.frames.is_empty() {
             self.cur_decls.clear();
         }

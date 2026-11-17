@@ -5,6 +5,7 @@ use super::super::facts::{
 use super::super::{is_ghost, is_root, join_ty};
 use super::WalkState;
 use super::constraints::UnknownStore;
+use super::omni;
 use super::{calls_through_fn_var_msg, dotted_callee, value_call_msg};
 use crate::ast::{BinOp, CtorKey, Expr, NodeId, Stmt, UnOp};
 use crate::diag::Diagnostic;
