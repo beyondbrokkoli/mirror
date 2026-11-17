@@ -16,7 +16,7 @@ impl Checker {
                 let mut expr_types = Vec::with_capacity(exprs.len());
                 for (name, expr) in names.iter().zip(exprs.iter()) {
                     if let Expr::Function { .. } = expr {
-                        expr_types.push(self.bind_function(lat, name, expr));
+                        expr_types.push(self.bind_function(lat, name, expr, false));
                     } else {
                         self.declare_fn_binding(name, None);
                         let ty = self.check_expr(lat, expr)?;
@@ -58,7 +58,11 @@ impl Checker {
                 // monomorphic law: expected (the capture's entry)
                 // unifies with actual, so no view goes stale.
                 if let Expr::Function { .. } = expr {
-                    let ty = self.bind_function(lat, name, expr);
+                    // an assignment rebinds the binding's home — the
+                    // face write follows the rebind law (bind_function's
+                    // `rebind` arm); the type bookkeeping below is the
+                    // declaration-neutral half and stays as-is
+                    let ty = self.bind_function(lat, name, expr, true);
                     if let Some(frame) = self
                         .frames
                         .iter_mut()

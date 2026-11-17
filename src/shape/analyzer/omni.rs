@@ -10,10 +10,19 @@
 //!
 //! `arg` is the canary-in-chief. It is the one binding the HOST
 //! mints (`boundary_root_scope` seeds it at depth 0 before any walk
-//! pass) — the seed of the future global foundation. This phase the
-//! layer is strictly observational: it never writes a face, never
-//! reorders a stack, never gates a diagnostic. It records, renders,
-//! and trips three invariants:
+//! pass) — the seed of the future global foundation. Phase 1 of the
+//! layer was strictly observational: it never wrote a face, never
+//! reordered a stack, never gated a diagnostic — it recorded,
+//! rendered, and tripped three invariants. Phase 2 plugged the
+//! foundation in: the checker now carries its own root fn-face home
+//! (`Checker::root_fns` — the rider-side twin of the walk's
+//! boundary-root scope at d0), so top-level fn faces live on the
+//! checker's own statement-order timeline and `resolve_fn_binding`
+//! answers through it BEFORE the master snapshot. The layer stays
+//! observational — the checker's writes are its own; the layer only
+//! renders them.
+//!
+//! The three invariants stand:
 //!
 //! - ORPHAN-BURIAL (hard): a scope's life may not cost a surviving
 //!   binding a fn face it carried when the scope opened, unless a
@@ -24,7 +33,10 @@
 //!   a depth-0 binding's fn face — the defcollection travels back in
 //!   time (fn_defcollection_order: the first print answers 2 before
 //!   g() ever ran). The trip is a receipt, not a rejection: the
-//!   divergence is chartered, so the layer reports and moves on.
+//!   divergence is chartered on the MASTER side — the walk's own
+//!   type story — while the checker's resolution no longer reads the
+//!   dragged state (the root home answers first), so the runtime
+//!   divergence the pin named is retired.
 //! - CHAIN-FREEZE (hard): a defcollection chain must not freeze a
 //!   depth-0 fn-bound name in (functions.rs excludes them exactly so
 //!   resolve_fn_binding's snapshot fallback sees the CURRENT binding).
@@ -35,8 +47,8 @@
 //! `ALM_OMNI` set, events stream to stderr prefixed `[omni]`, stage
 //! dumps render on request (`dump`/`all`/`1` values), and the run
 //! ends with a report. `ALM_OMNI_STRICT=1` turns ORPHAN-BURIAL and
-//! CHAIN-FREEZE trips into a panic — the phase-2 plug-in will want
-//! the hard gate on while it rewires the foundation.
+//! CHAIN-FREEZE trips into a panic — the plug-in phases want the
+//! hard gate on while the foundation is rewired.
 //!
 //! The five plate signals (195-199, trace_signals.txt) fire only
 //! under the gate, so plate.py decodes them on demand and the
@@ -90,10 +102,11 @@ fn face(ptr: Option<NodeId>) -> String {
 
 /// Which tier answered a fn resolution — the tier IS the story: a
 /// top-level name answering through the master snapshot means the
-/// checker's own frames had no home for it.
+/// rider's own foundation (frames + root home) had no home for it.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Tier {
     Frames,
+    RootHome,
     InlineChain,
     MasterSnap,
 }
@@ -102,6 +115,7 @@ impl Tier {
     fn label(self) -> &'static str {
         match self {
             Tier::Frames => "rider-frames",
+            Tier::RootHome => "root-home",
             Tier::InlineChain => "inline-chain",
             Tier::MasterSnap => "master-snapshot",
         }
@@ -508,17 +522,29 @@ pub(super) fn collection_end(fn_ptr: NodeId, root_faces_now: &RootFaces) {
 
 // ── checker-side hooks ───────────────────────────────────────────────
 
-/// The checker's own fn-face write into its rider frames. A write
-/// with no frame to land in is the "unreal global scope" receipt:
-/// the checker has no root frame, so a top-level fn face simply
-/// drops — the master snapshot carries it instead.
-pub(super) fn checker_fn_write(name: &str, frame: Option<usize>, ptr: Option<NodeId>, via: &str) {
+/// Where a checker-side fn-face write landed. `Frame` is a rider
+/// frame, `Root` is the rider's root fn-face home (the checker-side
+/// twin of the walk's boundary-root scope — the phase-2 global
+/// foundation), `None` is a write with no home at all: it drops.
+pub(super) enum FnHome {
+    Frame(usize),
+    Root,
+    None,
+}
+
+/// The checker's own fn-face write into its rider foundation. A
+/// `None` home is the "no home anywhere" receipt; the root home is
+/// where top-level fn faces live since phase 2 — the checker's own
+/// statement-order timeline, so a top-level call resolves at its
+/// binding point's state instead of the master snapshot's dragged
+/// future.
+pub(super) fn checker_fn_write(name: &str, home: FnHome, ptr: Option<NodeId>, via: &str) {
     if !enabled() {
         return;
     }
     with(|o| {
-        o.record(match frame {
-            Some(d) => format!(
+        o.record(match home {
+            FnHome::Frame(d) => format!(
                 "{} ✎checker-fn '{}' frame=d{} → {} ({})",
                 o.ctx(),
                 name,
@@ -526,10 +552,17 @@ pub(super) fn checker_fn_write(name: &str, frame: Option<usize>, ptr: Option<Nod
                 face(ptr),
                 via,
             ),
-            None => format!(
-                "{} ✎checker-fn '{}' → {} ({}) — DROPPED: no frame home \
-                 (top level: the checker has no root frame; the master \
-                 snapshot carries this face)",
+            FnHome::Root => format!(
+                "{} ✎checker-fn '{}' home=root → {} ({}) — the rider's \
+                 global foundation carries this face",
+                o.ctx(),
+                name,
+                face(ptr),
+                via,
+            ),
+            FnHome::None => format!(
+                "{} ✎checker-fn '{}' → {} ({}) — DROPPED: no home \
+                 anywhere (the master snapshot may carry this face)",
                 o.ctx(),
                 name,
                 face(ptr),

@@ -144,6 +144,23 @@ pub(super) struct CheckFacts {
 
 pub(super) struct Checker {
     frames: Vec<Frame>,
+    /// The rider's root fn-face home — the checker-side twin of the
+    /// walk's `boundary_root_scope` (d0). Top-level fn faces live
+    /// HERE, on the checker's own statement-order timeline, instead
+    /// of dropping to the master snapshot. The phase-1 receipts
+    /// (✎checker-fn DROPPED, tier=master-snapshot at top level) were
+    /// this map's absence; the phase-2 plug-in is this map.
+    ///
+    /// Its laws mirror the walk's face timeline exactly (the judge's
+    /// law, 2026-11-14): sequential and `do` writes persist, if-arm
+    /// and while-body writes die with their scope (`cond_depth` is
+    /// the standing mask for exactly those contexts), and a call
+    /// expansion's body write moves the root face at call time — the
+    /// defcollection drag's correct twin. `resolve_fn_binding`
+    /// answers through it BEFORE the master snapshot, so a top-level
+    /// call resolves at its binding point's state (the
+    /// fn_defcollection_order law).
+    root_fns: BTreeMap<String, Option<NodeId>>,
     top: BTreeMap<String, Ty>,
     cur_decls: BTreeSet<String>,
     snap: WalkSnap,

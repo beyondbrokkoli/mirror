@@ -3,6 +3,7 @@ impl Checker {
         let index_base = ctx.index_base;
         Self {
             frames: Vec::new(),
+            root_fns: BTreeMap::new(),
             top: BTreeMap::new(),
             cur_decls: BTreeSet::new(),
             snap: WalkSnap {
@@ -92,31 +93,55 @@ impl Checker {
     fn declare_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
         if let Some(frame) = self.frames.last_mut() {
             frame.fns.insert(name.to_string(), ptr);
-            omni::checker_fn_write(name, Some(self.frames.len() - 1), ptr, "declare");
+            omni::checker_fn_write(name, omni::FnHome::Frame(self.frames.len() - 1), ptr, "declare");
         } else {
-            // no frame home: the top level's face drops — the master
-            // snapshot carries it instead (the omni layer names this
-            // the "unreal global scope" receipt)
-            omni::checker_fn_write(name, None, ptr, "declare");
+            // no frame home: the face takes the rider's ROOT home —
+            // the checker-side twin of the walk's boundary-root scope
+            // (d0). Top-level fn faces live here on the checker's own
+            // statement-order timeline; the master snapshot no longer
+            // has to carry them (phase 2 closed the gap the omni
+            // layer's DROPPED receipt named).
+            self.root_fns.insert(name.to_string(), ptr);
+            omni::checker_fn_write(name, omni::FnHome::Root, ptr, "declare");
         }
     }
 
     fn assign_fn_binding(&mut self, name: &str, ptr: Option<NodeId>) {
-        let Some(depth) = self.frames.iter().rposition(|f| f.fns.contains_key(name)) else {
-            omni::checker_fn_write(name, None, ptr, "assign — no home depth, dropped");
+        if let Some(depth) = self.frames.iter().rposition(|f| f.fns.contains_key(name)) {
+            self.frames[depth].fns.insert(name.to_string(), ptr);
+            omni::checker_fn_write(name, omni::FnHome::Frame(depth), ptr, "assign");
             return;
-        };
-        self.frames[depth].fns.insert(name.to_string(), ptr);
-        omni::checker_fn_write(name, Some(depth), ptr, "assign");
+        }
+        // The root home: an assignment to a root fn-bound name
+        // rebinds the root binding's face — the checker-side mirror
+        // of the walk's `binding_at_mut` stamp. Masked contexts (an
+        // if arm or a loop body — `cond_depth`) keep their writes
+        // local: the judge's law says an arm's or a latch's fn write
+        // dies with its scope, so the root face must not move from
+        // inside one.
+        if self.cond_depth == 0
+            && let Some(home) = self.root_fns.get_mut(name)
+        {
+            *home = ptr;
+            omni::checker_fn_write(name, omni::FnHome::Root, ptr, "assign → root home");
+            return;
+        }
+        omni::checker_fn_write(name, omni::FnHome::None, ptr, "assign — no home depth, dropped");
     }
 
     fn resolve_fn_binding(&self, name: &str) -> Option<Option<NodeId>> {
         let base = self.expansion_frame_bases.last().copied().unwrap_or(0);
-        // The three tiers in their original or_else order — the tier
-        // that ANSWERS is the diagnosis the omni layer rides on: a
-        // top-level name answering through the master snapshot means
-        // the rider frames had no home for it (and the master's face
-        // is whatever the defcollection last left there).
+        // The tiers in their original or_else order — the tier
+        // that ANSWERS is the diagnosis the omni layer rides on. The
+        // root home sits between the inline chain and the master
+        // snapshot: the chain is the DEFINITION-SITE truth (inner
+        // wins — a body's shadowing decl must beat the root face),
+        // while the root home is the rider's own foundation for
+        // top-level fn faces — the names the chain excludes
+        // (CHAIN-FREEZE keeps root fn-bound names out of it). So a
+        // top-level call resolves at its binding point's state — the
+        // checker's statement-order timeline — instead of the master
+        // snapshot's defcollection-dragged future.
         let mut tier = omni::Tier::Frames;
         let mut answer = self
             .frames[base..]
@@ -132,6 +157,10 @@ impl Checker {
                     .and_then(|chain| chain.get(name))
                     .copied()
             });
+        }
+        if answer.is_none() {
+            tier = omni::Tier::RootHome;
+            answer = self.root_fns.get(name).copied();
         }
         if answer.is_none() {
             tier = omni::Tier::MasterSnap;
@@ -150,8 +179,9 @@ impl Checker {
 
     /// The rider frames' fn-face inventory, compact — the resolve
     /// event's "why did the tier answer" digest. An empty digest at
-    /// top level is the "unreal global scope" receipt: the checker
-    /// has no root frame, so the master snapshot answers.
+    /// top level sends the resolve to the root home and then the
+    /// master snapshot; the root home's inventory rides after the
+    /// frames so the answer's home is always named.
     fn omni_frames_digest(&self, base: usize) -> String {
         let mut s = String::new();
         for (i, frame) in self.frames[base..].iter().enumerate() {
@@ -162,6 +192,27 @@ impl Checker {
             s.push_str(&format!("d{}{{", base + i));
             let mut first = true;
             for (n, ptr) in &frame.fns {
+                if !first {
+                    s.push_str(", ");
+                }
+                first = false;
+                s.push_str(&match ptr {
+                    Some(p) => format!("{n}=fn#{}", p.0),
+                    None => format!("{n}=—"),
+                });
+            }
+            s.push('}');
+        }
+        if !self.root_fns.is_empty() {
+            s.push_str(if s.is_empty() { "[" } else { " | " });
+            s.push_str("root{");
+            let mut first = true;
+            let shown = self.root_fns.len().min(6);
+            for (i, (n, ptr)) in self.root_fns.iter().enumerate() {
+                if i == shown {
+                    s.push_str(&format!("…+{}", self.root_fns.len() - shown));
+                    break;
+                }
                 if !first {
                     s.push_str(", ");
                 }
@@ -184,7 +235,7 @@ impl Checker {
         self.resolve_fn_binding(name).flatten().is_some()
     }
 
-    fn bind_function(&mut self, lat: &mut UnknownStore, name: &str, expr: &Expr) -> Ty {
+    fn bind_function(&mut self, lat: &mut UnknownStore, name: &str, expr: &Expr, rebind: bool) -> Ty {
         let Expr::Function { params, body, .. } = expr else {
             unreachable!("bind_function on a non-function");
         };
@@ -199,7 +250,24 @@ impl Checker {
             },
         );
         self.collect_nested_fn_defs(lat, body);
-        self.declare_fn_binding(name, Some(expr.id()));
+        // The face's birthplace follows the statement form. A decl
+        // mints a FRESH binding — the face is born at the innermost
+        // scope (or the root home at top level). An assignment
+        // REBINDS an existing binding — the face moves where the
+        // binding lives: the write-through finds the home (a frame's
+        // fns entry, else the root home) and stamps it there. Masked
+        // contexts (an if arm or a loop body — `cond_depth`) and the
+        // bound-nowhere placeholder keep the declare semantics: the
+        // judge's law says an arm's or a latch's fn write dies with
+        // its scope, and a name bound nowhere takes the innermost
+        // placeholder home exactly as the walk's pre-bind does.
+        let home_exists = self.frames.iter().any(|f| f.fns.contains_key(name))
+            || self.root_fns.contains_key(name);
+        if rebind && home_exists && self.cond_depth == 0 {
+            self.assign_fn_binding(name, Some(expr.id()));
+        } else {
+            self.declare_fn_binding(name, Some(expr.id()));
+        }
         Ty::Unknown(lat.ensure_fn_value(expr.id()))
     }
 
