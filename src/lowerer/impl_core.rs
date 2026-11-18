@@ -297,9 +297,12 @@ impl<'a> IrLowerer<'a> {
             "a mixed join's tag phi never lowered — every If/Call tag \
              in an arm-free's extent lowers before the join",
         );
-        let carrier = self.read_var(&e.carrier)?;
         // Box-is-binding: the same cell veto emit_frees carries — the
         // cell's death owns the value, on every arm's path alike.
+        // The metadata read, never the value read: a cell-backed
+        // value read loads its cell, and the veto below would strand
+        // the load dead in the IR.
+        let carrier = self.peek_var(&e.carrier)?;
         if carrier.cell.is_some() {
             return Ok(());
         }
@@ -345,7 +348,11 @@ impl<'a> IrLowerer<'a> {
         let mut plain: Vec<Reg<Ptr>> = Vec::new();
         let mut kept: Vec<(Reg<Ptr>, Vec<Reg<Ptr>>)> = Vec::new();
         for f in frees {
-            let carrier = self.read_var(&f.carrier)?;
+            // The metadata read, never the value read: a cell-backed
+            // value read loads its cell, and the veto below would
+            // strand the load dead in the IR. The metadata read
+            // carries the same ty and the same cell.
+            let carrier = self.peek_var(&f.carrier)?;
             if matches!(carrier.ty, Ty::Closure(_)) {
                 panic!(
                     "a closure value's env has one owner (its mint) — '{}' \
